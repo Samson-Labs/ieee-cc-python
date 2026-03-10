@@ -40,9 +40,9 @@ S3: {ou}/pending/{file}.pdf
 
 ## AWS Resources
 
-| Resource | Name | Account |
+| Resource | Name | Details |
 |----------|------|---------|
-| S3 Bucket | `ieee-cc-python` | `141770997341` |
+| S3 Bucket | `ieee-cc-python` | Versioned, public access blocked |
 | ECR | `ieee-cc-pdf-extractor` | us-east-1 |
 | Lambda | `ieee-cc-pdf-extractor` | 3 GB, 5 min timeout |
 | IAM Role | `ieee-cc-pdf-extractor-role` | S3 read/write + CloudWatch |
