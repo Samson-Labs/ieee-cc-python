@@ -148,7 +148,7 @@ create_lambda() {
     else
         # Wait for role to propagate
         log "Waiting for IAM role propagation..."
-        sleep 10
+        aws iam wait role-exists --role-name "${LAMBDA_ROLE_NAME}"
 
         aws lambda create-function \
             --function-name "${LAMBDA_FUNCTION_NAME}" \
