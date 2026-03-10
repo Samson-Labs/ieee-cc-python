@@ -65,7 +65,7 @@ S3: actions/{job_id}.json  (trigger from Drupal)
 
 | Resource | Name | Config |
 |----------|------|--------|
-| S3 Bucket | `ieee-cc-python` | Shared, versioned |
+| S3 Bucket | `dev-ieee-conference-cloud-bulk-uploads` | Shared, versioned |
 | ECR | `ieee-cc-pdf-extractor` | PDF extractor image |
 | ECR | `ieee-rc-image-generator` | Image overlay image |
 | Lambda | `ieee-cc-pdf-extractor` | 3 GB, 5 min timeout |
@@ -76,12 +76,12 @@ S3: actions/{job_id}.json  (trigger from Drupal)
 
 **PDF Extractor:**
 ```bash
-./scripts/invoke.sh ieee-cc-python ieee/pending/STD-12345.pdf ieee STD-12345
+./scripts/invoke.sh dev-ieee-conference-cloud-bulk-uploads ieee/pending/STD-12345.pdf ieee STD-12345
 ```
 
 **Image Overlay Generator:**
 ```bash
-./scripts/invoke-image-overlay.sh ieee-cc-python actions/job-001.json
+./scripts/invoke-image-overlay.sh dev-ieee-conference-cloud-bulk-uploads actions/job-001.json
 ```
 
 ## Project Structure

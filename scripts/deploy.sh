@@ -18,7 +18,7 @@ AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
 
 ECR_REPO_NAME="ieee-cc-pdf-extractor"
 LAMBDA_FUNCTION_NAME="ieee-cc-pdf-extractor"
-S3_BUCKET_NAME="ieee-cc-python"
+S3_BUCKET_NAME="dev-ieee-conference-cloud-bulk-uploads"
 LAMBDA_ROLE_NAME="ieee-cc-pdf-extractor-role"
 IMAGE_TAG="latest"
 

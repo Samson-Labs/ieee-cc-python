@@ -6,7 +6,7 @@
 #   ./scripts/invoke.sh <bucket> <key> <ou> <product_part_number>
 #
 # Example:
-#   ./scripts/invoke.sh ieee-cc-python \
+#   ./scripts/invoke.sh dev-ieee-conference-cloud-bulk-uploads \
 #       ieee/pending/STD-12345.pdf ieee STD-12345
 #
 set -euo pipefail

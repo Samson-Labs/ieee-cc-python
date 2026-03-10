@@ -45,4 +45,4 @@ aws ecr delete-repository \
 
 log "Teardown complete."
 log "Note: S3 bucket notification for actions/*.json was NOT removed (may be shared)."
-log "To remove it manually: aws s3api put-bucket-notification-configuration --bucket ieee-cc-python --notification-configuration '{}'"
+log "To remove it manually: aws s3api put-bucket-notification-configuration --bucket dev-ieee-conference-cloud-bulk-uploads --notification-configuration '{}'"

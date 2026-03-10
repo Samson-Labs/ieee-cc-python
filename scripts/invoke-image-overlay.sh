@@ -6,7 +6,7 @@
 #   ./scripts/invoke-image-overlay.sh <bucket> <key>
 #
 # Example:
-#   ./scripts/invoke-image-overlay.sh ieee-cc-python actions/test-job.json
+#   ./scripts/invoke-image-overlay.sh dev-ieee-conference-cloud-bulk-uploads actions/test-job.json
 #
 set -euo pipefail
 

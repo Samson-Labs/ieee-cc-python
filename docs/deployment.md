@@ -14,7 +14,7 @@
 
 This creates all resources in order:
 1. **ECR repository** (`ieee-cc-pdf-extractor`) — container image registry
-2. **S3 bucket** (`ieee-cc-python`) — versioned, public access blocked
+2. **S3 bucket** (`dev-ieee-conference-cloud-bulk-uploads`) — versioned, public access blocked
 3. **IAM role** (`ieee-cc-pdf-extractor-role`) — Lambda execution + S3 read/write
 4. **Docker build + push** — builds from `Dockerfile`, pushes to ECR
 5. **Lambda function** (`ieee-cc-pdf-extractor`) — 3 GB memory, 5 min timeout, x86_64
@@ -35,14 +35,19 @@ After making code changes, rebuild the image and update Lambda without recreatin
 ./scripts/invoke.sh <bucket> <key> <ou> <product_part_number>
 
 # Example:
-./scripts/invoke.sh ieee-cc-python \
+./scripts/invoke.sh dev-ieee-conference-cloud-bulk-uploads \
     ieee/pending/STD-12345.pdf ieee STD-12345
 ```
 
-## Upload a Test PDF
+## Test PDFs
 
+Sample PDFs provided by PM (production bucket):
+- `s3://ieee-conference-cloud-bulk-uploads/PES/PES_PUB_TP_TP101_101995.pdf`
+- `s3://ieee-conference-cloud-bulk-uploads/PES/PES_MAG_ELE_13-4.pdf`
+
+Upload a test PDF to the dev bucket:
 ```bash
-aws s3 cp test.pdf s3://ieee-cc-python/ieee/pending/STD-12345.pdf \
+aws s3 cp test.pdf s3://dev-ieee-conference-cloud-bulk-uploads/PES/pending/STD-12345.pdf \
     --profile ieee-cc
 ```
 
@@ -80,7 +85,7 @@ The handler supports two event formats:
 **1. Direct (orchestrator):**
 ```json
 {
-  "bucket": "ieee-cc-python",
+  "bucket": "dev-ieee-conference-cloud-bulk-uploads",
   "key": "ieee/pending/STD-12345.pdf",
   "ou": "ieee",
   "product_part_number": "STD-12345"
@@ -92,7 +97,7 @@ The handler supports two event formats:
 {
   "Records": [{
     "s3": {
-      "bucket": {"name": "ieee-cc-python"},
+      "bucket": {"name": "dev-ieee-conference-cloud-bulk-uploads"},
       "object": {"key": "ieee/pending/STD-12345.pdf"}
     }
   }]

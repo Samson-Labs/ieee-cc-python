@@ -18,7 +18,7 @@ AWS_ACCOUNT_ID="${AWS_ACCOUNT_ID:-141770997341}"
 
 ECR_REPO_NAME="ieee-rc-image-generator"
 LAMBDA_FUNCTION_NAME="ieee-rc-image-generator"
-TRIGGER_BUCKET_NAME="ieee-cc-python"
+TRIGGER_BUCKET_NAME="dev-ieee-conference-cloud-bulk-uploads"
 LAMBDA_ROLE_NAME="ieee-rc-image-generator-role"
 IMAGE_TAG="latest"
 

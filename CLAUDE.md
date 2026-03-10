@@ -51,7 +51,7 @@ Docker-based Lambdas deployed via AWS CLI (no CDK/SAM). Each Lambda has its own 
 
 | Resource | Name | Config |
 |----------|------|--------|
-| S3 Bucket | `ieee-cc-python` | Shared across Lambdas, versioned |
+| S3 Bucket | `dev-ieee-conference-cloud-bulk-uploads` | Shared across Lambdas, versioned |
 | ECR | `ieee-cc-pdf-extractor` | PDF extractor |
 | ECR | `ieee-rc-image-generator` | Image overlay |
 | Lambda | `ieee-cc-pdf-extractor` | 3 GB, 5 min timeout, Python 3.13 |
