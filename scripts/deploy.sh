@@ -42,7 +42,9 @@ ecr_login() {
 build_and_push() {
     log "Building Docker image..."
     docker buildx build --platform linux/amd64 --provenance=false \
-        --output type=docker -t "${ECR_REPO_NAME}:${IMAGE_TAG}" "${PROJECT_ROOT}"
+        --output type=docker \
+        -f "${PROJECT_ROOT}/src/extractors/Dockerfile" \
+        -t "${ECR_REPO_NAME}:${IMAGE_TAG}" "${PROJECT_ROOT}"
 
     log "Tagging image..."
     docker tag "${ECR_REPO_NAME}:${IMAGE_TAG}" "${ECR_URI}:${IMAGE_TAG}"

@@ -43,7 +43,7 @@ build_and_push() {
     log "Building Docker image..."
     docker buildx build --platform linux/amd64 --provenance=false \
         --output type=docker \
-        -f "${PROJECT_ROOT}/Dockerfile.image-overlay" \
+        -f "${PROJECT_ROOT}/src/generators/Dockerfile" \
         -t "${ECR_REPO_NAME}:${IMAGE_TAG}" "${PROJECT_ROOT}"
 
     log "Tagging image..."
