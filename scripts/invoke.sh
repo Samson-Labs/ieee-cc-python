@@ -33,12 +33,15 @@ EOF
 echo "==> Invoking ${LAMBDA_FUNCTION_NAME}..."
 echo "    Payload: ${PAYLOAD}"
 
+RESPONSE_FILE=$(mktemp)
+trap 'rm -f "${RESPONSE_FILE}"' EXIT
+
 aws lambda invoke \
     --function-name "${LAMBDA_FUNCTION_NAME}" \
     --region "${AWS_REGION}" \
     --payload "${PAYLOAD}" \
-    /tmp/lambda-response.json
+    "${RESPONSE_FILE}"
 
 echo ""
 echo "==> Response:"
-cat /tmp/lambda-response.json | python3 -m json.tool
+cat "${RESPONSE_FILE}" | python3 -m json.tool
