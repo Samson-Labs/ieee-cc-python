@@ -1,6 +1,6 @@
 # IEEE Content Conversion — Python Pipeline
 
-PDF text extraction Lambda for the IEEE Content Conversion pipeline. Extracts text from PDFs in S3 and returns cleaned output suitable for AWS Bedrock (Claude Sonnet).
+Python Lambda modules for the IEEE Content Conversion pipeline. Handles PDF text extraction and image overlay generation via Docker-based Lambdas deployed to AWS.
 
 ## Quick Start
 
@@ -8,94 +8,109 @@ PDF text extraction Lambda for the IEEE Content Conversion pipeline. Extracts te
 # Install dependencies
 pip install -r requirements.txt -r requirements-dev.txt
 
-# Run tests
+# Run all tests (70 total)
 python -m pytest tests/ -v
 
-# Deploy to AWS (first time)
+# Deploy PDF Extractor
 ./scripts/deploy.sh
 
-# Deploy code changes only
-./scripts/deploy.sh update
+# Deploy Image Overlay Generator
+./scripts/deploy-image-overlay.sh
 ```
 
-## Architecture
+## Lambdas
+
+### PDF Text Extractor
+
+Extracts text from PDFs in S3 using PyMuPDF. Strips headers/footers, removes page numbers, truncates to 180k chars for Claude Sonnet's context window.
 
 ```
 S3: {ou}/pending/{file}.pdf
-        │
-        ▼
-┌──────────────────────┐
-│  Lambda: pdf_handler  │  (Docker, ECR, 3GB, 5min timeout)
-│  ├─ PDFExtractor      │  (PyMuPDF text extraction)
-│  ├─ Header/footer     │  (strip top/bottom 8%)
-│  ├─ Page numbers      │  (regex removal)
-│  └─ Truncate 180k     │  (Claude Sonnet context limit)
-└──────────┬───────────┘
-           │
-           ├─► Response: {text, page_count, extraction_method}
-           │
-           └─► S3: {ou}/metadata/{part_number}.pdf.json
-                   {pageCount, extractionMethod, extractedAt}
+        |
+        v
++------------------------+
+|  ieee-cc-pdf-extractor |  (Python 3.13, PyMuPDF, 3GB, 5min)
+|  +- Header/footer strip|  (top/bottom 8%)
+|  +- Page number removal|  (regex)
+|  +- Truncate 180k      |  (Claude Sonnet limit)
++----------+-------------+
+           |
+           +-> Response: {text, page_count, extraction_method}
+           |
+           +-> S3: {ou}/metadata/{part_number}.pdf.json
+```
+
+### Image Overlay Generator
+
+Generates product overlay images from JSON trigger files. Loads a background image, applies title/author text overlays using Pillow, writes output to a destination bucket.
+
+```
+S3: actions/{job_id}.json  (trigger from Drupal)
+        |
+        v
++---------------------------+
+|  ieee-rc-image-generator  |  (Python 3.12, Pillow, 1024MB, 60s)
+|  +- Load background       |  backgrounds/{ou}.jpg
+|  +- Title overlay          |  (40px, max 3 lines, word-wrap)
+|  +- Author overlay         |  (24px, max 2 lines)
+|  +- Optional thumbnail     |  (400x300 max)
++----------+----------------+
+           |
+           +-> S3: {public_path}/{part_number}.{jpg|png}
+           |
+           +-> Delete trigger JSON on success
 ```
 
 ## AWS Resources
 
-| Resource | Name | Details |
-|----------|------|---------|
-| S3 Bucket | `ieee-cc-python` | Versioned, public access blocked |
-| ECR | `ieee-cc-pdf-extractor` | us-east-1 |
+| Resource | Name | Config |
+|----------|------|--------|
+| S3 Bucket | `ieee-cc-python` | Shared, versioned |
+| ECR | `ieee-cc-pdf-extractor` | PDF extractor image |
+| ECR | `ieee-rc-image-generator` | Image overlay image |
 | Lambda | `ieee-cc-pdf-extractor` | 3 GB, 5 min timeout |
-| IAM Role | `ieee-cc-pdf-extractor-role` | S3 read/write + CloudWatch |
+| Lambda | `ieee-rc-image-generator` | 1024 MB, 60s timeout |
+| S3 Trigger | `actions/*.json` | -> image generator |
 
-## Invoking the Lambda
+## Invoking
 
-**Direct (orchestrator):**
-```json
-{
-  "bucket": "ieee-cc-python",
-  "key": "ieee/pending/STD-12345.pdf",
-  "ou": "ieee",
-  "product_part_number": "STD-12345"
-}
-```
-
-**Via script:**
+**PDF Extractor:**
 ```bash
 ./scripts/invoke.sh ieee-cc-python ieee/pending/STD-12345.pdf ieee STD-12345
 ```
 
-**Response:**
-```json
-{
-  "statusCode": 200,
-  "body": {
-    "text": "Extracted content...",
-    "page_count": 42,
-    "extraction_method": "text"
-  }
-}
+**Image Overlay Generator:**
+```bash
+./scripts/invoke-image-overlay.sh ieee-cc-python actions/job-001.json
 ```
 
 ## Project Structure
 
 ```
 src/
-  extractors/pdf_extractor.py   # PDF text extraction (PyMuPDF)
-  handlers/pdf_handler.py       # Lambda entry point
+  extractors/
+    Dockerfile                    # Python 3.13 + PyMuPDF
+    pdf_extractor.py              # PDF text extraction
+  generators/
+    Dockerfile                    # Python 3.12 + Pillow
+    requirements.txt              # Pillow + boto3
+    image_overlay_generator.py    # Image overlay generation
+  handlers/
+    pdf_handler.py                # PDF extractor Lambda entry point
+    image_overlay_handler.py      # Image overlay Lambda entry point
 tests/
-  extractors/test_pdf_extractor.py  # 21 extractor tests
-  handlers/test_pdf_handler.py      # 8 handler tests
+  extractors/test_pdf_extractor.py           # 21 tests
+  generators/test_image_overlay_generator.py # 28 tests
+  handlers/
+    test_pdf_handler.py                      # 9 tests
+    test_image_overlay_handler.py            # 12 tests
 scripts/
-  deploy.sh     # Full deploy (ECR, S3, IAM, Lambda)
-  invoke.sh     # Manual Lambda invocation
-  teardown.sh   # Cleanup (preserves S3)
-docs/
-  pdf-extractor.md   # Module documentation
-  deployment.md      # Deployment guide
+  deploy.sh / invoke.sh / teardown.sh                        # PDF extractor
+  deploy-image-overlay.sh / invoke-image-overlay.sh / teardown-image-overlay.sh  # Image overlay
 ```
 
 ## Documentation
 
 - [PDF Extractor Module](docs/pdf-extractor.md) — extraction pipeline, error handling, API
+- [Image Overlay Generator](docs/image-overlay-generator.md) — trigger schema, text layout, output formats
 - [Deployment Guide](docs/deployment.md) — AWS CLI deploy, teardown, configuration
-- [Dev Log](DEVLOG.md) — chronological implementation progress

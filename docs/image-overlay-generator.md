@@ -6,6 +6,7 @@ Lambda function that generates product overlay images from JSON trigger files wr
 
 **Module path:** `src/generators/image_overlay_generator.py`
 **Handler path:** `src/handlers/image_overlay_handler.py`
+**Dockerfile:** `src/generators/Dockerfile`
 **Lambda:** `ieee-rc-image-generator` (Python 3.12, Pillow, 1024 MB, 60s timeout)
 
 ## Usage
