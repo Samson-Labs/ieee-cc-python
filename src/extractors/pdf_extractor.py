@@ -58,6 +58,7 @@ class PDFExtractor:
         Returns:
             ExtractionResult with text, page_count, and extraction_method.
         """
+        logger.info("Extracting text from s3://%s/%s", bucket, key)
         pdf_bytes = self._download(bucket, key)
         result = self.extract_from_bytes(pdf_bytes)
 

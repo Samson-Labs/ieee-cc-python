@@ -1,4 +1,10 @@
 .envrc
+.env
 __pycache__/
 *.pyc
 .pytest_cache/
+*.egg-info/
+dist/
+.venv/
+cdk.out/
+.cdk.staging/

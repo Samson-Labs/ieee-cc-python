@@ -20,12 +20,39 @@ python -m pytest tests/extractors/test_pdf_extractor.py::TestNormalPDF::test_ext
 
 # Install dependencies
 pip install -r requirements.txt -r requirements-dev.txt
+
+# Deploy (first time — creates ECR, S3, IAM role, Lambda)
+./scripts/deploy.sh
+
+# Deploy (update code only — rebuild image + update Lambda)
+./scripts/deploy.sh update
+
+# Invoke Lambda manually
+./scripts/invoke.sh <bucket> <key> <ou> <product_part_number>
+
+# Tear down AWS resources (preserves S3 bucket)
+./scripts/teardown.sh
 ```
 
 ## Architecture
 
 - **`src/extractors/`** — Reusable extraction modules (one per file type). Each extractor class takes an S3 client, downloads the file, extracts content, writes metadata JSON back to S3, and returns a structured result dict.
+- **`src/handlers/`** — Lambda entry points. Each handler wraps an extractor, parses the event (direct invocation or S3 trigger), and returns a structured response.
+- **`scripts/`** — AWS CLI deployment scripts (`deploy.sh`, `invoke.sh`, `teardown.sh`).
 - **`tests/`** — Mirrors `src/` structure. Tests use in-memory PDFs built with PyMuPDF and mock S3 via `unittest.mock`.
+
+### Deployment
+
+Docker-based Lambda deployed via AWS CLI (no CDK/SAM). The `Dockerfile` at the project root uses `public.ecr.aws/lambda/python:3.13` as the base image. `scripts/deploy.sh` handles ECR repo creation, Docker build+push, S3 bucket, IAM role, and Lambda function creation. Image is built with `--platform linux/amd64 --provenance=false` for Lambda compatibility on Apple Silicon.
+
+### AWS Resources (account `141770997341`, us-east-1)
+
+| Resource | Name |
+|----------|------|
+| S3 Bucket | `ieee-cc-python` |
+| ECR Repository | `ieee-cc-pdf-extractor` |
+| Lambda Function | `ieee-cc-pdf-extractor` |
+| IAM Role | `ieee-cc-pdf-extractor-role` |
 
 ### S3 Path Conventions
 

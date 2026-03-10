@@ -1,6 +1,7 @@
 """Tests for PDFExtractor.
 
-Covers: normal PDF, scanned PDF, encrypted PDF, corrupted PDF, very large PDF.
+Covers: normal PDF, scanned PDF, encrypted PDF, corrupted PDF, very large PDF,
+multi-column PDF, Unicode/non-English text, S3 error handling.
 """
 
 from __future__ import annotations
@@ -8,6 +9,8 @@ from __future__ import annotations
 import json
 from io import BytesIO
 from unittest.mock import MagicMock, patch
+
+from botocore.exceptions import ClientError
 
 import fitz  # PyMuPDF
 import pytest
@@ -43,6 +46,48 @@ def _make_pdf(pages: list[str], *, encrypt: bool = False) -> bytes:
         )
     else:
         buf = doc.tobytes()
+    doc.close()
+    return buf
+
+
+def _make_multicolumn_pdf() -> bytes:
+    """Create a PDF with text in two columns (left and right halves)."""
+    doc = fitz.open()
+    page = doc.new_page()
+    mid_x = page.rect.width / 2
+    y_center = page.rect.height / 2
+
+    # Left column
+    tw_left = fitz.TextWriter(page.rect)
+    tw_left.append(fitz.Point(72, y_center), "Left column content here.")
+    tw_left.write_text(page)
+
+    # Right column
+    tw_right = fitz.TextWriter(page.rect)
+    tw_right.append(fitz.Point(mid_x + 20, y_center), "Right column content here.")
+    tw_right.write_text(page)
+
+    buf = doc.tobytes()
+    doc.close()
+    return buf
+
+
+def _make_unicode_pdf() -> bytes:
+    """Create a PDF with multilingual/Unicode text."""
+    doc = fitz.open()
+    page = doc.new_page()
+    y = page.rect.height / 2
+    tw = fitz.TextWriter(page.rect)
+    # Mix of scripts — Latin, accented, CJK-compatible ASCII representations
+    tw.append(fitz.Point(72, y), "Caf\u00e9 na\u00efve r\u00e9sum\u00e9")
+    tw.write_text(page)
+
+    page2 = doc.new_page()
+    tw2 = fitz.TextWriter(page2.rect)
+    tw2.append(fitz.Point(72, page2.rect.height / 2), "\u00dcber Stra\u00dfe Gr\u00f6\u00dfe")
+    tw2.write_text(page2)
+
+    buf = doc.tobytes()
     doc.close()
     return buf
 
@@ -227,3 +272,128 @@ class TestCleanText:
     def test_collapses_excessive_newlines(self):
         text = "A\n\n\n\n\nB"
         assert _clean_text(text) == "A\n\nB"
+
+
+# ---------------------------------------------------------------------------
+# Tests: Multi-column PDF
+# ---------------------------------------------------------------------------
+
+class TestMultiColumnPDF:
+    def test_extracts_both_columns(self, extractor: PDFExtractor):
+        pdf = _make_multicolumn_pdf()
+        result = extractor.extract_from_bytes(pdf)
+
+        assert result["extraction_method"] == "text"
+        assert result["page_count"] == 1
+        assert "Left column" in result["text"]
+        assert "Right column" in result["text"]
+
+    def test_does_not_merge_columns_into_garbage(self, extractor: PDFExtractor):
+        """Ensure column text is individually readable, not interleaved."""
+        pdf = _make_multicolumn_pdf()
+        result = extractor.extract_from_bytes(pdf)
+
+        text = result["text"]
+        left_idx = text.index("Left column")
+        right_idx = text.index("Right column")
+        # Both phrases should appear intact (not character-interleaved)
+        assert "Left column content here." in text
+        assert "Right column content here." in text
+
+
+# ---------------------------------------------------------------------------
+# Tests: Unicode / non-English text
+# ---------------------------------------------------------------------------
+
+class TestUnicodePDF:
+    def test_extracts_accented_characters(self, extractor: PDFExtractor):
+        pdf = _make_unicode_pdf()
+        result = extractor.extract_from_bytes(pdf)
+
+        assert result["extraction_method"] == "text"
+        assert result["page_count"] == 2
+        assert "Caf\u00e9" in result["text"]
+        assert "r\u00e9sum\u00e9" in result["text"]
+
+    def test_extracts_german_characters(self, extractor: PDFExtractor):
+        pdf = _make_unicode_pdf()
+        result = extractor.extract_from_bytes(pdf)
+
+        assert "\u00dcber" in result["text"]
+        assert "Stra\u00dfe" in result["text"]
+
+    def test_blank_pdf_no_crash(self, extractor: PDFExtractor):
+        """A PDF with a single blank page (no text at all) should not crash."""
+        doc = fitz.open()
+        doc.new_page()  # blank page, no text inserted
+        buf = doc.tobytes()
+        doc.close()
+
+        result = extractor.extract_from_bytes(buf)
+        assert result["extraction_method"] == "ocr"  # no text found
+        assert result["page_count"] == 1
+        assert result["text"] == ""
+
+
+# ---------------------------------------------------------------------------
+# Tests: S3 error handling
+# ---------------------------------------------------------------------------
+
+class TestS3Errors:
+    def test_download_not_found_raises(self, extractor: PDFExtractor):
+        """S3 NoSuchKey should propagate — orchestrator handles retries."""
+        error_response = {"Error": {"Code": "NoSuchKey", "Message": "Not found"}}
+        extractor._s3.get_object.side_effect = ClientError(error_response, "GetObject")
+
+        with pytest.raises(ClientError) as exc_info:
+            extractor.extract(
+                bucket="bucket",
+                key="ieee/pending/missing.pdf",
+                ou="ieee",
+                product_part_number="X",
+            )
+        assert exc_info.value.response["Error"]["Code"] == "NoSuchKey"
+
+    def test_download_access_denied_raises(self, extractor: PDFExtractor):
+        error_response = {"Error": {"Code": "AccessDenied", "Message": "Forbidden"}}
+        extractor._s3.get_object.side_effect = ClientError(error_response, "GetObject")
+
+        with pytest.raises(ClientError) as exc_info:
+            extractor.extract(
+                bucket="bucket",
+                key="ieee/pending/secret.pdf",
+                ou="ieee",
+                product_part_number="X",
+            )
+        assert exc_info.value.response["Error"]["Code"] == "AccessDenied"
+
+    def test_metadata_write_failure_raises(self, normal_pdf: bytes):
+        """If metadata put_object fails, the error should propagate."""
+        s3_mock = MagicMock()
+        s3_mock.get_object.return_value = {"Body": BytesIO(normal_pdf)}
+        error_response = {"Error": {"Code": "InternalError", "Message": "S3 down"}}
+        s3_mock.put_object.side_effect = ClientError(error_response, "PutObject")
+
+        extractor = PDFExtractor(s3_client=s3_mock)
+
+        with pytest.raises(ClientError):
+            extractor.extract(
+                bucket="bucket",
+                key="ieee/pending/doc.pdf",
+                ou="ieee",
+                product_part_number="STD-999",
+            )
+
+    def test_download_timeout_raises(self, extractor: PDFExtractor):
+        """Network timeout on S3 download should propagate."""
+        from botocore.exceptions import ReadTimeoutError
+
+        extractor._s3.get_object.side_effect = ReadTimeoutError(endpoint_url="https://s3.amazonaws.com")
+
+        with pytest.raises(ReadTimeoutError):
+            extractor.extract(
+                bucket="bucket",
+                key="ieee/pending/slow.pdf",
+                ou="ieee",
+                product_part_number="X",
+            )
