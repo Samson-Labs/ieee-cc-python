@@ -69,3 +69,27 @@ Docker-based Lambda deployed via AWS CLI (no CDK/SAM). The `Dockerfile` at the p
 - Each module exposes a method for unit testing without S3 (e.g. `extract_from_bytes()`, `generate_overlay()`).
 - Results use `TypedDict` for type safety.
 - AWS profile: `ieee-cc` (set via `.envrc` / direnv).
+
+### Deployment
+
+Docker-based Lambdas deployed via AWS CLI (no CDK/SAM). Each Lambda has its own Dockerfile, deploy script, and ECR repo. Images built with `--platform linux/amd64 --provenance=false` for Lambda compatibility on Apple Silicon.
+
+### AWS Resources (account `141770997341`, us-east-1)
+
+| Resource | Name | Config |
+|----------|------|--------|
+| S3 Bucket | `ieee-cc-python` | Shared across Lambdas |
+| ECR | `ieee-rc-image-generator` | Image overlay |
+| Lambda | `ieee-rc-image-generator` | 1024 MB, 60s timeout, Python 3.12 |
+| IAM Role | `ieee-rc-image-generator-role` | S3 read/write/delete + CloudWatch |
+| S3 Trigger | `actions/*.json` | -> `ieee-rc-image-generator` |
+
+### Deploy Commands
+
+```bash
+# Image Overlay Generator
+./scripts/deploy-image-overlay.sh          # first-time full deploy
+./scripts/deploy-image-overlay.sh update   # rebuild + update code only
+./scripts/invoke-image-overlay.sh <bucket> <key>
+./scripts/teardown-image-overlay.sh
+```
