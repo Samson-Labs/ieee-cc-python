@@ -66,3 +66,55 @@ Chronological log of implementation progress, decisions, and modules completed.
 3. Verified metadata written to `s3://ieee-cc-python/ieee/metadata/STD-TEST-001.pdf.json`
 
 **Result:** Full pipeline working — PDF download, text extraction, metadata write, structured response all confirmed on account `141770997341` (us-east-1).
+
+---
+
+## 2026-03-10 — Image Overlay Generation Module
+
+**Module:** `src/generators/image_overlay_generator.py`
+**Handler:** `src/handlers/image_overlay_handler.py`
+
+**What was built:**
+- `ImageOverlayGenerator` class that reads JSON trigger files from S3, loads a background image, applies text overlays (title, authors) using Pillow, and writes output to a destination bucket.
+- Supports both S3 event triggers (`actions/*.json`) and direct Lambda invocations.
+- Title overlay: word-wrapped, max 3 lines, 40px font, truncated with ellipsis.
+- Author overlay: word-wrapped, max 2 lines, 24px font.
+- Thumbnail generation when `is_thumbnail: true` (resized to 400x300 max).
+- Output formats: JPEG (default, with configurable quality) and PNG.
+- RGBA-to-RGB conversion for JPEG output (no alpha channel support).
+- Trigger JSON deleted on success, preserved on failure for retry.
+- Font loading with system font fallback chain (Linux/Lambda, macOS).
+
+**Trigger JSON schema:**
+```json
+{
+  "product_part_number": "STD-12345",
+  "title": "Product Title",
+  "authors": "Author One, Author Two",
+  "config": {
+    "source_bucket": "ieee-rc-assets",
+    "dest_bucket": "ieee-rc-public",
+    "public_path": "images/products"
+  },
+  "background_source": "ieee",
+  "output_format": "jpg",
+  "output_quality": 85,
+  "is_thumbnail": false
+}
+```
+
+**S3 paths:**
+- Trigger input: `actions/{job_id}.json`
+- Background: `backgrounds/{background_source}.jpg`
+- Output: `{config.public_path}/{product_part_number}.{format}`
+- Thumbnail: `{config.public_path}/{product_part_number}_thumb.{format}`
+
+**Lambda config:** `ieee-rc-image-generator`, Python 3.12 + Pillow, 1024 MB, 60s timeout.
+
+**Decisions:**
+- Used `src/generators/` (not `src/extractors/`) since this module generates output rather than extracting content.
+- Trigger JSON acts as a job queue — Drupal writes JSON, Lambda processes and deletes it.
+- Font fallback chain avoids hard dependency on specific system fonts.
+- Validation errors return 400 (not 500) so the orchestrator can distinguish bad input from infra failures.
+
+**Tests:** 28 generator tests + 12 handler tests = 40 total in `tests/generators/test_image_overlay_generator.py` and `tests/handlers/test_image_overlay_handler.py`. Covers overlay rendering, text wrapping/truncation, thumbnail generation, output formats (JPEG/PNG), trigger validation, S3 errors, image encoding, event parsing, and error handling.

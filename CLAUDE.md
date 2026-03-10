@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-IEEE Content Conversion (CC) pipeline — Python Lambda modules that extract text from PDFs in S3 and pass it to AWS Bedrock (Claude Sonnet) for processing. Modules are designed as reusable classes called by an orchestrator Lambda.
+IEEE Content Conversion (CC) pipeline — Python Lambda modules for PDF text extraction and image overlay generation. Modules are designed as reusable classes called by an orchestrator Lambda.
 
 ## Commands
 
@@ -37,9 +37,10 @@ pip install -r requirements.txt -r requirements-dev.txt
 ## Architecture
 
 - **`src/extractors/`** — Reusable extraction modules (one per file type). Each extractor class takes an S3 client, downloads the file, extracts content, writes metadata JSON back to S3, and returns a structured result dict.
-- **`src/handlers/`** — Lambda entry points. Each handler wraps an extractor, parses the event (direct invocation or S3 trigger), and returns a structured response.
-- **`scripts/`** — AWS CLI deployment scripts (`deploy.sh`, `invoke.sh`, `teardown.sh`).
-- **`tests/`** — Mirrors `src/` structure. Tests use in-memory PDFs built with PyMuPDF and mock S3 via `unittest.mock`.
+- **`src/generators/`** — Reusable generation modules. Each generator class takes an S3 client, reads trigger JSON, processes assets, writes output to S3, and returns a structured result dict.
+- **`src/handlers/`** — Lambda entry points. Each handler wraps an extractor or generator, parses the event, and returns a structured response.
+- **`scripts/`** — AWS CLI deployment scripts (per-Lambda: `deploy-*.sh`, `invoke-*.sh`, `teardown-*.sh`).
+- **`tests/`** — Mirrors `src/` structure. Tests use in-memory assets and mock S3 via `unittest.mock`.
 
 ### Deployment
 
@@ -56,13 +57,15 @@ Docker-based Lambda deployed via AWS CLI (no CDK/SAM). The `Dockerfile` at the p
 
 ### S3 Path Conventions
 
-- Input: `{ou}/pending/{filename}.pdf`
-- Metadata output: `{ou}/metadata/{product_part_number}.pdf.json`
+- PDF Input: `{ou}/pending/{filename}.pdf`
+- PDF Metadata output: `{ou}/metadata/{product_part_number}.pdf.json`
+- Image trigger: `actions/{job_id}.json`
+- Image background: `backgrounds/{ou_short_name}.jpg`
+- Image output: `{config.public_path}/{product_part_number}.{format}`
 
 ### Key Conventions
 
-- Extractors accept an optional `s3_client` param for dependency injection (testability).
-- Each extractor exposes a `extract_from_bytes()` method for unit testing without S3.
-- Extraction results use `TypedDict` with fields: `text`, `page_count`, `extraction_method` (`"text"` | `"ocr"` | `"failed"`).
-- Text is truncated to 180,000 characters to fit Claude Sonnet's context window.
+- All modules accept an optional `s3_client` param for dependency injection (testability).
+- Each module exposes a method for unit testing without S3 (e.g. `extract_from_bytes()`, `generate_overlay()`).
+- Results use `TypedDict` for type safety.
 - AWS profile: `ieee-cc` (set via `.envrc` / direnv).
