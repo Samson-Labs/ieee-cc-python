@@ -21,7 +21,6 @@ from src.generators.image_overlay_generator import (
     SUPPORTED_FORMATS,
     THUMBNAIL_SIZE,
     TITLE_MAX_LINES,
-    TITLE_WRAP_WIDTH,
     GenerationResult,
     ImageOverlayGenerator,
     _wrap_and_truncate,

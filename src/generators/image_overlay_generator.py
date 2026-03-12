@@ -18,18 +18,17 @@ from PIL import Image, ImageDraw, ImageFont
 
 logger = logging.getLogger(__name__)
 
-# Layout constants
-TITLE_FONT_SIZE = 40
-AUTHOR_FONT_SIZE = 24
-TITLE_MAX_LINES = 3
+# Layout constants (proportional to image dimensions)
+TITLE_FONT_RATIO = 0.042  # title font size as fraction of image height
+AUTHOR_FONT_RATIO = 0.026  # author font size as fraction of image height
+TITLE_MAX_LINES = 4
 AUTHOR_MAX_LINES = 2
-TITLE_WRAP_WIDTH = 30  # characters per line before wrapping
-AUTHOR_WRAP_WIDTH = 40
-TITLE_Y_START = 80
-AUTHOR_Y_OFFSET = 40  # gap below last title line
-LOGO_PADDING = 20
-TEXT_X_MARGIN = 60
-LINE_SPACING = 8
+LOGO_BAR_RATIO = 0.15  # bottom 15% reserved for logo bar
+TITLE_Y_RATIO = 0.12  # title starts at 12% from top
+AUTHOR_GAP_RATIO = 0.04  # gap between title and author as fraction of height
+LINE_SPACING_RATIO = 0.012  # line spacing as fraction of height
+SHADOW_OFFSET = 2  # pixels offset for text shadow
+SHADOW_COLOR = (0, 0, 0, 160)  # semi-transparent black
 
 # Thumbnail dimensions
 THUMBNAIL_SIZE = (400, 300)
@@ -166,7 +165,8 @@ class ImageOverlayGenerator:
     ) -> Image.Image:
         """Apply text overlays to a background image.
 
-        Useful for unit testing without S3 interaction.
+        Text is horizontally centered with a drop shadow for contrast.
+        Font sizes and positioning scale proportionally to image dimensions.
 
         Args:
             background: PIL Image to draw on (will be copied).
@@ -179,22 +179,53 @@ class ImageOverlayGenerator:
         img = background.copy()
         draw = ImageDraw.Draw(img)
 
-        title_font = _load_font(TITLE_FONT_SIZE)
-        author_font = _load_font(AUTHOR_FONT_SIZE)
+        w, h = img.size
+        content_h = h * (1 - LOGO_BAR_RATIO)  # area above logo bar
 
-        # Draw title (word-wrapped, max 3 lines, truncated)
-        title_lines = _wrap_and_truncate(title, TITLE_WRAP_WIDTH, TITLE_MAX_LINES)
-        y = TITLE_Y_START
+        title_font_size = max(20, int(h * TITLE_FONT_RATIO))
+        author_font_size = max(14, int(h * AUTHOR_FONT_RATIO))
+        line_spacing = int(h * LINE_SPACING_RATIO)
+        author_gap = int(h * AUTHOR_GAP_RATIO)
+
+        title_font = _load_font(title_font_size)
+        author_font = _load_font(author_font_size)
+
+        # Calculate wrap width based on image width and font size
+        # Estimate chars per line: usable width (~80% of image) / avg char width
+        avg_char_width = title_font_size * 0.55
+        title_wrap_width = max(15, int((w * 0.80) / avg_char_width))
+        avg_author_char_width = author_font_size * 0.55
+        author_wrap_width = max(20, int((w * 0.80) / avg_author_char_width))
+
+        # Draw title (word-wrapped, centered)
+        title_lines = _wrap_and_truncate(title, title_wrap_width, TITLE_MAX_LINES)
+        y = int(h * TITLE_Y_RATIO)
         for line in title_lines:
-            draw.text((TEXT_X_MARGIN, y), line, fill="white", font=title_font)
-            y += TITLE_FONT_SIZE + LINE_SPACING
+            bbox = draw.textbbox((0, 0), line, font=title_font)
+            text_w = bbox[2] - bbox[0]
+            x = (w - text_w) // 2
+            # Shadow
+            draw.text(
+                (x + SHADOW_OFFSET, y + SHADOW_OFFSET),
+                line, fill=SHADOW_COLOR, font=title_font,
+            )
+            # Main text
+            draw.text((x, y), line, fill="white", font=title_font)
+            y += title_font_size + line_spacing
 
-        # Draw authors (word-wrapped, max 2 lines)
-        author_lines = _wrap_and_truncate(authors, AUTHOR_WRAP_WIDTH, AUTHOR_MAX_LINES)
-        y += AUTHOR_Y_OFFSET
+        # Draw authors (word-wrapped, centered)
+        author_lines = _wrap_and_truncate(authors, author_wrap_width, AUTHOR_MAX_LINES)
+        y += author_gap
         for line in author_lines:
-            draw.text((TEXT_X_MARGIN, y), line, fill="white", font=author_font)
-            y += AUTHOR_FONT_SIZE + LINE_SPACING
+            bbox = draw.textbbox((0, 0), line, font=author_font)
+            text_w = bbox[2] - bbox[0]
+            x = (w - text_w) // 2
+            draw.text(
+                (x + SHADOW_OFFSET, y + SHADOW_OFFSET),
+                line, fill=SHADOW_COLOR, font=author_font,
+            )
+            draw.text((x, y), line, fill="white", font=author_font)
+            y += author_font_size + line_spacing
 
         return img
 
