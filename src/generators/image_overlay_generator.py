@@ -131,7 +131,7 @@ class ImageOverlayGenerator:
         thumbnail_key = ""
         if is_thumbnail:
             thumb = overlay.copy()
-            thumb.thumbnail(THUMBNAIL_SIZE, Image.LANCZOS)
+            thumb.thumbnail(THUMBNAIL_SIZE, Image.Resampling.LANCZOS)
             thumb_key_name = (
                 f"{config['public_path']}/{payload['product_part_number']}"
                 f"_thumb.{output_format}"
