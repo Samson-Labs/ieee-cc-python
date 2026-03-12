@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-IEEE Content Conversion (CC) pipeline — Python Lambda modules for PDF text extraction and image overlay generation. Modules are designed as reusable classes called by an orchestrator Lambda.
+IEEE Content Conversion (CC) pipeline — Python Lambda modules for PDF text extraction, image overlay generation, and AI-powered metadata generation via AWS Bedrock. Modules are designed as reusable classes called by an orchestrator Lambda.
 
 ## Commands
 
@@ -15,6 +15,7 @@ python -m pytest tests/ -v
 # Run a single test file
 python -m pytest tests/extractors/test_pdf_extractor.py -v
 python -m pytest tests/generators/test_image_overlay_generator.py -v
+python -m pytest tests/ai/test_bedrock_inference.py -v
 
 # Run a single test class or method
 python -m pytest tests/extractors/test_pdf_extractor.py::TestNormalPDF::test_extracts_text -v
@@ -33,13 +34,21 @@ pip install -r requirements.txt -r requirements-dev.txt
 ./scripts/deploy-image-overlay.sh update   # rebuild + update code only
 ./scripts/invoke-image-overlay.sh <bucket> <key>
 ./scripts/teardown-image-overlay.sh
+
+# Bedrock Metadata Generation Lambda
+./scripts/deploy-bedrock.sh                # first-time full deploy
+./scripts/deploy-bedrock.sh update         # rebuild + update code only
+./scripts/invoke-bedrock.sh <bucket> <key> # S3 metadata reference
+./scripts/invoke-bedrock.sh --text "text"  # direct text invocation
+./scripts/teardown-bedrock.sh
 ```
 
 ## Architecture
 
 - **`src/extractors/`** — Reusable extraction modules (one per file type). Each extractor class takes an S3 client, downloads the file, extracts content, writes metadata JSON back to S3, and returns a structured result dict. Contains its own `Dockerfile`.
 - **`src/generators/`** — Reusable generation modules. Each generator class takes an S3 client, reads trigger JSON, processes assets, writes output to S3, and returns a structured result dict. Contains its own `Dockerfile` and `requirements.txt`.
-- **`src/handlers/`** — Lambda entry points. Each handler wraps an extractor or generator, parses the event, and returns a structured response.
+- **`src/ai/`** — AI inference modules. `BedrockInference` calls AWS Bedrock (Claude Sonnet) with the IEEE system prompt to generate structured metadata from document text. Includes retry logic for throttling and invalid JSON. Contains its own `Dockerfile` and `requirements.txt`.
+- **`src/handlers/`** — Lambda entry points. Each handler wraps an extractor, generator, or inference module, parses the event, and returns a structured response.
 - **`scripts/`** — AWS CLI deployment scripts (per-Lambda: `deploy-*.sh`, `invoke-*.sh`, `teardown-*.sh`).
 - **`tests/`** — Mirrors `src/` structure. Tests use in-memory assets and mock S3 via `unittest.mock`.
 
@@ -54,10 +63,13 @@ Docker-based Lambdas deployed via AWS CLI (no CDK/SAM). Each Lambda has its own 
 | S3 Bucket | `dev-ieee-conference-cloud-bulk-uploads` | Shared across Lambdas, versioned |
 | ECR | `ieee-cc-pdf-extractor` | PDF extractor |
 | ECR | `ieee-rc-image-generator` | Image overlay |
+| ECR | `ieee-cc-bedrock-inference` | Bedrock metadata |
 | Lambda | `ieee-cc-pdf-extractor` | 3 GB, 5 min timeout, Python 3.13 |
 | Lambda | `ieee-rc-image-generator` | 1024 MB, 60s timeout, Python 3.12 |
+| Lambda | `ieee-cc-bedrock-inference` | 512 MB, 120s timeout, Python 3.13 |
 | IAM Role | `ieee-cc-pdf-extractor-role` | S3 read/write + CloudWatch |
 | IAM Role | `ieee-rc-image-generator-role` | S3 read/write/delete + CloudWatch |
+| IAM Role | `ieee-cc-bedrock-inference-role` | S3 read + Bedrock invoke + CloudWatch |
 | S3 Trigger | `actions/*.json` | -> `ieee-rc-image-generator` |
 
 ### S3 Path Conventions
@@ -71,6 +83,6 @@ Docker-based Lambdas deployed via AWS CLI (no CDK/SAM). Each Lambda has its own 
 ### Key Conventions
 
 - All modules accept an optional `s3_client` param for dependency injection (testability).
-- Each module exposes a method for unit testing without S3 (e.g. `extract_from_bytes()`, `generate_overlay()`).
+- Each module exposes a method for unit testing without S3/Bedrock (e.g. `extract_from_bytes()`, `generate_overlay()`, `generate_metadata()`).
 - Results use `TypedDict` for type safety.
 - AWS profile: `ieee-cc` (set via `.envrc` / direnv).
