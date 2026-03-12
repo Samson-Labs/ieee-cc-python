@@ -14,7 +14,7 @@ set -euo pipefail
 
 AWS_PROFILE="${AWS_PROFILE:-ieee-cc}"
 AWS_REGION="${AWS_REGION:-us-east-1}"
-AWS_ACCOUNT_ID="${AWS_ACCOUNT_ID:-141770997341}"
+AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
 
 ECR_REPO_NAME="ieee-rc-image-generator"
 LAMBDA_FUNCTION_NAME="ieee-rc-image-generator"
