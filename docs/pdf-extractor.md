@@ -87,4 +87,4 @@ This is consumed by the MetadataExtractor on the Drupal side.
 python -m pytest tests/extractors/test_pdf_extractor.py -v
 ```
 
-12 tests covering: normal PDF, scanned PDF, encrypted PDF, corrupted PDF, large PDF truncation, S3 integration with metadata write, and text cleaning utilities.
+21 tests covering: normal PDF, scanned PDF, encrypted PDF, corrupted PDF, large PDF truncation, multi-column PDF, Unicode text, blank PDF, S3 errors (404, 403, 500, timeout), S3 integration with metadata write, and text cleaning utilities.
