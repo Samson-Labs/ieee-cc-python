@@ -17,7 +17,7 @@ The `BedrockInference` module calls AWS Bedrock (Claude Sonnet) to generate stru
 ```json
 {
   "anthropic_version": "bedrock-2023-05-31",
-  "modelId": "anthropic.claude-sonnet-4-5-20250929-v1:0",
+  "modelId": "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
   "messages": [
     {"role": "user", "content": "<extracted text truncated to 180k chars>"}
   ],
@@ -81,7 +81,7 @@ The S3 JSON file must contain an `extractedText` field.
 
 | Setting | Default | Override |
 |---------|---------|----------|
-| Model ID | `anthropic.claude-sonnet-4-5-20250929-v1:0` | `BEDROCK_MODEL_ID` env var |
+| Model ID | `us.anthropic.claude-sonnet-4-5-20250929-v1:0` | `BEDROCK_MODEL_ID` env var |
 | Log level | `INFO` | `LOG_LEVEL` env var |
 | Text truncation | 180,000 chars | `TEXT_TRUNCATION_LIMIT` constant |
 

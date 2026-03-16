@@ -20,7 +20,7 @@ ECR_REPO_NAME="ieee-cc-bedrock-inference"
 LAMBDA_FUNCTION_NAME="ieee-cc-bedrock-inference"
 LAMBDA_ROLE_NAME="ieee-cc-bedrock-inference-role"
 IMAGE_TAG="latest"
-BEDROCK_MODEL_ID="${BEDROCK_MODEL_ID:-anthropic.claude-sonnet-4-5-20250929-v1:0}"
+BEDROCK_MODEL_ID="${BEDROCK_MODEL_ID:-us.anthropic.claude-sonnet-4-5-20250929-v1:0}"
 
 ECR_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO_NAME}"
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -96,7 +96,10 @@ create_lambda_role() {
             {
                 "Effect": "Allow",
                 "Action": ["bedrock:InvokeModel"],
-                "Resource": "arn:aws:bedrock:*::foundation-model/*"
+                "Resource": [
+                    "arn:aws:bedrock:*::foundation-model/*",
+                    "arn:aws:bedrock:*:*:inference-profile/*"
+                ]
             }
         ]
     }'
