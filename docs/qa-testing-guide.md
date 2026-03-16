@@ -168,14 +168,21 @@ for pdf in PES_TP_Mag_PE_v23_N6_SP PES_TR_138_SBLCS_011726 PES_TR_TR139_ITSLC_01
     --payload "{\"bucket\":\"dev-ieee-conference-cloud-bulk-uploads\",\"key\":\"PES/pending/${pdf}.pdf\",\"ou\":\"PES\",\"product_part_number\":\"${pdf}\"}" \
     /tmp/pdf-${pdf}.json
   python3 -c "
-import json
-with open('/tmp/pdf-${pdf}.json') as f:
-    data = json.load(f)
-b = data['body']
-print(f\"  Status: {data['statusCode']}\")
-print(f\"  Pages: {b['page_count']}\")
-print(f\"  Method: {b['extraction_method']}\")
-print(f\"  Text length: {len(b['text'])} chars\")
+import json, sys
+try:
+    with open(f'/tmp/pdf-{pdf}.json') as f:
+        data = json.load(f)
+    body = data.get('body', {})
+    status = data.get('statusCode')
+    print(f'  Status: {status}')
+    if status == 200:
+        print(f'  Pages: {body.get(\"page_count\", \"N/A\")}')
+        print(f'  Method: {body.get(\"extraction_method\", \"N/A\")}')
+        print(f'  Text length: {len(body.get(\"text\", \"\"))} chars')
+    else:
+        print(f'  Error: {body.get(\"error\", \"Unknown error\")}')
+except Exception as e:
+    print(f'  Failed to process response: {type(e).__name__}', file=sys.stderr)
 "
   echo ""
 done
