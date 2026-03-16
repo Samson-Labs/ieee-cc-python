@@ -166,7 +166,7 @@ for pdf in PES_TP_Mag_PE_v23_N6_SP PES_TR_138_SBLCS_011726 PES_TR_TR139_ITSLC_01
   aws lambda invoke \
     --function-name ieee-cc-pdf-extractor \
     --payload "{\"bucket\":\"dev-ieee-conference-cloud-bulk-uploads\",\"key\":\"PES/pending/${pdf}.pdf\",\"ou\":\"PES\",\"product_part_number\":\"${pdf}\"}" \
-    /tmp/pdf-${pdf}.json 2>/dev/null
+    /tmp/pdf-${pdf}.json
   python3 -c "
 import json
 with open('/tmp/pdf-${pdf}.json') as f:
