@@ -18,11 +18,13 @@ from src.generators.image_overlay_generator import (
     AUTHOR_MAX_LINES,
     DEFAULT_FORMAT,
     DEFAULT_QUALITY,
+    LEGACY_FIELDS,
     SUPPORTED_FORMATS,
     THUMBNAIL_SIZE,
     TITLE_MAX_LINES,
     GenerationResult,
     ImageOverlayGenerator,
+    _parse_legacy_attributes,
     _wrap_and_truncate,
 )
 
@@ -431,3 +433,195 @@ class TestImageEncoding:
         # Should succeed and produce valid JPEG
         reloaded = Image.open(BytesIO(data))
         assert reloaded.mode == "RGB"
+
+
+# ---------------------------------------------------------------------------
+# Helpers: legacy schema
+# ---------------------------------------------------------------------------
+
+
+def _make_legacy_payload(**overrides) -> dict:
+    """Create a valid legacy Drupal trigger payload."""
+    payload = {
+        "sourceBucket": "ieee-conference-cloud-uploads",
+        "sourceName": "video-image-backgrounds/conferences/ieee-test.jpg",
+        "destBucket": "ieee-conference-cloud-bulk-uploads",
+        "destName": "SPS/SPSTEST001.jpg",
+        "overlay": [
+            {
+                "text": "Advanced Power Systems Engineering",
+                "attributes": [
+                    {"attr": "y", "value": "22%"},
+                    {"attr": "x", "value": "50%"},
+                    {"attr": "fill", "value": "white"},
+                    {"attr": "text-anchor", "value": "middle"},
+                    {"attr": "font-family", "value": "OpenSans"},
+                    {"attr": "font-weight", "value": "Bold"},
+                    {"attr": "font-size", "value": "64px"},
+                ],
+                "rowHeightPad": "30",
+            },
+            {
+                "text": "Jane Doe, John Smith",
+                "attributes": [
+                    {"attr": "y", "value": "70%"},
+                    {"attr": "x", "value": "50%"},
+                    {"attr": "fill", "value": "white"},
+                    {"attr": "text-anchor", "value": "middle"},
+                    {"attr": "font-family", "value": "OpenSans"},
+                    {"attr": "font-size", "value": "32px"},
+                    {"attr": "font-weight", "value": "bold"},
+                ],
+                "rowHeightPad": "15",
+            },
+        ],
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _mock_s3_for_legacy_trigger(s3_mock, trigger_payload=None, bg_size=(800, 600)):
+    """Set up S3 mock for legacy trigger JSON and background image."""
+    trigger = trigger_payload or _make_legacy_payload()
+    trigger_bytes = json.dumps(trigger).encode()
+    bg_bytes = _background_bytes(*bg_size)
+
+    def get_object_side_effect(Bucket, Key):
+        if Key.endswith(".json"):
+            return {"Body": BytesIO(trigger_bytes)}
+        # Legacy uses full source path, not backgrounds/ prefix
+        return {"Body": BytesIO(bg_bytes)}
+
+    s3_mock.get_object.side_effect = get_object_side_effect
+
+
+# ---------------------------------------------------------------------------
+# Tests: legacy schema support
+# ---------------------------------------------------------------------------
+
+
+class TestLegacySchemaDetection:
+    def test_detects_legacy_payload(self):
+        payload = _make_legacy_payload()
+        assert ImageOverlayGenerator._is_legacy_payload(payload) is True
+
+    def test_detects_standard_payload(self):
+        payload = _make_trigger_payload()
+        assert ImageOverlayGenerator._is_legacy_payload(payload) is False
+
+    def test_validates_legacy_payload(self):
+        gen = ImageOverlayGenerator(s3_client=MagicMock())
+        payload = _make_legacy_payload()
+        gen._validate_legacy_payload(payload)  # should not raise
+
+    def test_missing_legacy_field_raises(self):
+        gen = ImageOverlayGenerator(s3_client=MagicMock())
+        for field in ["sourceBucket", "sourceName", "destBucket", "destName", "overlay"]:
+            payload = _make_legacy_payload()
+            del payload[field]
+            with pytest.raises(ValueError, match="Missing required fields"):
+                gen._validate_legacy_payload(payload)
+
+    def test_overlay_not_list_raises(self):
+        gen = ImageOverlayGenerator(s3_client=MagicMock())
+        payload = _make_legacy_payload(overlay="not a list")
+        with pytest.raises(ValueError, match="must be a list"):
+            gen._validate_legacy_payload(payload)
+
+
+class TestParseLegacyAttributes:
+    def test_parses_font_size(self):
+        attrs = [{"attr": "font-size", "value": "64px"}]
+        result = _parse_legacy_attributes(attrs)
+        assert result["font_size"] == 64
+
+    def test_parses_position_percentages(self):
+        attrs = [
+            {"attr": "x", "value": "50%"},
+            {"attr": "y", "value": "22%"},
+        ]
+        result = _parse_legacy_attributes(attrs)
+        assert result["x_pct"] == 50.0
+        assert result["y_pct"] == 22.0
+
+    def test_parses_fill_and_anchor(self):
+        attrs = [
+            {"attr": "fill", "value": "white"},
+            {"attr": "text-anchor", "value": "middle"},
+        ]
+        result = _parse_legacy_attributes(attrs)
+        assert result["fill"] == "white"
+        assert result["text_anchor"] == "middle"
+
+    def test_parses_font_weight(self):
+        attrs = [{"attr": "font-weight", "value": "Bold"}]
+        result = _parse_legacy_attributes(attrs)
+        assert result["font_weight"] == "Bold"
+
+    def test_empty_attributes(self):
+        assert _parse_legacy_attributes([]) == {}
+
+
+class TestLegacyProcessTrigger:
+    def test_generates_and_uploads_image(self):
+        s3_mock = MagicMock()
+        _mock_s3_for_legacy_trigger(s3_mock)
+        gen = ImageOverlayGenerator(s3_client=s3_mock)
+
+        result = gen.process_trigger(
+            bucket="trigger-bucket", key="actions/job-001.json"
+        )
+
+        assert result["output_key"] == "SPS/SPSTEST001.jpg"
+        assert result["format"] == "jpg"
+        assert result["width"] == 800
+        assert result["height"] == 600
+        assert result["thumbnail_key"] == ""
+
+        put_calls = s3_mock.put_object.call_args_list
+        assert len(put_calls) == 1
+        assert put_calls[0][1]["Bucket"] == "ieee-conference-cloud-bulk-uploads"
+        assert put_calls[0][1]["Key"] == "SPS/SPSTEST001.jpg"
+
+    def test_deletes_trigger_on_success(self):
+        s3_mock = MagicMock()
+        _mock_s3_for_legacy_trigger(s3_mock)
+        gen = ImageOverlayGenerator(s3_client=s3_mock)
+
+        gen.process_trigger(bucket="trigger-bucket", key="actions/job.json")
+
+        s3_mock.delete_object.assert_called_once_with(
+            Bucket="trigger-bucket", Key="actions/job.json"
+        )
+
+    def test_overlay_modifies_pixels(self):
+        gen = ImageOverlayGenerator(s3_client=MagicMock())
+        bg = _make_background()
+        overlay_specs = _make_legacy_payload()["overlay"]
+
+        result = gen.generate_legacy_overlay(
+            background=bg, overlay_specs=overlay_specs
+        )
+
+        assert list(result.getdata()) != list(bg.getdata())
+
+    def test_empty_overlay_list(self):
+        gen = ImageOverlayGenerator(s3_client=MagicMock())
+        bg = _make_background()
+
+        result = gen.generate_legacy_overlay(background=bg, overlay_specs=[])
+        assert result.size == bg.size
+
+    def test_png_output_from_dest_extension(self):
+        s3_mock = MagicMock()
+        trigger = _make_legacy_payload(destName="SPS/output.png")
+        _mock_s3_for_legacy_trigger(s3_mock, trigger)
+        gen = ImageOverlayGenerator(s3_client=s3_mock)
+
+        result = gen.process_trigger(
+            bucket="trigger-bucket", key="actions/job.json"
+        )
+
+        assert result["format"] == "png"
+        put_kwargs = s3_mock.put_object.call_args[1]
+        assert put_kwargs["ContentType"] == "image/png"

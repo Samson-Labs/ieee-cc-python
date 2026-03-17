@@ -8,7 +8,7 @@ Python Lambda modules for the IEEE Content Conversion pipeline. Handles PDF text
 # Install dependencies
 pip install -r requirements.txt -r requirements-dev.txt
 
-# Run all tests (100+ total)
+# Run all tests (119 total)
 python -m pytest tests/ -v
 
 # Deploy PDF Extractor
@@ -139,7 +139,7 @@ src/
     bedrock_handler.py            # Bedrock inference Lambda entry point
 tests/
   extractors/test_pdf_extractor.py           # 21 tests
-  generators/test_image_overlay_generator.py # 28 tests
+  generators/test_image_overlay_generator.py # 43 tests
   ai/test_bedrock_inference.py               # 25 tests
   handlers/
     test_pdf_handler.py                      # 9 tests
