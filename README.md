@@ -1,6 +1,6 @@
 # IEEE Content Conversion — Python Pipeline
 
-Python Lambda modules for the IEEE Content Conversion pipeline. Handles PDF text extraction, image overlay generation, and AI-powered metadata generation via Docker-based Lambdas deployed to AWS.
+Python Lambda modules for the IEEE Content Conversion pipeline. Handles PDF text extraction, video transcription, image overlay generation, and AI-powered metadata generation via Docker-based Lambdas deployed to AWS.
 
 ## Quick Start
 
@@ -8,7 +8,7 @@ Python Lambda modules for the IEEE Content Conversion pipeline. Handles PDF text
 # Install dependencies
 pip install -r requirements.txt -r requirements-dev.txt
 
-# Run all tests (119 total)
+# Run all tests (190 total)
 python -m pytest tests/ -v
 
 # Deploy PDF Extractor
@@ -19,6 +19,9 @@ python -m pytest tests/ -v
 
 # Deploy Bedrock Metadata Generator
 ./scripts/deploy-bedrock.sh
+
+# Deploy Video Transcriber
+./scripts/deploy-video-transcriber.sh
 ```
 
 ## Lambdas
@@ -64,6 +67,26 @@ S3: actions/{job_id}.json  (trigger from Drupal)
            +-> Delete trigger JSON on success
 ```
 
+### Video Transcriber
+
+Transcribes video files (MP4, MOV, WEBM) using AWS Transcribe with speaker diarization. Optionally cleans transcripts with Claude 3.5 Haiku to remove filler words and fix formatting.
+
+```
+S3: {ou}/pending/{file}.{mp4|mov|webm}
+        |
+        v
++-----------------------------+
+|  ieee-cc-video-transcriber  |  (Python 3.13, boto3, 512MB, 15min)
+|  +- AWS Transcribe          |  (en-US, max 2 speakers)
+|  +- Speaker diarization     |  (poll every 30s, 600s timeout)
+|  +- Claude Haiku cleanup    |  (optional filler word removal)
++----------+------------------+
+           |
+           +-> Response: {transcript, duration, duration_seconds, speaker_count}
+           |
+           +-> S3: {ou}/metadata/{part_number}.mp4.json
+```
+
 ### Bedrock Metadata Generator
 
 Takes extracted document text, sends it to AWS Bedrock (Claude Sonnet) with the IEEE Technical Metadata Specialist system prompt (v1.2), and returns structured metadata.
@@ -92,9 +115,11 @@ Extracted text (direct or from S3 JSON)
 | ECR | `ieee-cc-pdf-extractor` | PDF extractor image |
 | ECR | `ieee-rc-image-generator` | Image overlay image |
 | ECR | `ieee-cc-bedrock-inference` | Bedrock metadata image |
+| ECR | `ieee-cc-video-transcriber` | Video transcriber image |
 | Lambda | `ieee-cc-pdf-extractor` | 3 GB, 5 min timeout |
 | Lambda | `ieee-rc-image-generator` | 1024 MB, 60s timeout |
 | Lambda | `ieee-cc-bedrock-inference` | 512 MB, 120s timeout |
+| Lambda | `ieee-cc-video-transcriber` | 512 MB, 15 min timeout |
 | S3 Trigger | `actions/*.json` | -> image generator |
 
 ## Invoking
@@ -118,13 +143,20 @@ Extracted text (direct or from S3 JSON)
 ./scripts/invoke-bedrock.sh --text "Extracted document text..."
 ```
 
+**Video Transcriber:**
+```bash
+./scripts/invoke-video-transcriber.sh dev-ieee-conference-cloud-bulk-uploads PES/pending/lecture.mp4 PES LECTURE-001
+```
+
 ## Project Structure
 
 ```
 src/
   extractors/
-    Dockerfile                    # Python 3.13 + PyMuPDF
+    Dockerfile                    # Python 3.13 + PyMuPDF (PDF extractor)
+    VideoTranscriberDockerfile    # Python 3.13 + boto3 (Video transcriber)
     pdf_extractor.py              # PDF text extraction
+    video_transcriber.py          # Video transcription (AWS Transcribe + Haiku)
   generators/
     Dockerfile                    # Python 3.12 + Pillow
     requirements.txt              # Pillow + boto3
@@ -137,18 +169,22 @@ src/
     pdf_handler.py                # PDF extractor Lambda entry point
     image_overlay_handler.py      # Image overlay Lambda entry point
     bedrock_handler.py            # Bedrock inference Lambda entry point
+    video_transcriber_handler.py  # Video transcriber Lambda entry point
 tests/
   extractors/test_pdf_extractor.py           # 21 tests
+  extractors/test_video_transcriber.py       # 35 tests
   generators/test_image_overlay_generator.py # 43 tests
   ai/test_bedrock_inference.py               # 25 tests
   handlers/
     test_pdf_handler.py                      # 9 tests
     test_image_overlay_handler.py            # 12 tests
     test_bedrock_handler.py                  # 9 tests
+    test_video_transcriber_handler.py        # 18 tests
 scripts/
   deploy.sh / invoke.sh / teardown.sh                        # PDF extractor
   deploy-image-overlay.sh / invoke-image-overlay.sh / teardown-image-overlay.sh  # Image overlay
   deploy-bedrock.sh / invoke-bedrock.sh / teardown-bedrock.sh                    # Bedrock metadata
+  deploy-video-transcriber.sh / invoke-video-transcriber.sh / teardown-video-transcriber.sh  # Video transcriber
 ```
 
 ## Documentation
@@ -156,4 +192,5 @@ scripts/
 - [PDF Extractor Module](docs/pdf-extractor.md) — extraction pipeline, error handling, API
 - [Image Overlay Generator](docs/image-overlay-generator.md) — trigger schema, text layout, output formats
 - [Bedrock Metadata Generator](docs/bedrock-inference.md) — system prompt, validation, retry logic
+- [Video Transcriber Module](docs/video-transcriber.md) — AWS Transcribe integration, speaker diarization, Haiku cleanup
 - [Deployment Guide](docs/deployment.md) — AWS CLI deploy, teardown, configuration
