@@ -65,6 +65,10 @@ class TriggerPayload(TypedDict, total=False):
     is_thumbnail: bool
 
 
+# Legacy schema fields (existing Drupal ImageGenerationService format)
+LEGACY_FIELDS = {"sourceBucket", "sourceName", "destBucket", "destName", "overlay"}
+
+
 class GenerationResult(TypedDict):
     output_key: str
     thumbnail_key: str
@@ -82,11 +86,12 @@ class ImageOverlayGenerator:
     def process_trigger(self, bucket: str, key: str) -> GenerationResult:
         """Process an S3 trigger JSON file end-to-end.
 
-        1. Read and validate the trigger JSON
-        2. Load the background image
-        3. Generate the overlay image (and thumbnail if requested)
-        4. Write output(s) to the destination bucket
-        5. Delete the trigger JSON on success
+        Supports both the new schema (product_part_number/title/authors/config)
+        and the legacy Drupal schema (sourceBucket/sourceName/destBucket/destName/overlay).
+
+        1. Read the trigger JSON
+        2. Detect schema and route accordingly
+        3. Generate overlay, write output, delete trigger
 
         Args:
             bucket: S3 bucket containing the trigger JSON.
@@ -98,6 +103,16 @@ class ImageOverlayGenerator:
         logger.info("Processing trigger s3://%s/%s", bucket, key)
 
         payload = self._read_trigger(bucket, key)
+
+        if self._is_legacy_payload(payload):
+            return self._process_legacy(payload, bucket, key)
+
+        return self._process_standard(payload, bucket, key)
+
+    def _process_standard(
+        self, payload: dict, trigger_bucket: str, trigger_key: str
+    ) -> GenerationResult:
+        """Process a trigger using the standard schema."""
         self._validate_payload(payload)
 
         config = payload["config"]
@@ -146,12 +161,74 @@ class ImageOverlayGenerator:
             )
 
         # Delete trigger JSON on success
-        self._s3.delete_object(Bucket=bucket, Key=key)
-        logger.info("Deleted trigger s3://%s/%s", bucket, key)
+        self._s3.delete_object(Bucket=trigger_bucket, Key=trigger_key)
+        logger.info("Deleted trigger s3://%s/%s", trigger_bucket, trigger_key)
 
         return GenerationResult(
             output_key=output_key,
             thumbnail_key=thumbnail_key,
+            width=overlay.width,
+            height=overlay.height,
+            format=output_format,
+        )
+
+    def _process_legacy(
+        self, payload: dict, trigger_bucket: str, trigger_key: str
+    ) -> GenerationResult:
+        """Process a trigger using the legacy Drupal schema.
+
+        Legacy format:
+        {
+            "sourceBucket": "ieee-conference-cloud-uploads",
+            "sourceName": "video-image-backgrounds/conferences/bg.jpg",
+            "destBucket": "ieee-conference-cloud-bulk-uploads",
+            "destName": "SPS/output.jpg",
+            "overlay": [
+                {
+                    "text": "Title text",
+                    "attributes": [{"attr": "font-size", "value": "64px"}, ...],
+                    "rowHeightPad": "30"
+                }
+            ]
+        }
+        """
+        self._validate_legacy_payload(payload)
+        logger.info("Detected legacy Drupal trigger schema")
+
+        source_bucket = payload["sourceBucket"]
+        source_name = payload["sourceName"]
+        dest_bucket = payload["destBucket"]
+        dest_name = payload["destName"]
+        overlay_specs = payload["overlay"]
+
+        # Load background image
+        bg_bytes = self._download(source_bucket, source_name)
+        background = Image.open(BytesIO(bg_bytes)).convert("RGBA")
+
+        # Extract text and styling from overlay specs
+        overlay = self.generate_legacy_overlay(
+            background=background,
+            overlay_specs=overlay_specs,
+        )
+
+        # Determine output format from dest key extension
+        output_format = dest_name.rsplit(".", 1)[-1].lower() if "." in dest_name else DEFAULT_FORMAT
+        if output_format not in SUPPORTED_FORMATS:
+            output_format = DEFAULT_FORMAT
+        output_quality = DEFAULT_QUALITY
+
+        # Write output image
+        image_bytes = self._encode_image(overlay, output_format, output_quality)
+        self._upload(dest_bucket, dest_name, image_bytes, output_format)
+        logger.info("Wrote overlay to s3://%s/%s", dest_bucket, dest_name)
+
+        # Delete trigger JSON on success
+        self._s3.delete_object(Bucket=trigger_bucket, Key=trigger_key)
+        logger.info("Deleted trigger s3://%s/%s", trigger_bucket, trigger_key)
+
+        return GenerationResult(
+            output_key=dest_name,
+            thumbnail_key="",
             width=overlay.width,
             height=overlay.height,
             format=output_format,
@@ -187,8 +264,8 @@ class ImageOverlayGenerator:
         line_spacing = int(h * LINE_SPACING_RATIO)
         author_gap = int(h * AUTHOR_GAP_RATIO)
 
-        title_font = _load_font(title_font_size)
-        author_font = _load_font(author_font_size)
+        title_font = _load_font(title_font_size, bold=True)
+        author_font = _load_font(author_font_size, bold=False)
 
         # Calculate wrap width based on image width and font size
         # Estimate chars per line: usable width (~80% of image) / avg char width
@@ -229,9 +306,92 @@ class ImageOverlayGenerator:
 
         return img
 
+    def generate_legacy_overlay(
+        self,
+        background: Image.Image,
+        overlay_specs: list[dict],
+    ) -> Image.Image:
+        """Apply text overlays using the legacy Drupal overlay spec format.
+
+        Each spec contains:
+            text: The text to render
+            attributes: List of {attr, value} CSS-style attribute dicts
+            rowHeightPad: Padding between wrapped lines
+
+        Args:
+            background: PIL Image to draw on (will be copied).
+            overlay_specs: List of overlay specification dicts.
+
+        Returns:
+            New PIL Image with overlays applied.
+        """
+        img = background.copy()
+        draw = ImageDraw.Draw(img)
+        w, h = img.size
+
+        for spec in overlay_specs:
+            text = spec.get("text", "")
+            if not text:
+                continue
+
+            attrs = _parse_legacy_attributes(spec.get("attributes", []))
+            row_height_pad = int(spec.get("rowHeightPad", 10))
+
+            font_size = attrs.get("font_size", 40)
+            is_bold = attrs.get("font_weight", "").lower() in ("bold", "700", "800", "900")
+            font = _load_font(font_size, bold=is_bold)
+            fill_color = attrs.get("fill", "white")
+
+            # Calculate position from percentage or pixel values
+            x_pct = attrs.get("x_pct")
+            y_pct = attrs.get("y_pct")
+            text_anchor = attrs.get("text_anchor", "middle")
+
+            y_pos = int(h * y_pct / 100) if y_pct is not None else int(h * 0.2)
+
+            # Word-wrap text based on image width and font
+            avg_char_width = font_size * 0.55
+            wrap_width = max(15, int((w * 0.85) / avg_char_width))
+            lines = _wrap_and_truncate(text, wrap_width, TITLE_MAX_LINES)
+
+            for line in lines:
+                bbox = draw.textbbox((0, 0), line, font=font)
+                text_w = bbox[2] - bbox[0]
+
+                if text_anchor == "middle":
+                    x_pos = (w - text_w) // 2
+                elif text_anchor == "start":
+                    x_pos = int(w * x_pct / 100) if x_pct is not None else 0
+                else:
+                    x_pos = (w - text_w) // 2
+
+                # Drop shadow
+                draw.text(
+                    (x_pos + SHADOW_OFFSET, y_pos + SHADOW_OFFSET),
+                    line, fill=SHADOW_COLOR, font=font,
+                )
+                draw.text((x_pos, y_pos), line, fill=fill_color, font=font)
+                y_pos += font_size + row_height_pad
+
+        return img
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _is_legacy_payload(payload: dict) -> bool:
+        """Check if the payload uses the legacy Drupal schema."""
+        return "overlay" in payload and "sourceBucket" in payload
+
+    @staticmethod
+    def _validate_legacy_payload(payload: dict) -> None:
+        """Validate a legacy Drupal trigger payload."""
+        missing = LEGACY_FIELDS - set(payload.keys())
+        if missing:
+            raise ValueError(f"Missing required fields: {', '.join(sorted(missing))}")
+        if not isinstance(payload.get("overlay"), list):
+            raise ValueError("'overlay' must be a list")
 
     def _read_trigger(self, bucket: str, key: str) -> TriggerPayload:
         body = self._download(bucket, key)
@@ -298,15 +458,54 @@ def _wrap_and_truncate(text: str, width: int, max_lines: int) -> list[str]:
     return lines
 
 
-def _load_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+def _parse_legacy_attributes(attributes: list[dict]) -> dict:
+    """Parse legacy CSS-style attributes into a normalized dict.
+
+    Input format: [{"attr": "font-size", "value": "64px"}, ...]
+    Output: {"font_size": 64, "fill": "white", "x_pct": 50, ...}
+    """
+    result: dict = {}
+    for item in attributes:
+        attr = item.get("attr", "")
+        value = item.get("value", "")
+
+        if attr == "font-size":
+            result["font_size"] = int(value.replace("px", ""))
+        elif attr == "font-weight":
+            result["font_weight"] = value
+        elif attr == "font-family":
+            result["font_family"] = value
+        elif attr == "fill":
+            result["fill"] = value
+        elif attr == "text-anchor":
+            result["text_anchor"] = value
+        elif attr == "x":
+            if value.endswith("%"):
+                result["x_pct"] = float(value.replace("%", ""))
+        elif attr == "y":
+            if value.endswith("%"):
+                result["y_pct"] = float(value.replace("%", ""))
+
+    return result
+
+
+def _load_font(
+    size: int, *, bold: bool = True
+) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
     """Load a TrueType font, falling back to Pillow's default."""
-    # Try common system font paths
-    font_paths = [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",  # Linux/Lambda
+    bold_paths = [
+        "/usr/share/fonts/truetype/opensans/OpenSans-Bold.ttf",  # Bundled
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
         "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
         "/System/Library/Fonts/Helvetica.ttc",  # macOS
-        "/System/Library/Fonts/SFNSDisplay.ttf",  # macOS fallback
     ]
+    regular_paths = [
+        "/usr/share/fonts/truetype/opensans/OpenSans-SemiBold.ttf",  # Bundled
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/System/Library/Fonts/Helvetica.ttc",  # macOS
+    ]
+    font_paths = bold_paths if bold else regular_paths
     for path in font_paths:
         try:
             return ImageFont.truetype(path, size)

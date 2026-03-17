@@ -257,7 +257,77 @@ aws s3 cp /tmp/overlay-test4.json s3://dev-ieee-conference-cloud-bulk-uploads/ac
 
 ---
 
-## Test 5: Error Handling
+## Test 5: Legacy Drupal Schema (Backward Compatibility)
+
+Tests that the Lambda accepts the existing Drupal `ImageGenerationService` JSON format:
+
+```bash
+cat > /tmp/overlay-test5.json << 'EOF'
+{
+    "sourceBucket": "dev-ieee-conference-cloud-bulk-uploads",
+    "sourceName": "backgrounds/ieee-test.jpg",
+    "destBucket": "dev-ieee-conference-cloud-bulk-uploads",
+    "destName": "images/products/QA-LEGACY-001.jpg",
+    "overlay": [
+        {
+            "text": "Advanced Power Systems Engineering",
+            "attributes": [
+                { "attr": "y", "value": "22%" },
+                { "attr": "x", "value": "50%" },
+                { "attr": "fill", "value": "white" },
+                { "attr": "text-anchor", "value": "middle" },
+                { "attr": "font-family", "value": "OpenSans" },
+                { "attr": "font-weight", "value": "Bold" },
+                { "attr": "font-size", "value": "40px" }
+            ],
+            "rowHeightPad": "20"
+        },
+        {
+            "text": "Jane Doe, John Smith",
+            "attributes": [
+                { "attr": "y", "value": "65%" },
+                { "attr": "x", "value": "50%" },
+                { "attr": "fill", "value": "white" },
+                { "attr": "text-anchor", "value": "middle" },
+                { "attr": "font-size", "value": "24px" },
+                { "attr": "font-weight", "value": "bold" }
+            ],
+            "rowHeightPad": "10"
+        }
+    ]
+}
+EOF
+
+aws s3 cp /tmp/overlay-test5.json s3://dev-ieee-conference-cloud-bulk-uploads/actions/qa-legacy-001.json
+```
+
+Wait a few seconds, then verify:
+
+```bash
+aws s3 ls s3://dev-ieee-conference-cloud-bulk-uploads/images/products/QA-LEGACY-001.jpg
+
+# Download and inspect
+aws s3 cp s3://dev-ieee-conference-cloud-bulk-uploads/images/products/QA-LEGACY-001.jpg /tmp/qa-legacy-001.jpg
+python3 -c "
+from PIL import Image; import os
+img = Image.open('/tmp/qa-legacy-001.jpg')
+print(f'Size: {img.size[0]}x{img.size[1]}')
+print(f'Format: {img.format}')
+print(f'File size: {os.path.getsize(\"/tmp/qa-legacy-001.jpg\")} bytes')
+"
+```
+
+### Validation
+
+- [ ] Output image exists at `images/products/QA-LEGACY-001.jpg`
+- [ ] Trigger JSON is deleted from `actions/`
+- [ ] Image contains visible title and author text overlays
+- [ ] CloudWatch log shows "Detected legacy Drupal trigger schema"
+- [ ] File size is reasonable (>5 KB)
+
+---
+
+## Test 6: Error Handling
 
 ### Missing required fields (should return 400)
 
@@ -326,6 +396,8 @@ aws logs filter-log-events \
 | Thumbnail | test-thumb.json | TEST-THUMB.jpg + TEST-THUMB_thumb.jpg | 800x600 / 400x300 | JPEG | 10.8 KB / 3.3 KB | 258ms | PASS |
 | PNG format | test-png.json | TEST-PNG.png | 800x600 | PNG | 11.1 KB | 179ms | PASS |
 | Direct invoke | test-direct.json | TEST-DIRECT.jpg | 800x600 | JPEG | 11.4 KB | ~200ms | PASS |
+| Legacy schema | legacy-test-001.json | LEGACY-TEST-001.jpg | 800x600 | JPEG | 33.8 KB | ~374ms | PASS |
+| Standard schema | standard-test-001.json | STANDARD-TEST-001.jpg | 800x600 | JPEG | 18.7 KB | ~270ms | PASS |
 
 ### Error Handling Tests
 
@@ -345,7 +417,7 @@ aws logs filter-log-events \
 
 ### Notes
 
-- Font warning: "No TrueType font found, using Pillow default bitmap font" — this is expected on Lambda. The module falls back to Pillow's default bitmap font when system TrueType fonts (DejaVu, Liberation, Helvetica) are not available in the Lambda container.
+- OpenSans fonts (Bold, SemiBold) are bundled in the Docker image. Title text uses OpenSans Bold, author text uses OpenSans SemiBold.
 - S3 trigger deletes the trigger JSON on success, so direct invocation after trigger fires will fail with AccessDenied (trigger already consumed).
 - All triggers were auto-processed within seconds of upload.
 
@@ -356,13 +428,13 @@ aws logs filter-log-events \
 Remove test images after QA:
 
 ```bash
-aws s3 rm s3://dev-ieee-conference-cloud-bulk-uploads/images/products/ --recursive --exclude "*" --include "QA-TEST-*" --include "TEST-*"
+aws s3 rm s3://dev-ieee-conference-cloud-bulk-uploads/images/products/ --recursive --exclude "*" --include "QA-TEST-*" --include "QA-LEGACY-*" --include "TEST-*"
 aws s3 rm s3://dev-ieee-conference-cloud-bulk-uploads/backgrounds/ieee-test.jpg
 ```
 
 ---
 
-## Unit Tests (40 total, all passing)
+## Unit Tests (55 total, all passing)
 
 Run locally:
 ```bash
@@ -371,5 +443,5 @@ python -m pytest tests/generators/test_image_overlay_generator.py tests/handlers
 
 | Test Suite | Count | Status |
 |------------|-------|--------|
-| tests/generators/test_image_overlay_generator.py | 28 | PASS |
+| tests/generators/test_image_overlay_generator.py | 43 | PASS |
 | tests/handlers/test_image_overlay_handler.py | 12 | PASS |
