@@ -146,7 +146,7 @@ create_lambda() {
             --memory-size 512 \
             --timeout 300 \
             --architectures x86_64 \
-            --environment "Variables={LOG_LEVEL=INFO}"
+            --environment "Variables={LOG_LEVEL=INFO,PDF_EXTRACTOR_FUNCTION=ieee-cc-pdf-extractor,VIDEO_TRANSCRIBER_FUNCTION=ieee-cc-video-transcriber,BEDROCK_FUNCTION=ieee-cc-bedrock-inference}"
 
         aws lambda wait function-active-v2 \
             --function-name "${LAMBDA_FUNCTION_NAME}" \

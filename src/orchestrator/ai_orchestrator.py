@@ -17,6 +17,8 @@ import urllib.error
 from datetime import datetime, timezone
 from typing import TypedDict
 
+import os
+
 import boto3
 from botocore.exceptions import ClientError
 
@@ -26,10 +28,10 @@ logger = logging.getLogger(__name__)
 PDF_MEDIA_TYPES = {"application/pdf"}
 VIDEO_MEDIA_TYPES = {"video/mp4", "video/quicktime", "video/webm"}
 
-# Lambda function names for dispatch
-PDF_EXTRACTOR_FUNCTION = "ieee-cc-pdf-extractor"
-VIDEO_TRANSCRIBER_FUNCTION = "ieee-cc-video-transcriber"
-BEDROCK_FUNCTION = "ieee-cc-bedrock-inference"
+# Lambda function names for dispatch (configurable via env vars)
+PDF_EXTRACTOR_FUNCTION = os.environ.get("PDF_EXTRACTOR_FUNCTION", "ieee-cc-pdf-extractor")
+VIDEO_TRANSCRIBER_FUNCTION = os.environ.get("VIDEO_TRANSCRIBER_FUNCTION", "ieee-cc-video-transcriber")
+BEDROCK_FUNCTION = os.environ.get("BEDROCK_FUNCTION", "ieee-cc-bedrock-inference")
 
 # Retry settings for S3 reads
 S3_READ_MAX_RETRIES = 3
