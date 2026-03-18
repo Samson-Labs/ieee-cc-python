@@ -18,7 +18,7 @@ from botocore.exceptions import ClientError
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODEL_ID = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+DEFAULT_MODEL_ID = "global.anthropic.claude-sonnet-4-6"
 MAX_TOKENS = 2048
 TEMPERATURE = 0.3
 TEXT_TRUNCATION_LIMIT = 180_000  # characters — fits within Claude's context window

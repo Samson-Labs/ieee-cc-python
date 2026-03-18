@@ -1,6 +1,6 @@
 # IEEE Content Conversion — Python Pipeline
 
-Python Lambda modules for the IEEE Content Conversion pipeline. Handles PDF text extraction, video transcription, image overlay generation, and AI-powered metadata generation via Docker-based Lambdas deployed to AWS.
+Python Lambda modules for the IEEE Content Conversion pipeline. Handles PDF text extraction, video transcription, image overlay generation, AI-powered metadata generation, and central orchestration via Docker-based Lambdas deployed to AWS.
 
 ## Quick Start
 
@@ -8,7 +8,7 @@ Python Lambda modules for the IEEE Content Conversion pipeline. Handles PDF text
 # Install dependencies
 pip install -r requirements.txt -r requirements-dev.txt
 
-# Run all tests (190 total)
+# Run all tests (218 total)
 python -m pytest tests/ -v
 
 # Deploy PDF Extractor
@@ -22,6 +22,9 @@ python -m pytest tests/ -v
 
 # Deploy Video Transcriber
 ./scripts/deploy-video-transcriber.sh
+
+# Deploy AI Orchestrator
+./scripts/deploy-ai-orchestrator.sh
 ```
 
 ## Lambdas
@@ -107,6 +110,36 @@ Extracted text (direct or from S3 JSON)
                           intended_audience, category, processing_time_ms}
 ```
 
+### AI Orchestrator
+
+Central routing Lambda triggered by S3 ObjectCreated events on `{ou}/pending/`. Reads `.meta.json` to determine routing: if AI enrichment is disabled, moves the file to `/processed/`; if enabled, dispatches to the appropriate extraction Lambda, invokes Bedrock for metadata, sends a webhook to Drupal, then moves the file.
+
+```
+S3: {ou}/pending/{file}.{pdf|mp4|mov|webm}
+        |
+        v
++-----------------------------+
+|  ieee-rc-ai-orchestrator   |  (Python 3.12, boto3, 512MB, 5min)
+|  +- Read .meta.json        |  {ou}/metadata/{item_id}.meta.json
+|  +- Route by media_type    |  PDF -> extractor, Video -> transcriber
+|  +- Invoke Bedrock         |  metadata generation
+|  +- Send webhook           |  POST to Drupal
+|  +- Move to /processed/    |  copy + delete
++-----------------------------+
+```
+
+**.meta.json schema:**
+```json
+{
+  "item_id": "STD-12345",
+  "ou": "PES",
+  "product_part_number": "STD-12345",
+  "ai_enrichment_enabled": true,
+  "content": { "media_type": "application/pdf", "filename": "STD-12345.pdf" },
+  "webhook_url": "https://drupal.example.com/hook"
+}
+```
+
 ## AWS Resources
 
 | Resource | Name | Config |
@@ -116,10 +149,12 @@ Extracted text (direct or from S3 JSON)
 | ECR | `ieee-rc-image-generator` | Image overlay image |
 | ECR | `ieee-cc-bedrock-inference` | Bedrock metadata image |
 | ECR | `ieee-cc-video-transcriber` | Video transcriber image |
+| ECR | `ieee-rc-ai-orchestrator` | AI orchestrator image |
 | Lambda | `ieee-cc-pdf-extractor` | 3 GB, 5 min timeout |
 | Lambda | `ieee-rc-image-generator` | 1024 MB, 60s timeout |
 | Lambda | `ieee-cc-bedrock-inference` | 512 MB, 120s timeout |
 | Lambda | `ieee-cc-video-transcriber` | 512 MB, 15 min timeout |
+| Lambda | `ieee-rc-ai-orchestrator` | 512 MB, 5 min timeout |
 | S3 Trigger | `actions/*.json` | -> image generator |
 
 ## Invoking
@@ -148,6 +183,11 @@ Extracted text (direct or from S3 JSON)
 ./scripts/invoke-video-transcriber.sh dev-ieee-conference-cloud-bulk-uploads PES/pending/lecture.mp4 PES LECTURE-001
 ```
 
+**AI Orchestrator:**
+```bash
+./scripts/invoke-ai-orchestrator.sh dev-ieee-conference-cloud-bulk-uploads PES/pending/STD-12345.pdf
+```
+
 ## Project Structure
 
 ```
@@ -165,26 +205,34 @@ src/
     Dockerfile                    # Python 3.13 + boto3
     requirements.txt              # boto3
     bedrock_inference.py          # Bedrock Claude metadata generation
+  orchestrator/
+    AIOrchestratorDockerfile       # Python 3.12 + boto3
+    ai_orchestrator_requirements.txt
+    ai_orchestrator.py             # Central routing orchestrator
   handlers/
     pdf_handler.py                # PDF extractor Lambda entry point
     image_overlay_handler.py      # Image overlay Lambda entry point
     bedrock_handler.py            # Bedrock inference Lambda entry point
     video_transcriber_handler.py  # Video transcriber Lambda entry point
+    ai_orchestrator_handler.py    # AI orchestrator Lambda entry point
 tests/
   extractors/test_pdf_extractor.py           # 21 tests
   extractors/test_video_transcriber.py       # 35 tests
   generators/test_image_overlay_generator.py # 43 tests
   ai/test_bedrock_inference.py               # 25 tests
+  orchestrator/test_ai_orchestrator.py       # 29 tests
   handlers/
     test_pdf_handler.py                      # 9 tests
     test_image_overlay_handler.py            # 12 tests
     test_bedrock_handler.py                  # 9 tests
     test_video_transcriber_handler.py        # 18 tests
+    test_ai_orchestrator_handler.py          # 17 tests
 scripts/
   deploy.sh / invoke.sh / teardown.sh                        # PDF extractor
   deploy-image-overlay.sh / invoke-image-overlay.sh / teardown-image-overlay.sh  # Image overlay
   deploy-bedrock.sh / invoke-bedrock.sh / teardown-bedrock.sh                    # Bedrock metadata
   deploy-video-transcriber.sh / invoke-video-transcriber.sh / teardown-video-transcriber.sh  # Video transcriber
+  deploy-ai-orchestrator.sh / invoke-ai-orchestrator.sh / teardown-ai-orchestrator.sh        # AI orchestrator
 ```
 
 ## Documentation
@@ -194,6 +242,8 @@ scripts/
 - [Bedrock Metadata Generator](docs/bedrock-inference.md) — system prompt, validation, retry logic
 - [Video Transcriber Module](docs/video-transcriber.md) — AWS Transcribe integration, speaker diarization, Haiku cleanup
 - [Deployment Guide](docs/deployment.md) — AWS CLI deploy, teardown, configuration
+- [AI Orchestrator Module](docs/ai-orchestrator.md) — routing logic, .meta.json schema, Lambda dispatch
 - **QA Testing Guides:**
-  - [PDF Text Extraction QA](docs/qa-testing-guide.md) — PDF extractor + image overlay test cases and results
+  - [Image Overlay QA](docs/qa-image-overlay.md) — Image overlay test cases and results
   - [Video Transcriber QA](docs/qa-video-transcriber.md) — Video transcription test cases and AWS live results
+  - [AI Orchestrator QA](docs/qa-ai-orchestrator.md) — Orchestrator test cases and AWS live results
