@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-IEEE Content Conversion (CC) pipeline — Python Lambda modules for PDF text extraction, image overlay generation, and AI-powered metadata generation via AWS Bedrock. Modules are designed as reusable classes called by an orchestrator Lambda.
+IEEE Content Conversion (CC) pipeline — Python Lambda modules for PDF text extraction, video transcription, image overlay generation, and AI-powered metadata generation via AWS Bedrock. Modules are designed as reusable classes called by an orchestrator Lambda.
 
 ## Commands
 
@@ -16,6 +16,7 @@ python -m pytest tests/ -v
 python -m pytest tests/extractors/test_pdf_extractor.py -v
 python -m pytest tests/generators/test_image_overlay_generator.py -v
 python -m pytest tests/ai/test_bedrock_inference.py -v
+python -m pytest tests/extractors/test_video_transcriber.py -v
 
 # Run a single test class or method
 python -m pytest tests/extractors/test_pdf_extractor.py::TestNormalPDF::test_extracts_text -v
@@ -41,11 +42,17 @@ pip install -r requirements.txt -r requirements-dev.txt
 ./scripts/invoke-bedrock.sh <bucket> <key> # S3 metadata reference
 ./scripts/invoke-bedrock.sh --text "text"  # direct text invocation
 ./scripts/teardown-bedrock.sh
+
+# Video Transcriber Lambda
+./scripts/deploy-video-transcriber.sh          # first-time full deploy
+./scripts/deploy-video-transcriber.sh update   # rebuild + update code only
+./scripts/invoke-video-transcriber.sh <bucket> <key> <ou> <product_part_number>
+./scripts/teardown-video-transcriber.sh
 ```
 
 ## Architecture
 
-- **`src/extractors/`** — Reusable extraction modules (one per file type). Each extractor class takes an S3 client, downloads the file, extracts content, writes metadata JSON back to S3, and returns a structured result dict. Contains its own `Dockerfile`.
+- **`src/extractors/`** — Reusable extraction modules (one per file type). Each extractor class takes an S3 client, downloads the file, extracts content, writes metadata JSON back to S3, and returns a structured result dict. Contains its own `Dockerfile`. Includes `VideoTranscriber` which uses AWS Transcribe for video-to-text with speaker diarization and optional Claude Haiku transcript cleanup.
 - **`src/generators/`** — Reusable generation modules. Each generator class takes an S3 client, reads trigger JSON, processes assets, writes output to S3, and returns a structured result dict. Contains its own `Dockerfile` and `requirements.txt`.
 - **`src/ai/`** — AI inference modules. `BedrockInference` calls AWS Bedrock (Claude Sonnet) with the IEEE system prompt to generate structured metadata from document text. Includes retry logic for throttling and invalid JSON. Contains its own `Dockerfile` and `requirements.txt`.
 - **`src/handlers/`** — Lambda entry points. Each handler wraps an extractor, generator, or inference module, parses the event, and returns a structured response.
@@ -64,12 +71,15 @@ Docker-based Lambdas deployed via AWS CLI (no CDK/SAM). Each Lambda has its own 
 | ECR | `ieee-cc-pdf-extractor` | PDF extractor |
 | ECR | `ieee-rc-image-generator` | Image overlay |
 | ECR | `ieee-cc-bedrock-inference` | Bedrock metadata |
+| ECR | `ieee-cc-video-transcriber` | Video transcriber |
 | Lambda | `ieee-cc-pdf-extractor` | 3 GB, 5 min timeout, Python 3.13 |
 | Lambda | `ieee-rc-image-generator` | 1024 MB, 60s timeout, Python 3.12 |
 | Lambda | `ieee-cc-bedrock-inference` | 512 MB, 120s timeout, Python 3.13 |
+| Lambda | `ieee-cc-video-transcriber` | 512 MB, 15 min timeout, Python 3.13 |
 | IAM Role | `ieee-cc-pdf-extractor-role` | S3 read/write + CloudWatch |
 | IAM Role | `ieee-rc-image-generator-role` | S3 read/write/delete + CloudWatch |
 | IAM Role | `ieee-cc-bedrock-inference-role` | S3 read + Bedrock invoke + CloudWatch |
+| IAM Role | `ieee-cc-video-transcriber-role` | S3 read/write + Transcribe + Bedrock + CloudWatch |
 | S3 Trigger | `actions/*.json` | -> `ieee-rc-image-generator` |
 
 ### S3 Path Conventions
@@ -79,6 +89,8 @@ Docker-based Lambdas deployed via AWS CLI (no CDK/SAM). Each Lambda has its own 
 - Image trigger: `actions/{job_id}.json`
 - Image background: `backgrounds/{ou_short_name}.jpg`
 - Image output: `{config.public_path}/{product_part_number}.{format}`
+- Video Input: `{ou}/pending/{filename}.{mp4|mov|webm}`
+- Video Metadata output: `{ou}/metadata/{product_part_number}.mp4.json`
 
 ### Key Conventions
 
