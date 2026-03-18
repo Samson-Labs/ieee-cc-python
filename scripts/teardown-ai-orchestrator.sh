@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Tear down the Pipeline Orchestrator Lambda and associated resources.
+# Tear down the AI Orchestrator Lambda and associated resources.
 # S3 bucket is preserved (shared with other Lambdas).
 #
 set -euo pipefail
@@ -8,9 +8,9 @@ set -euo pipefail
 AWS_PROFILE="${AWS_PROFILE:-ieee-cc}"
 AWS_REGION="${AWS_REGION:-us-east-1}"
 
-ECR_REPO_NAME="ieee-cc-pipeline-orchestrator"
-LAMBDA_FUNCTION_NAME="ieee-cc-pipeline-orchestrator"
-LAMBDA_ROLE_NAME="ieee-cc-pipeline-orchestrator-role"
+ECR_REPO_NAME="ieee-rc-ai-orchestrator"
+LAMBDA_FUNCTION_NAME="ieee-rc-ai-orchestrator"
+LAMBDA_ROLE_NAME="ieee-rc-ai-orchestrator-role"
 
 export AWS_PROFILE AWS_REGION
 
@@ -29,7 +29,7 @@ aws iam detach-role-policy \
 log "Deleting inline policy from role"
 aws iam delete-role-policy \
     --role-name "${LAMBDA_ROLE_NAME}" \
-    --policy-name "S3AndBedrockAccess" 2>/dev/null || true
+    --policy-name "OrchestratorAccess" 2>/dev/null || true
 
 log "Deleting IAM role: ${LAMBDA_ROLE_NAME}"
 aws iam delete-role --role-name "${LAMBDA_ROLE_NAME}" 2>/dev/null || log "Role not found — skipping."

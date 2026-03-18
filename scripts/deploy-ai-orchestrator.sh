@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 #
-# Deploy the Pipeline Orchestrator Lambda using AWS CLI + Docker.
+# Deploy the AI Orchestrator Lambda using AWS CLI + Docker.
 #
 # Prerequisites:
 #   - AWS CLI configured with profile "ieee-cc"
 #   - Docker running locally
 #
 # Usage:
-#   ./scripts/deploy-pipeline.sh                # first-time setup + deploy
-#   ./scripts/deploy-pipeline.sh update         # rebuild image + update Lambda code only
+#   ./scripts/deploy-ai-orchestrator.sh                # first-time setup + deploy
+#   ./scripts/deploy-ai-orchestrator.sh update         # rebuild image + update Lambda code only
 #
 set -euo pipefail
 
@@ -16,10 +16,10 @@ AWS_PROFILE="${AWS_PROFILE:-ieee-cc}"
 AWS_REGION="${AWS_REGION:-us-east-1}"
 AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
 
-ECR_REPO_NAME="ieee-cc-pipeline-orchestrator"
-LAMBDA_FUNCTION_NAME="ieee-cc-pipeline-orchestrator"
+ECR_REPO_NAME="ieee-rc-ai-orchestrator"
+LAMBDA_FUNCTION_NAME="ieee-rc-ai-orchestrator"
 S3_BUCKET_NAME="dev-ieee-conference-cloud-bulk-uploads"
-LAMBDA_ROLE_NAME="ieee-cc-pipeline-orchestrator-role"
+LAMBDA_ROLE_NAME="ieee-rc-ai-orchestrator-role"
 IMAGE_TAG="latest"
 
 ECR_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO_NAME}"
@@ -43,7 +43,7 @@ build_and_push() {
     log "Building Docker image..."
     docker buildx build --platform linux/amd64 --provenance=false \
         --output type=docker \
-        -f "${PROJECT_ROOT}/src/orchestrator/Dockerfile" \
+        -f "${PROJECT_ROOT}/src/orchestrator/AIOrchestratorDockerfile" \
         -t "${ECR_REPO_NAME}:${IMAGE_TAG}" "${PROJECT_ROOT}"
 
     log "Tagging image..."
@@ -84,41 +84,39 @@ create_lambda_role() {
         }]
     }'
 
-    # S3 read/write + Bedrock invoke
+    # S3 read/write/delete + Bedrock + Transcribe + Lambda invoke
     INLINE_POLICY="{
         \"Version\": \"2012-10-17\",
         \"Statement\": [
             {
                 \"Effect\": \"Allow\",
-                \"Action\": [\"s3:GetObject\", \"s3:PutObject\"],
+                \"Action\": [\"s3:GetObject\", \"s3:PutObject\", \"s3:DeleteObject\", \"s3:CopyObject\"],
                 \"Resource\": \"arn:aws:s3:::${S3_BUCKET_NAME}/*\"
             },
             {
                 \"Effect\": \"Allow\",
-                \"Action\": [\"bedrock:InvokeModel\"],
+                \"Action\": [\"lambda:InvokeFunction\"],
                 \"Resource\": [
-                    \"arn:aws:bedrock:*::foundation-model/*\",
-                    \"arn:aws:bedrock:*:*:inference-profile/*\"
+                    \"arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:ieee-cc-pdf-extractor\",
+                    \"arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:ieee-cc-video-transcriber\",
+                    \"arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:ieee-cc-bedrock-inference\"
                 ]
             }
         ]
     }"
 
-    # Create role if it doesn't exist
     aws iam get-role --role-name "${LAMBDA_ROLE_NAME}" >/dev/null 2>&1 \
     || aws iam create-role \
         --role-name "${LAMBDA_ROLE_NAME}" \
         --assume-role-policy-document "${TRUST_POLICY}"
 
-    # Attach basic Lambda execution policy
     aws iam attach-role-policy \
         --role-name "${LAMBDA_ROLE_NAME}" \
         --policy-arn "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole" 2>/dev/null || true
 
-    # Put inline S3 + Bedrock policy
     aws iam put-role-policy \
         --role-name "${LAMBDA_ROLE_NAME}" \
-        --policy-name "S3AndBedrockAccess" \
+        --policy-name "OrchestratorAccess" \
         --policy-document "${INLINE_POLICY}"
 
     ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/${LAMBDA_ROLE_NAME}"
@@ -136,7 +134,6 @@ create_lambda() {
         log "Lambda already exists — updating code..."
         update_lambda_code
     else
-        # Wait for role to propagate
         log "Waiting for IAM role propagation..."
         aws iam wait role-exists --role-name "${LAMBDA_ROLE_NAME}"
 
@@ -146,10 +143,10 @@ create_lambda() {
             --package-type Image \
             --code "ImageUri=${ECR_URI}:${IMAGE_TAG}" \
             --role "${ROLE_ARN}" \
-            --memory-size 3008 \
+            --memory-size 512 \
             --timeout 300 \
             --architectures x86_64 \
-            --environment "Variables={LOG_LEVEL=INFO,BEDROCK_MODEL_ID=us.anthropic.claude-sonnet-4-6}"
+            --environment "Variables={LOG_LEVEL=INFO,PDF_EXTRACTOR_FUNCTION=ieee-cc-pdf-extractor,VIDEO_TRANSCRIBER_FUNCTION=ieee-cc-video-transcriber,BEDROCK_FUNCTION=ieee-cc-bedrock-inference}"
 
         aws lambda wait function-active-v2 \
             --function-name "${LAMBDA_FUNCTION_NAME}" \
@@ -189,7 +186,7 @@ create_lambda
 log "Deployment complete."
 log ""
 log "  ECR:     ${ECR_URI}:${IMAGE_TAG}"
-log "  Lambda:  ${LAMBDA_FUNCTION_NAME} (3 GB, 5 min timeout)"
+log "  Lambda:  ${LAMBDA_FUNCTION_NAME} (512 MB, 5 min timeout)"
 log ""
 log "  Invoke:"
-log "    ./scripts/invoke-pipeline.sh <bucket> <key> <ou> <product_part_number>"
+log "    ./scripts/invoke-ai-orchestrator.sh <bucket> <key>"
