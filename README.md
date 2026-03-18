@@ -194,3 +194,6 @@ scripts/
 - [Bedrock Metadata Generator](docs/bedrock-inference.md) — system prompt, validation, retry logic
 - [Video Transcriber Module](docs/video-transcriber.md) — AWS Transcribe integration, speaker diarization, Haiku cleanup
 - [Deployment Guide](docs/deployment.md) — AWS CLI deploy, teardown, configuration
+- **QA Testing Guides:**
+  - [PDF Text Extraction QA](docs/qa-testing-guide.md) — PDF extractor + image overlay test cases and results
+  - [Video Transcriber QA](docs/qa-video-transcriber.md) — Video transcription test cases and AWS live results
