@@ -103,7 +103,7 @@ class VideoTranscriber:
         logger.info("Starting transcription job %s for %s", job_name, media_uri)
 
         # Step 1: Start transcription job
-        self._start_job(job_name, media_uri, media_format)
+        self._start_job(job_name, media_uri, media_format, output_bucket=bucket)
 
         # Step 2: Poll for completion
         job = self._poll_job(job_name)
@@ -162,19 +162,27 @@ class VideoTranscriber:
     # ------------------------------------------------------------------
 
     def _start_job(
-        self, job_name: str, media_uri: str, media_format: str
+        self,
+        job_name: str,
+        media_uri: str,
+        media_format: str,
+        output_bucket: str | None = None,
     ) -> None:
         """Start an AWS Transcribe job with speaker diarization."""
-        self._transcribe.start_transcription_job(
-            TranscriptionJobName=job_name,
-            LanguageCode=LANGUAGE_CODE,
-            Media={"MediaFileUri": media_uri},
-            MediaFormat=media_format,
-            Settings={
+        params = {
+            "TranscriptionJobName": job_name,
+            "LanguageCode": LANGUAGE_CODE,
+            "Media": {"MediaFileUri": media_uri},
+            "MediaFormat": media_format,
+            "Settings": {
                 "ShowSpeakerLabels": True,
                 "MaxSpeakerLabels": MAX_SPEAKERS,
             },
-        )
+        }
+        if output_bucket:
+            params["OutputBucketName"] = output_bucket
+            params["OutputKey"] = f"transcribe-output/{job_name}.json"
+        self._transcribe.start_transcription_job(**params)
 
     def _poll_job(self, job_name: str) -> dict:
         """Poll Transcribe job until completion or timeout."""
