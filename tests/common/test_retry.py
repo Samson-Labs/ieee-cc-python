@@ -127,6 +127,34 @@ class TestOnRetryCallback:
         assert args1[2] == 2.0
 
 
+class TestValidation:
+    def test_max_attempts_zero_raises_value_error(self):
+        with pytest.raises(ValueError, match="max_attempts must be >= 1"):
+            @with_retry(max_attempts=0, exceptions=[ValueError])
+            def func():
+                pass
+
+    def test_max_attempts_negative_raises_value_error(self):
+        with pytest.raises(ValueError, match="max_attempts must be >= 1"):
+            @with_retry(max_attempts=-1, exceptions=[ValueError])
+            def func():
+                pass
+
+    def test_fixed_delays_too_short_raises_value_error(self):
+        with pytest.raises(ValueError, match="fixed_delays length"):
+            @with_retry(max_attempts=4, exceptions=[ValueError], fixed_delays=[1, 2])
+            def func():
+                pass
+
+    def test_max_attempts_one_calls_once_no_retry(self):
+        @with_retry(max_attempts=1, exceptions=[ValueError])
+        def fails():
+            raise ValueError("once")
+
+        with pytest.raises(ValueError, match="once"):
+            fails()
+
+
 class TestFunctools:
     def test_wraps_preserves_name_and_docstring(self):
         @with_retry(max_attempts=2, exceptions=[ValueError])

@@ -2,6 +2,7 @@
 
 import json
 import logging
+from unittest.mock import patch
 
 from src.common.logging import get_json_logger, JsonFormatter
 
@@ -86,3 +87,12 @@ class TestGetJsonLogger:
         handler_count = len(logger1.handlers)
         logger2 = get_json_logger(name)
         assert len(logger2.handlers) == handler_count
+
+    def test_defaults_to_log_level_env_var(self):
+        with patch.dict("os.environ", {"LOG_LEVEL": "DEBUG"}):
+            logger = get_json_logger("test.json.envlevel")
+        assert logger.level == logging.DEBUG
+
+    def test_propagate_is_false(self):
+        logger = get_json_logger("test.json.propagate")
+        assert logger.propagate is False

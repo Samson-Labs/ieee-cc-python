@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from src.dlq.dlq_processor import DLQProcessor, RETRIABLE_ERROR_TYPES
+from src.dlq.dlq_processor import DLQProcessor
 from src.handlers.dlq_handler import handler
 
 
@@ -16,6 +16,7 @@ def _make_sqs_record(message: dict, message_id: str = "msg-001") -> dict:
 def _make_dlq_message(
     error_type: str = "BedrockError",
     error_message: str = "throttled",
+    is_retriable: bool = True,
     correlation_id: str = "req-123",
     retry_count: int = 0,
 ) -> dict:
@@ -24,6 +25,7 @@ def _make_dlq_message(
         "error": {
             "error_type": error_type,
             "error_message": error_message,
+            "is_retriable": is_retriable,
             "correlation_id": correlation_id,
             "timestamp": "2026-03-20T00:00:00+00:00",
             "stack_trace": "Traceback ...",
@@ -48,7 +50,7 @@ def processor():
 class TestRetriableReprocess:
     def test_reinvokes_orchestrator_when_retriable(self, processor):
         proc, lambda_mock, _, _ = processor
-        message = _make_dlq_message(error_type="BedrockError", retry_count=0)
+        message = _make_dlq_message(error_type="BedrockError", is_retriable=True, retry_count=0)
         record = _make_sqs_record(message)
 
         result = proc.process_message(record)
@@ -64,7 +66,7 @@ class TestRetriableReprocess:
 
     def test_reinvokes_with_custom_function_name(self, processor):
         proc, lambda_mock, _, _ = processor
-        message = _make_dlq_message(error_type="S3Error", retry_count=1)
+        message = _make_dlq_message(error_type="S3Error", is_retriable=True, retry_count=1)
         record = _make_sqs_record(message)
 
         with patch.dict("os.environ", {"ORCHESTRATOR_FUNCTION_NAME": "my-orchestrator"}):
@@ -77,7 +79,7 @@ class TestRetriableReprocess:
 class TestRetriableExhausted:
     def test_archives_when_retries_exhausted(self, processor):
         proc, lambda_mock, s3_mock, sns_mock = processor
-        message = _make_dlq_message(error_type="BedrockError", retry_count=2)
+        message = _make_dlq_message(error_type="BedrockError", is_retriable=True, retry_count=2)
         record = _make_sqs_record(message)
 
         with patch.dict("os.environ", {"FAILURES_SNS_TOPIC_ARN": "arn:aws:sns:us-east-1:123:failures"}):
@@ -90,9 +92,9 @@ class TestRetriableExhausted:
 
 
 class TestPermanentError:
-    def test_archives_immediately_for_validation_error(self, processor):
+    def test_archives_immediately_for_non_retriable(self, processor):
         proc, lambda_mock, s3_mock, sns_mock = processor
-        message = _make_dlq_message(error_type="ValidationError", retry_count=0)
+        message = _make_dlq_message(error_type="ValidationError", is_retriable=False, retry_count=0)
         record = _make_sqs_record(message)
 
         with patch.dict("os.environ", {"FAILURES_SNS_TOPIC_ARN": "arn:aws:sns:us-east-1:123:failures"}):
@@ -102,9 +104,47 @@ class TestPermanentError:
         lambda_mock.invoke.assert_not_called()
         s3_mock.put_object.assert_called_once()
 
-    def test_archives_immediately_for_webhook_error(self, processor):
+    def test_archives_when_is_retriable_missing(self, processor):
+        """Messages without is_retriable flag default to permanent."""
         proc, lambda_mock, s3_mock, _ = processor
-        message = _make_dlq_message(error_type="WebhookError", retry_count=0)
+        message = _make_dlq_message(retry_count=0)
+        del message["error"]["is_retriable"]
+        record = _make_sqs_record(message)
+
+        result = proc.process_message(record)
+
+        assert result == {"action": "archived"}
+        lambda_mock.invoke.assert_not_called()
+
+
+class TestRetryCountCoercion:
+    def test_string_retry_count_coerced_to_int(self, processor):
+        proc, lambda_mock, _, _ = processor
+        message = _make_dlq_message(is_retriable=True, retry_count=0)
+        message["retry_count"] = "1"
+        record = _make_sqs_record(message)
+
+        result = proc.process_message(record)
+
+        assert result == {"action": "reprocessed"}
+        payload = json.loads(lambda_mock.invoke.call_args[1]["Payload"])
+        assert payload["retry_count"] == 2
+
+    def test_invalid_retry_count_treated_as_exhausted(self, processor):
+        proc, lambda_mock, s3_mock, _ = processor
+        message = _make_dlq_message(is_retriable=True, retry_count=0)
+        message["retry_count"] = "not-a-number"
+        record = _make_sqs_record(message)
+
+        result = proc.process_message(record)
+
+        assert result == {"action": "archived"}
+        lambda_mock.invoke.assert_not_called()
+
+    def test_none_retry_count_treated_as_exhausted(self, processor):
+        proc, lambda_mock, s3_mock, _ = processor
+        message = _make_dlq_message(is_retriable=True, retry_count=0)
+        message["retry_count"] = None
         record = _make_sqs_record(message)
 
         result = proc.process_message(record)
@@ -116,8 +156,7 @@ class TestPermanentError:
 class TestArchiveDetails:
     def test_s3_key_contains_correlation_id(self, processor):
         proc, _, s3_mock, _ = processor
-        message = _make_dlq_message(correlation_id="req-abc")
-        message["retry_count"] = 2
+        message = _make_dlq_message(correlation_id="req-abc", is_retriable=True, retry_count=2)
         record = _make_sqs_record(message)
 
         proc.process_message(record)
@@ -131,6 +170,7 @@ class TestArchiveDetails:
         message = _make_dlq_message(
             error_type="BedrockError",
             error_message="throttled",
+            is_retriable=True,
             correlation_id="req-xyz",
             retry_count=2,
         )
@@ -149,7 +189,7 @@ class TestArchiveDetails:
 
     def test_skips_sns_when_topic_not_set(self, processor):
         proc, _, s3_mock, sns_mock = processor
-        message = _make_dlq_message(retry_count=2)
+        message = _make_dlq_message(is_retriable=True, retry_count=2)
         record = _make_sqs_record(message)
 
         with patch.dict("os.environ", {}, clear=True):
@@ -180,21 +220,25 @@ class TestInvalidMessage:
         lambda_mock.invoke.assert_not_called()
 
 
-class TestRetriableErrorTypes:
-    def test_retriable_types(self):
-        assert "TranscribeError" in RETRIABLE_ERROR_TYPES
-        assert "BedrockError" in RETRIABLE_ERROR_TYPES
-        assert "S3Error" in RETRIABLE_ERROR_TYPES
+class TestIsRetriable:
+    def test_true_when_flag_is_true(self):
+        assert DLQProcessor._is_retriable({"is_retriable": True}) is True
 
-    def test_non_retriable_types(self):
-        assert "ValidationError" not in RETRIABLE_ERROR_TYPES
-        assert "WebhookError" not in RETRIABLE_ERROR_TYPES
+    def test_false_when_flag_is_false(self):
+        assert DLQProcessor._is_retriable({"is_retriable": False}) is False
+
+    def test_false_when_flag_missing(self):
+        assert DLQProcessor._is_retriable({"error_type": "SomeError"}) is False
+
+    def test_false_when_flag_is_string_true(self):
+        """Only boolean True is accepted, not truthy strings."""
+        assert DLQProcessor._is_retriable({"is_retriable": "true"}) is False
 
 
 class TestDLQHandler:
     def test_processes_multiple_records(self):
-        msg1 = _make_dlq_message(error_type="ValidationError", retry_count=0)
-        msg2 = _make_dlq_message(error_type="BedrockError", retry_count=0)
+        msg1 = _make_dlq_message(error_type="ValidationError", is_retriable=False, retry_count=0)
+        msg2 = _make_dlq_message(error_type="BedrockError", is_retriable=True, retry_count=0)
         event = {
             "Records": [
                 _make_sqs_record(msg1, "msg-001"),
@@ -202,9 +246,8 @@ class TestDLQHandler:
             ]
         }
 
-        with patch("src.handlers.dlq_handler.DLQProcessor") as MockProc:
-            instance = MockProc.return_value
-            instance.process_message.side_effect = [
+        with patch("src.handlers.dlq_handler.processor") as mock_proc:
+            mock_proc.process_message.side_effect = [
                 {"action": "archived"},
                 {"action": "reprocessed"},
             ]
@@ -222,9 +265,8 @@ class TestDLQHandler:
             ]
         }
 
-        with patch("src.handlers.dlq_handler.DLQProcessor") as MockProc:
-            instance = MockProc.return_value
-            instance.process_message.side_effect = [
+        with patch("src.handlers.dlq_handler.processor") as mock_proc:
+            mock_proc.process_message.side_effect = [
                 {"action": "archived"},
                 RuntimeError("unexpected"),
             ]

@@ -8,6 +8,9 @@ from src.dlq.dlq_processor import DLQProcessor
 
 logger = get_json_logger(__name__)
 
+# Module-level singleton — reuses boto3 clients across warm invocations.
+processor = DLQProcessor()
+
 
 def handler(event: dict, context) -> dict:
     """Process an SQS batch of DLQ messages.
@@ -22,7 +25,6 @@ def handler(event: dict, context) -> dict:
         Dict with ``batchItemFailures`` for any records that could not
         be processed, plus a ``results`` summary.
     """
-    processor = DLQProcessor()
     records = event.get("Records", [])
 
     results = []

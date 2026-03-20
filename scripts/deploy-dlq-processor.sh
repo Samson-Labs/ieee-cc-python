@@ -14,6 +14,8 @@ set -euo pipefail
 
 AWS_PROFILE="${AWS_PROFILE:-ieee-cc}"
 AWS_REGION="${AWS_REGION:-us-east-1}"
+export AWS_PROFILE AWS_REGION
+
 AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
 
 ECR_REPO_NAME="ieee-rc-dlq-processor"
@@ -21,12 +23,12 @@ LAMBDA_FUNCTION_NAME="ieee-rc-dlq-processor"
 S3_BUCKET_NAME="dev-ieee-conference-cloud-bulk-uploads"
 LAMBDA_ROLE_NAME="ieee-rc-dlq-processor-role"
 SQS_QUEUE_NAME="ieee-rc-processing-dlq"
+ORCHESTRATOR_FUNCTION_NAME="ieee-rc-ai-orchestrator"
+SNS_TOPIC_NAME="ieee-rc-processing-failures"
 IMAGE_TAG="latest"
 
 ECR_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO_NAME}"
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-
-export AWS_PROFILE AWS_REGION
 
 # ---------------------------------------------------------------
 # Helpers
@@ -85,31 +87,34 @@ create_lambda_role() {
         }]
     }'
 
-    INLINE_POLICY="{
-        \"Version\": \"2012-10-17\",
-        \"Statement\": [
-            {
-                \"Effect\": \"Allow\",
-                \"Action\": [\"lambda:InvokeFunction\"],
-                \"Resource\": \"arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:ieee-rc-ai-orchestrator\"
-            },
-            {
-                \"Effect\": \"Allow\",
-                \"Action\": [\"s3:PutObject\"],
-                \"Resource\": \"arn:aws:s3:::${S3_BUCKET_NAME}/failed/*\"
-            },
-            {
-                \"Effect\": \"Allow\",
-                \"Action\": [\"sns:Publish\"],
-                \"Resource\": \"arn:aws:sns:${AWS_REGION}:${AWS_ACCOUNT_ID}:ieee-rc-processing-failures\"
-            },
-            {
-                \"Effect\": \"Allow\",
-                \"Action\": [\"sqs:ReceiveMessage\", \"sqs:DeleteMessage\", \"sqs:GetQueueAttributes\"],
-                \"Resource\": \"arn:aws:sqs:${AWS_REGION}:${AWS_ACCOUNT_ID}:${SQS_QUEUE_NAME}\"
-            }
-        ]
-    }"
+    INLINE_POLICY=$(cat <<EOF
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": ["lambda:InvokeFunction"],
+            "Resource": "arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:${ORCHESTRATOR_FUNCTION_NAME}"
+        },
+        {
+            "Effect": "Allow",
+            "Action": ["s3:PutObject"],
+            "Resource": "arn:aws:s3:::${S3_BUCKET_NAME}/failed/*"
+        },
+        {
+            "Effect": "Allow",
+            "Action": ["sns:Publish"],
+            "Resource": "arn:aws:sns:${AWS_REGION}:${AWS_ACCOUNT_ID}:${SNS_TOPIC_NAME}"
+        },
+        {
+            "Effect": "Allow",
+            "Action": ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes"],
+            "Resource": "arn:aws:sqs:${AWS_REGION}:${AWS_ACCOUNT_ID}:${SQS_QUEUE_NAME}"
+        }
+    ]
+}
+EOF
+    )
 
     aws iam get-role --role-name "${LAMBDA_ROLE_NAME}" >/dev/null 2>&1 \
     || aws iam create-role \
@@ -152,7 +157,7 @@ create_lambda() {
             --memory-size 256 \
             --timeout 60 \
             --architectures x86_64 \
-            --environment "Variables={LOG_LEVEL=INFO,ORCHESTRATOR_FUNCTION_NAME=ieee-rc-ai-orchestrator,ARCHIVE_BUCKET=${S3_BUCKET_NAME}}"
+            --environment "Variables={LOG_LEVEL=INFO,ORCHESTRATOR_FUNCTION_NAME=${ORCHESTRATOR_FUNCTION_NAME},ARCHIVE_BUCKET=${S3_BUCKET_NAME}}"
 
         aws lambda wait function-active-v2 \
             --function-name "${LAMBDA_FUNCTION_NAME}" \

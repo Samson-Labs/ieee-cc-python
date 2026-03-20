@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from datetime import datetime, timezone
 
 
@@ -33,22 +34,28 @@ class JsonFormatter(logging.Formatter):
         return json.dumps(log_obj, default=str)
 
 
-def get_json_logger(name: str, level: str = "INFO") -> logging.Logger:
+def get_json_logger(name: str, level: str | None = None) -> logging.Logger:
     """Return a logger configured with JSON output.
 
     Args:
         name: Logger name (typically ``__name__``).
         level: Log level string (e.g. ``"INFO"``, ``"DEBUG"``).
+            Defaults to the ``LOG_LEVEL`` environment variable, or ``"INFO"``.
 
     Returns:
         A ``logging.Logger`` with a ``JsonFormatter`` stream handler.
     """
+    if level is None:
+        level = os.environ.get("LOG_LEVEL", "INFO")
+
     logger = logging.getLogger(name)
     logger.setLevel(getattr(logging, level.upper(), logging.INFO))
 
     if not logger.handlers:
         handler = logging.StreamHandler()
         handler.setFormatter(JsonFormatter())
+        handler.setLevel(logger.level)
         logger.addHandler(handler)
+        logger.propagate = False
 
     return logger

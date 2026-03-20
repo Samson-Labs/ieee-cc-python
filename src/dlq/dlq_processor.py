@@ -12,8 +12,6 @@ from src.common.logging import get_json_logger
 
 logger = get_json_logger(__name__)
 
-RETRIABLE_ERROR_TYPES = {"TranscribeError", "BedrockError", "S3Error"}
-
 
 class DLQProcessor:
     """Processes messages from the pipeline dead-letter queue.
@@ -48,6 +46,7 @@ class DLQProcessor:
                 "error": {
                     "error_type": "InvalidMessage",
                     "error_message": f"Failed to parse DLQ message: {exc}",
+                    "is_retriable": False,
                     "correlation_id": "",
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                     "stack_trace": "",
@@ -56,8 +55,12 @@ class DLQProcessor:
             }
 
         error = message.get("error", {})
-        retry_count = message.get("retry_count", 0)
         correlation_id = error.get("correlation_id", "")
+
+        try:
+            retry_count = int(message.get("retry_count", 0))
+        except (TypeError, ValueError):
+            retry_count = self.MAX_REPROCESS_ATTEMPTS
 
         if self._is_retriable(error) and retry_count < self.MAX_REPROCESS_ATTEMPTS:
             logger.info(
@@ -65,25 +68,25 @@ class DLQProcessor:
                 retry_count + 1,
                 correlation_id,
             )
-            return self._reprocess(message)
+            return self._reprocess(message, retry_count)
 
         logger.info(
             "Archiving permanently failed message: %s",
             correlation_id,
         )
-        return self._archive_and_notify(message)
+        return self._archive_and_notify(message, retry_count)
 
-    def _is_retriable(self, error: dict) -> bool:
-        """Check whether the error type is retriable."""
-        return error.get("error_type", "") in RETRIABLE_ERROR_TYPES
+    @staticmethod
+    def _is_retriable(error: dict) -> bool:
+        """Check whether the error is retriable using the message flag."""
+        return error.get("is_retriable", False) is True
 
-    def _reprocess(self, message: dict) -> dict:
+    def _reprocess(self, message: dict, retry_count: int) -> dict:
         """Re-invoke the orchestrator Lambda with the original event."""
         function_name = os.environ.get(
             "ORCHESTRATOR_FUNCTION_NAME", "ieee-rc-ai-orchestrator"
         )
         original_event = message.get("original_event", {})
-        retry_count = message.get("retry_count", 0)
 
         payload = {
             **original_event,
@@ -104,7 +107,7 @@ class DLQProcessor:
         )
         return {"action": "reprocessed"}
 
-    def _archive_and_notify(self, message: dict) -> dict:
+    def _archive_and_notify(self, message: dict, retry_count: int) -> dict:
         """Archive the failed message to S3 and publish an SNS alert."""
         error = message.get("error", {})
         correlation_id = error.get("correlation_id", "") or "unknown"
@@ -128,7 +131,7 @@ class DLQProcessor:
                 "correlation_id": correlation_id,
                 "error_type": error.get("error_type", ""),
                 "error_message": error.get("error_message", ""),
-                "retry_count": message.get("retry_count", 0),
+                "retry_count": retry_count,
                 "archive_key": key,
             }
             self._sns.publish(

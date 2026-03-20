@@ -17,14 +17,24 @@ def with_retry(
     """Decorator that retries a function on specified exceptions.
 
     Args:
-        max_attempts: Total attempts (including the first call).
+        max_attempts: Total attempts (including the first call). Must be >= 1.
         base_delay: Base delay in seconds for exponential backoff.
         exceptions: Tuple of exception types to catch and retry.
         fixed_delays: If provided, use these exact delays instead of exponential backoff.
-            Length should be >= max_attempts - 1.
+            Length must be >= max_attempts - 1.
         on_retry: Optional callback invoked before each retry sleep as
             ``on_retry(attempt, exception, delay)``.
+
+    Raises:
+        ValueError: If ``max_attempts < 1`` or ``fixed_delays`` is too short.
     """
+    if max_attempts < 1:
+        raise ValueError(f"max_attempts must be >= 1, got {max_attempts}")
+    if fixed_delays is not None and len(fixed_delays) < max_attempts - 1:
+        raise ValueError(
+            f"fixed_delays length ({len(fixed_delays)}) must be >= "
+            f"max_attempts - 1 ({max_attempts - 1})"
+        )
 
     def decorator(func):
         @functools.wraps(func)

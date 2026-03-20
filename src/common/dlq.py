@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import traceback
 from datetime import datetime, timezone
 
+from src.common import format_stack_trace
 from src.common.exceptions import PipelineError
 
 
@@ -27,22 +27,20 @@ def build_dlq_message(
     """
     if isinstance(exc, PipelineError):
         error_type = exc.error_type
+        is_retriable = exc.is_retriable
     else:
         error_type = type(exc).__name__
-
-    stack = traceback.format_exception(type(exc), exc, exc.__traceback__)
-    stack_trace = "".join(stack)
-    if len(stack_trace) > 2000:
-        stack_trace = stack_trace[:2000]
+        is_retriable = False
 
     return {
         "original_event": original_event,
         "error": {
             "error_type": error_type,
             "error_message": str(exc),
+            "is_retriable": is_retriable,
             "correlation_id": correlation_id,
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "stack_trace": stack_trace,
+            "stack_trace": format_stack_trace(exc),
         },
         "retry_count": retry_count,
     }

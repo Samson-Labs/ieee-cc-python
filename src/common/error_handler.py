@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import traceback
 from datetime import datetime, timezone
 
+from src.common import format_stack_trace
 from src.common.exceptions import PipelineError, ValidationError
 
 
@@ -37,10 +37,7 @@ def build_error_response(
     else:
         error_type = type(exc).__name__
 
-    stack = traceback.format_exception(type(exc), exc, exc.__traceback__)
-    stack_trace = "".join(stack)
-    if len(stack_trace) > 2000:
-        stack_trace = stack_trace[:2000]
+    stack_trace = format_stack_trace(exc)
 
     return {
         "statusCode": code,

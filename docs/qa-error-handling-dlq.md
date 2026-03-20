@@ -111,11 +111,11 @@ def call_bedrock():
 
 ```
 SQS Message → Parse body as DLQ message
-  ├── Retriable error AND retry_count < 2:
+  ├── error.is_retriable == true AND retry_count < 2:
   │     → Re-invoke ieee-rc-ai-orchestrator (async) with is_retry=True, retry_count=N+1
   │     → Return {"action": "reprocessed"}
   │
-  ├── Permanent error OR retries exhausted:
+  ├── error.is_retriable == false OR retries exhausted:
   │     → Archive to s3://{bucket}/failed/{correlation_id}/{timestamp}.json
   │     → Publish SNS alert to FAILURES_SNS_TOPIC_ARN
   │     → Return {"action": "archived"}
@@ -124,8 +124,10 @@ SQS Message → Parse body as DLQ message
         → Treat as permanent → archive + notify
 ```
 
-**Retriable error types:** `TranscribeError`, `BedrockError`, `S3Error`
-**Permanent error types:** `ValidationError`, `WebhookError`, unknown types, or any error with `retry_count >= 2`
+The DLQ processor uses the `is_retriable` boolean flag embedded in each DLQ message (set by `build_dlq_message()` from the exception's `is_retriable` attribute). This decouples the processor from specific error type names.
+
+**Retriable (is_retriable=True):** `TranscribeError`, `BedrockError`, `WebhookError`, `S3Error`
+**Permanent (is_retriable=False):** `ValidationError`, unknown/generic exceptions, or any error with `retry_count >= 2`
 
 ### Environment Variables
 
