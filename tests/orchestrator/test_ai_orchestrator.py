@@ -49,7 +49,8 @@ def _lambda_invoke_response(status_code=200, body=None):
 def orchestrator():
     s3 = MagicMock()
     lam = MagicMock()
-    orch = AIOrchestrator(s3_client=s3, lambda_client=lam)
+    sns = MagicMock()
+    orch = AIOrchestrator(s3_client=s3, lambda_client=lam, sns_client=sns)
     return orch, s3, lam
 
 
@@ -344,8 +345,8 @@ class TestDispatchErrors:
 # ---------------------------------------------------------------
 
 class TestWebhook:
-    @patch("src.orchestrator.ai_orchestrator.urllib.request.urlopen")
-    def test_sends_webhook_on_success(self, mock_urlopen, orchestrator):
+    @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
+    def test_sends_webhook_on_success(self, mock_send, orchestrator):
         orch, s3, lam = orchestrator
         meta = _make_meta(ai_enabled=True, webhook_url="https://drupal.example.com/hook")
         s3.get_object.return_value = _s3_get_object_response(meta)
@@ -357,16 +358,19 @@ class TestWebhook:
             _lambda_invoke_response(200, bedrock_body),
         ]
 
-        mock_resp = MagicMock()
-        mock_resp.status = 200
-        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
-        mock_resp.__exit__ = MagicMock(return_value=False)
-        mock_urlopen.return_value = mock_resp
-
         result = orch.process("bucket", "PES/pending/STD-12345.pdf")
 
         assert result["details"]["webhook_sent"] is True
-        mock_urlopen.assert_called_once()
+        mock_send.assert_called_once()
+
+        # Verify correct URL and payload structure
+        call_args = mock_send.call_args
+        assert call_args[0][0] == "https://drupal.example.com/hook"
+        payload = call_args[0][2]
+        assert payload["item_id"] == "STD-12345"
+        assert payload["ou"] == "PES"
+        assert payload["product_part_number"] == "STD-12345"
+        assert payload["status"] == "completed"
 
     def test_no_webhook_url_skips(self, orchestrator):
         orch, s3, lam = orchestrator
@@ -384,8 +388,8 @@ class TestWebhook:
 
         assert result["details"]["webhook_sent"] is False
 
-    @patch("src.orchestrator.ai_orchestrator.urllib.request.urlopen")
-    def test_webhook_failure_does_not_block(self, mock_urlopen, orchestrator):
+    @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=False)
+    def test_webhook_failure_does_not_block(self, mock_send, orchestrator):
         orch, s3, lam = orchestrator
         meta = _make_meta(ai_enabled=True, webhook_url="https://drupal.example.com/hook")
         s3.get_object.return_value = _s3_get_object_response(meta)
@@ -396,9 +400,6 @@ class TestWebhook:
             _lambda_invoke_response(200, extraction_body),
             _lambda_invoke_response(200, bedrock_body),
         ]
-
-        import urllib.error
-        mock_urlopen.side_effect = urllib.error.URLError("connection refused")
 
         result = orch.process("bucket", "PES/pending/STD-12345.pdf")
 
