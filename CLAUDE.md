@@ -17,6 +17,7 @@ python -m pytest tests/extractors/test_pdf_extractor.py -v
 python -m pytest tests/generators/test_image_overlay_generator.py -v
 python -m pytest tests/ai/test_bedrock_inference.py -v
 python -m pytest tests/extractors/test_video_transcriber.py -v
+python -m pytest tests/webhook/test_sender.py -v
 
 # Run a single test class or method
 python -m pytest tests/extractors/test_pdf_extractor.py::TestNormalPDF::test_extracts_text -v
@@ -61,6 +62,7 @@ pip install -r requirements.txt -r requirements-dev.txt
 - **`src/extractors/`** — Reusable extraction modules (one per file type). Each extractor class takes an S3 client, downloads the file, extracts content, writes metadata JSON back to S3, and returns a structured result dict. Contains its own `Dockerfile`. Includes `VideoTranscriber` which uses AWS Transcribe for video-to-text with speaker diarization and optional Claude Haiku transcript cleanup.
 - **`src/generators/`** — Reusable generation modules. Each generator class takes an S3 client, reads trigger JSON, processes assets, writes output to S3, and returns a structured result dict. Contains its own `Dockerfile` and `requirements.txt`.
 - **`src/ai/`** — AI inference modules. `BedrockInference` calls AWS Bedrock (Claude Sonnet) with the IEEE system prompt to generate structured metadata from document text. Includes retry logic for throttling and invalid JSON. Contains its own `Dockerfile` and `requirements.txt`.
+- **`src/webhook/`** — Webhook delivery module. `WebhookSender` signs payloads with HMAC-SHA256, retries with exponential backoff on 5xx/connection errors, and publishes to an SNS dead-letter topic after exhausting retries.
 - **`src/orchestrator/`** — AI Orchestrator module. `AIOrchestrator` reads `.meta.json` for uploaded files, routes based on `ai_enrichment_enabled` flag: dispatches to PDF extractor or video transcriber, invokes Bedrock for metadata, sends webhook to Drupal, and moves files from `/pending/` to `/processed/`. Contains its own `Dockerfile` and `requirements.txt`.
 - **`src/handlers/`** — Lambda entry points. Each handler wraps an extractor, generator, inference, or orchestrator module, parses the event, and returns a structured response.
 - **`scripts/`** — AWS CLI deployment scripts (per-Lambda: `deploy-*.sh`, `invoke-*.sh`, `teardown-*.sh`).

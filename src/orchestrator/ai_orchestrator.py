@@ -11,16 +11,15 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
-import urllib.request
-import urllib.error
 from datetime import datetime, timezone
 from typing import TypedDict
 
-import os
-
 import boto3
 from botocore.exceptions import ClientError
+
+from src.webhook.sender import WebhookSender
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +31,9 @@ VIDEO_MEDIA_TYPES = {"video/mp4", "video/quicktime", "video/webm"}
 PDF_EXTRACTOR_FUNCTION = os.environ.get("PDF_EXTRACTOR_FUNCTION", "ieee-cc-pdf-extractor")
 VIDEO_TRANSCRIBER_FUNCTION = os.environ.get("VIDEO_TRANSCRIBER_FUNCTION", "ieee-cc-video-transcriber")
 BEDROCK_FUNCTION = os.environ.get("BEDROCK_FUNCTION", "ieee-cc-bedrock-inference")
+
+# Webhook secret
+DRUPAL_WEBHOOK_SECRET = os.environ.get("DRUPAL_WEBHOOK_SECRET", "")
 
 # Retry settings for S3 reads
 S3_READ_MAX_RETRIES = 3
@@ -68,9 +70,11 @@ class AIOrchestrator:
         self,
         s3_client=None,
         lambda_client=None,
+        sns_client=None,
     ):
         self._s3 = s3_client or boto3.client("s3")
         self._lambda = lambda_client or boto3.client("lambda")
+        self._webhook_sender = WebhookSender(sns_client=sns_client)
 
     def process(
         self,
@@ -149,9 +153,19 @@ class AIOrchestrator:
         webhook_url = meta.get("webhook_url")
         webhook_sent = False
         if webhook_url:
-            webhook_sent = self._send_webhook(
-                webhook_url, item_id, ou, product_part_number,
-                extraction_result, bedrock_result, correlation,
+            payload = {
+                "item_id": item_id,
+                "ou": ou,
+                "product_part_number": product_part_number,
+                "status": "completed",
+                "completed_at": datetime.now(timezone.utc)
+                .isoformat()
+                .replace("+00:00", "Z"),
+                "extraction": extraction_result,
+                "metadata": bedrock_result,
+            }
+            webhook_sent = self._webhook_sender.send(
+                webhook_url, DRUPAL_WEBHOOK_SECRET, payload, correlation,
             )
 
         # Step 6: Move file from /pending/ to /processed/
@@ -358,47 +372,3 @@ class AIOrchestrator:
         logger.info("%s Bedrock metadata generated", correlation)
         return body
 
-    # ------------------------------------------------------------------
-    # Webhook
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _send_webhook(
-        url: str,
-        item_id: str,
-        ou: str,
-        product_part_number: str,
-        extraction_result: dict,
-        bedrock_result: dict,
-        correlation: str,
-    ) -> bool:
-        """Send webhook notification to Drupal."""
-        payload = {
-            "item_id": item_id,
-            "ou": ou,
-            "product_part_number": product_part_number,
-            "status": "completed",
-            "completed_at": datetime.now(timezone.utc)
-            .isoformat()
-            .replace("+00:00", "Z"),
-            "extraction": extraction_result,
-            "metadata": bedrock_result,
-        }
-
-        try:
-            data = json.dumps(payload).encode()
-            req = urllib.request.Request(
-                url,
-                data=data,
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                logger.info(
-                    "%s Webhook sent to %s (status %d)",
-                    correlation, url, resp.status,
-                )
-                return True
-        except (urllib.error.URLError, OSError) as exc:
-            logger.error("%s Webhook failed: %s", correlation, exc)
-            return False
