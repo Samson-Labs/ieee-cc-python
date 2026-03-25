@@ -2,16 +2,19 @@
 
 Triggered by S3 ObjectCreated events on {ou}/pending/ prefix.
 Reads .meta.json, routes to extraction/transcription + Bedrock, sends webhook.
+On retriable failures, publishes to the DLQ for automatic reprocessing.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 
 import boto3
 from botocore.exceptions import ClientError
 
+from src.common.dlq import build_dlq_message
 from src.orchestrator.ai_orchestrator import AIOrchestrator
 
 logger = logging.getLogger()
@@ -19,10 +22,13 @@ logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 
 _s3_client = boto3.client("s3")
 _lambda_client = boto3.client("lambda")
+_sqs_client = boto3.client("sqs")
 _orchestrator = AIOrchestrator(
     s3_client=_s3_client,
     lambda_client=_lambda_client,
 )
+
+DLQ_QUEUE_URL = os.environ.get("DLQ_QUEUE_URL", "")
 
 
 def handler(event: dict, context) -> dict:
@@ -30,6 +36,8 @@ def handler(event: dict, context) -> dict:
     request_id = ""
     if context and hasattr(context, "aws_request_id"):
         request_id = context.aws_request_id
+
+    retry_count = event.get("retry_count", 0)
 
     try:
         bucket, key = _parse_event(event)
@@ -50,12 +58,15 @@ def handler(event: dict, context) -> dict:
         code = exc.response["Error"]["Code"]
         msg = exc.response["Error"]["Message"]
         logger.error("AWS error (%s): %s", code, msg)
+        _publish_to_dlq(event, exc, request_id, retry_count)
         return {"statusCode": 500, "body": {"error": f"{code}: {msg}"}}
     except RuntimeError as exc:
         logger.error("Processing error: %s", exc)
+        _publish_to_dlq(event, exc, request_id, retry_count)
         return {"statusCode": 500, "body": {"error": str(exc)}}
     except Exception as exc:
         logger.exception("Unexpected error")
+        _publish_to_dlq(event, exc, request_id, retry_count)
         return {
             "statusCode": 500,
             "body": {"error": f"Internal error: {type(exc).__name__}"},
@@ -73,6 +84,25 @@ def handler(event: dict, context) -> dict:
             "processing_time_ms": result["processing_time_ms"],
         },
     }
+
+
+def _publish_to_dlq(
+    event: dict, exc: Exception, correlation_id: str, retry_count: int
+) -> None:
+    """Publish a failed event to the DLQ for reprocessing."""
+    if not DLQ_QUEUE_URL:
+        logger.warning("DLQ_QUEUE_URL not set — skipping DLQ publish")
+        return
+
+    try:
+        message = build_dlq_message(event, exc, correlation_id, retry_count)
+        _sqs_client.send_message(
+            QueueUrl=DLQ_QUEUE_URL,
+            MessageBody=json.dumps(message, default=str),
+        )
+        logger.info("Published failed event to DLQ (retry_count=%d)", retry_count)
+    except Exception as dlq_exc:
+        logger.error("Failed to publish to DLQ: %s", dlq_exc)
 
 
 def _parse_event(event: dict) -> tuple[str, str]:
