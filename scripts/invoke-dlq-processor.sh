@@ -18,7 +18,7 @@ PAYLOAD='{
   "Records": [
     {
       "messageId": "test-msg-001",
-      "body": "{\"original_event\":{\"bucket\":\"dev-ieee-conference-cloud-bulk-uploads\",\"key\":\"PES/pending/STD-12345.pdf\"},\"error\":{\"error_type\":\"BedrockError\",\"error_message\":\"ThrottlingException\",\"correlation_id\":\"req-test-001\",\"timestamp\":\"2026-03-20T00:00:00+00:00\",\"stack_trace\":\"Traceback ...\"},\"retry_count\":0}"
+      "body": "{\"original_event\":{\"bucket\":\"dev-ieee-conference-cloud-bulk-uploads\",\"key\":\"PES/pending/STD-12345.pdf\"},\"error\":{\"error_type\":\"BedrockError\",\"error_message\":\"ThrottlingException\",\"is_retriable\":true,\"correlation_id\":\"req-test-001\",\"timestamp\":\"2026-03-20T00:00:00+00:00\",\"stack_trace\":\"Traceback ...\"},\"retry_count\":0}"
     }
   ]
 }'

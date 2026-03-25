@@ -84,25 +84,26 @@ create_lambda_role() {
         }]
     }'
 
-    # S3 read policy for fetching metadata JSON + Bedrock invoke policy
-    INLINE_POLICY='{
-        "Version": "2012-10-17",
-        "Statement": [
+    # S3 read policy (scoped to pipeline bucket) + Bedrock invoke policy (scoped to region)
+    S3_BUCKET_NAME="dev-ieee-conference-cloud-bulk-uploads"
+    INLINE_POLICY="{
+        \"Version\": \"2012-10-17\",
+        \"Statement\": [
             {
-                "Effect": "Allow",
-                "Action": ["s3:GetObject"],
-                "Resource": "arn:aws:s3:::*/*"
+                \"Effect\": \"Allow\",
+                \"Action\": [\"s3:GetObject\"],
+                \"Resource\": \"arn:aws:s3:::${S3_BUCKET_NAME}/*\"
             },
             {
-                "Effect": "Allow",
-                "Action": ["bedrock:InvokeModel"],
-                "Resource": [
-                    "arn:aws:bedrock:*::foundation-model/*",
-                    "arn:aws:bedrock:*:*:inference-profile/*"
+                \"Effect\": \"Allow\",
+                \"Action\": [\"bedrock:InvokeModel\"],
+                \"Resource\": [
+                    \"arn:aws:bedrock:${AWS_REGION}::foundation-model/*\",
+                    \"arn:aws:bedrock:${AWS_REGION}:${AWS_ACCOUNT_ID}:inference-profile/*\"
                 ]
             }
         ]
-    }'
+    }"
 
     # Create role if it doesn't exist
     aws iam get-role --role-name "${LAMBDA_ROLE_NAME}" >/dev/null 2>&1 \

@@ -120,9 +120,7 @@ Automatically derives `ou` and `product_part_number` from the S3 key pattern `{o
     "transcript": "Speaker 1: Welcome to the lecture...",
     "duration": "01:23:45",
     "duration_seconds": 5025,
-    "speaker_count": 2,
-    "bucket": "dev-ieee-conference-cloud-bulk-uploads",
-    "key": "PES/pending/lecture.mp4"
+    "speaker_count": 2
   }
 }
 ```

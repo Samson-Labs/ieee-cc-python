@@ -143,9 +143,7 @@ class AIOrchestrator:
         bedrock_result = {}
 
         if extracted_text.strip():
-            bedrock_result = self._invoke_bedrock(
-                bucket, ou, product_part_number, extracted_text, correlation
-            )
+            bedrock_result = self._invoke_bedrock(extracted_text, correlation)
         else:
             logger.warning("%s No text extracted — skipping Bedrock", correlation)
 
@@ -342,9 +340,6 @@ class AIOrchestrator:
 
     def _invoke_bedrock(
         self,
-        bucket: str,
-        ou: str,
-        product_part_number: str,
         text: str,
         correlation: str,
     ) -> dict:

@@ -14,10 +14,11 @@ The `BedrockInference` module calls AWS Bedrock (Claude Sonnet) to generate stru
 
 ### Request to Bedrock
 
+The model ID (`us.anthropic.claude-sonnet-4-5-20250929-v1:0`) is passed as the `modelId` API parameter to `invoke_model`, not in the JSON body.
+
 ```json
 {
   "anthropic_version": "bedrock-2023-05-31",
-  "modelId": "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
   "messages": [
     {"role": "user", "content": "<extracted text truncated to 180k chars>"}
   ],

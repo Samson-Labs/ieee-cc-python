@@ -132,7 +132,7 @@ class VideoTranscriber:
 
         # Step 5: Write duration metadata to S3
         duration_str = self._format_duration(duration_seconds)
-        metadata_key = f"{ou}/metadata/{product_part_number}.mp4.json"
+        metadata_key = f"{ou}/metadata/{product_part_number}.{media_format}.json"
         self._write_metadata(
             bucket, metadata_key, duration_str, duration_seconds
         )

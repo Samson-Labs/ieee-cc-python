@@ -21,7 +21,7 @@ The Bedrock Metadata Generator (`ieee-cc-bedrock-inference`) takes extracted doc
 | Timeout | 120s (2 minutes) |
 | ECR Repo | `ieee-cc-bedrock-inference` |
 | IAM Role | `ieee-cc-bedrock-inference-role` |
-| Model ID | `global.anthropic.claude-sonnet-4-6` (configurable via `BEDROCK_MODEL_ID`) |
+| Model ID | `us.anthropic.claude-sonnet-4-5-20250929-v1:0` (configurable via `BEDROCK_MODEL_ID`) |
 
 ## Acceptance Criteria Checklist
 

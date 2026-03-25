@@ -18,7 +18,7 @@ from botocore.exceptions import ClientError
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODEL_ID = "global.anthropic.claude-sonnet-4-6"
+DEFAULT_MODEL_ID = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
 MAX_TOKENS = 2048
 TEMPERATURE = 0.3
 TEXT_TRUNCATION_LIMIT = 180_000  # characters — fits within Claude's context window
@@ -205,12 +205,6 @@ class BedrockInference:
                     continue
                 raise
 
-        # Should not reach here, but just in case
-        raise ClientError(
-            {"Error": {"Code": "ThrottlingException", "Message": "Max retries exceeded"}},
-            "InvokeModel",
-        )
-
     @staticmethod
     def _try_parse_json(raw: str) -> dict | None:
         """Try to parse JSON from raw text, stripping markdown fences if present."""
@@ -244,9 +238,11 @@ class BedrockInference:
                 "abstract must be a string with two paragraphs separated by \\n\\n"
             )
         paragraphs = [p.strip() for p in abstract.split("\n\n") if p.strip()]
-        if len(paragraphs) < 2:
-            raise ValueError("abstract must contain at least two paragraphs")
-        for i, para in enumerate(paragraphs[:2]):
+        if len(paragraphs) != 2:
+            raise ValueError(
+                f"abstract must contain exactly two paragraphs, got {len(paragraphs)}"
+            )
+        for i, para in enumerate(paragraphs):
             word_count = len(para.split())
             if word_count < 50 or word_count > 150:
                 raise ValueError(

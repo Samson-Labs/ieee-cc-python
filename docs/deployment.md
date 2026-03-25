@@ -198,7 +198,7 @@ Creates all resources in order:
 | Timeout | 120s | Bedrock inference can take 30–60s; retries need headroom |
 | Architecture | x86_64 | Consistency with other Lambdas |
 | Base image | `public.ecr.aws/lambda/python:3.13` | AWS-provided Lambda runtime with Python 3.13 |
-| `BEDROCK_MODEL_ID` | `anthropic.claude-sonnet-4-5-20250929-v1:0` | Configurable via env var |
+| `BEDROCK_MODEL_ID` | `us.anthropic.claude-sonnet-4-5-20250929-v1:0` | Configurable via env var |
 
 ### IAM Permissions
 
