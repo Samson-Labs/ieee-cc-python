@@ -49,3 +49,10 @@ class ValidationError(PipelineError):
 
     error_type: str = "ValidationError"
     is_retriable: bool = False
+
+
+class BulkProcessingError(PipelineError):
+    """Bulk processing failures (manifest read, SQS publish, progress tracking)."""
+
+    error_type: str = "BulkProcessingError"
+    is_retriable: bool = True
