@@ -5,6 +5,7 @@ from io import BytesIO
 from unittest.mock import MagicMock, patch
 
 import pytest
+from botocore.exceptions import ClientError
 
 from src.bulk.bulk_worker import BulkWorker
 from src.common.exceptions import BulkProcessingError, ValidationError
@@ -205,7 +206,9 @@ class TestUpdateProgress:
 
     def test_creates_progress_if_missing(self, worker):
         w, _, s3_mock, _ = worker
-        s3_mock.get_object.side_effect = Exception("NoSuchKey")
+        s3_mock.get_object.side_effect = ClientError(
+            {"Error": {"Code": "NoSuchKey", "Message": "Not found"}}, "GetObject"
+        )
 
         progress = w._update_progress("bucket", "bulk-test-001", 42, True, 10)
 

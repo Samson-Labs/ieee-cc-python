@@ -21,7 +21,7 @@ AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
 
 ECR_REPO_NAME="ieee-rc-bulk-worker"
 LAMBDA_FUNCTION_NAME="ieee-rc-bulk-worker"
-S3_BUCKET_NAME="dev-ieee-conference-cloud-bulk-uploads"
+S3_BUCKET_NAME="${S3_BUCKET_NAME:-dev-ieee-conference-cloud-bulk-uploads}"
 LAMBDA_ROLE_NAME="ieee-rc-bulk-worker-role"
 ORCHESTRATOR_FUNCTION_NAME="ieee-rc-ai-orchestrator"
 SNS_TOPIC_NAME="ieee-rc-bulk-completion"
@@ -169,7 +169,7 @@ create_lambda() {
             --memory-size 512 \
             --timeout 300 \
             --architectures x86_64 \
-            --environment "Variables={LOG_LEVEL=INFO,ORCHESTRATOR_FUNCTION_NAME=${ORCHESTRATOR_FUNCTION_NAME},S3_BUCKET=${S3_BUCKET_NAME},COMPLETION_SNS_TOPIC_ARN=arn:aws:sns:${AWS_REGION}:${AWS_ACCOUNT_ID}:${SNS_TOPIC_NAME}}"
+            --environment "Variables={LOG_LEVEL=${LOG_LEVEL:-INFO},ORCHESTRATOR_FUNCTION_NAME=${ORCHESTRATOR_FUNCTION_NAME},S3_BUCKET=${S3_BUCKET_NAME},COMPLETION_SNS_TOPIC_ARN=arn:aws:sns:${AWS_REGION}:${AWS_ACCOUNT_ID}:${SNS_TOPIC_NAME}}"
 
         aws lambda wait function-active-v2 \
             --function-name "${LAMBDA_FUNCTION_NAME}" \

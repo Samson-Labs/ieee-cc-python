@@ -16,7 +16,7 @@ logger = get_json_logger(__name__)
 
 DEFAULT_BUCKET = os.environ.get("S3_BUCKET", "dev-ieee-conference-cloud-bulk-uploads")
 
-REQUIRED_MANIFEST_FIELDS = {"batch_id", "callback_url", "items", "config"}
+REQUIRED_MANIFEST_FIELDS = {"batch_id", "callback_url", "items"}
 REQUIRED_ITEM_FIELDS = {"item_id", "request_id", "s3_key", "media_type", "resource_center"}
 VALID_MEDIA_TYPES = {"PDF", "MP4", "MOV", "WEBM"}
 

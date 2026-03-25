@@ -8,6 +8,7 @@ import time
 from typing import TypedDict
 
 import boto3
+from botocore.exceptions import ClientError
 
 from src.common.exceptions import BulkProcessingError, ValidationError
 from src.common.logging import get_json_logger
@@ -206,7 +207,7 @@ class BulkWorker:
         try:
             response = self._s3.get_object(Bucket=bucket, Key=progress_key)
             progress = json.loads(response["Body"].read().decode())
-        except Exception:
+        except (ClientError, json.JSONDecodeError, KeyError):
             progress = {
                 "batch_id": batch_id,
                 "total_items": total_items,
