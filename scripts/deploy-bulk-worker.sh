@@ -115,6 +115,11 @@ create_lambda_role() {
         },
         {
             "Effect": "Allow",
+            "Action": ["s3:ListBucket"],
+            "Resource": "arn:aws:s3:::${S3_BUCKET_NAME}"
+        },
+        {
+            "Effect": "Allow",
             "Action": ["sns:Publish"],
             "Resource": "arn:aws:sns:${AWS_REGION}:${AWS_ACCOUNT_ID}:${SNS_TOPIC_NAME}"
         },
