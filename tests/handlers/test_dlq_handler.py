@@ -1,42 +1,19 @@
 """Tests for the DLQ handler Lambda entry point."""
 
-import json
 from unittest.mock import patch
 
 from src.handlers.dlq_handler import handler
-
-
-def _make_sqs_record(message: dict, message_id: str = "msg-001") -> dict:
-    return {"messageId": message_id, "body": json.dumps(message)}
-
-
-def _make_dlq_message(
-    error_type: str = "BedrockError",
-    is_retriable: bool = True,
-    retry_count: int = 0,
-) -> dict:
-    return {
-        "original_event": {"bucket": "test-bucket", "key": "PES/pending/STD-123.pdf"},
-        "error": {
-            "error_type": error_type,
-            "error_message": "test error",
-            "is_retriable": is_retriable,
-            "correlation_id": "req-123",
-            "timestamp": "2026-03-20T00:00:00+00:00",
-            "stack_trace": "Traceback ...",
-        },
-        "retry_count": retry_count,
-    }
+from tests.conftest import make_dlq_message, make_sqs_record
 
 
 class TestDLQHandler:
     def test_processes_multiple_records(self):
-        msg1 = _make_dlq_message(error_type="ValidationError", is_retriable=False)
-        msg2 = _make_dlq_message(error_type="BedrockError", is_retriable=True)
+        msg1 = make_dlq_message(error_type="ValidationError", is_retriable=False)
+        msg2 = make_dlq_message(error_type="BedrockError", is_retriable=True)
         event = {
             "Records": [
-                _make_sqs_record(msg1, "msg-001"),
-                _make_sqs_record(msg2, "msg-002"),
+                make_sqs_record(msg1, "msg-001"),
+                make_sqs_record(msg2, "msg-002"),
             ]
         }
 
@@ -51,11 +28,11 @@ class TestDLQHandler:
         assert result["batchItemFailures"] == []
 
     def test_partial_batch_failure(self):
-        msg = _make_dlq_message()
+        msg = make_dlq_message()
         event = {
             "Records": [
-                _make_sqs_record(msg, "msg-001"),
-                _make_sqs_record(msg, "msg-002"),
+                make_sqs_record(msg, "msg-001"),
+                make_sqs_record(msg, "msg-002"),
             ]
         }
 

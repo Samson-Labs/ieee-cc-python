@@ -2,8 +2,6 @@
 
 from datetime import datetime, timezone
 
-import pytest
-
 from src.common.dlq import build_dlq_message
 from src.common.exceptions import BedrockError, ValidationError
 
@@ -74,14 +72,9 @@ class TestBuildDLQMessage:
         assert "RuntimeError" in result["error"]["stack_trace"]
         assert "fail with trace" in result["error"]["stack_trace"]
 
-    def test_default_correlation_id_is_empty(self):
+    def test_default_values(self):
         exc = RuntimeError("fail")
         result = build_dlq_message(SAMPLE_EVENT, exc)
 
         assert result["error"]["correlation_id"] == ""
-
-    def test_default_retry_count_is_zero(self):
-        exc = RuntimeError("fail")
-        result = build_dlq_message(SAMPLE_EVENT, exc)
-
         assert result["retry_count"] == 0

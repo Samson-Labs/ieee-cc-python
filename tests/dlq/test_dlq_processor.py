@@ -1,4 +1,4 @@
-"""Tests for DLQ processor and handler."""
+"""Tests for DLQ processor."""
 
 import json
 from unittest.mock import MagicMock, patch
@@ -6,31 +6,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from src.dlq.dlq_processor import DLQProcessor
-
-
-def _make_sqs_record(message: dict, message_id: str = "msg-001") -> dict:
-    return {"messageId": message_id, "body": json.dumps(message)}
-
-
-def _make_dlq_message(
-    error_type: str = "BedrockError",
-    error_message: str = "throttled",
-    is_retriable: bool = True,
-    correlation_id: str = "req-123",
-    retry_count: int = 0,
-) -> dict:
-    return {
-        "original_event": {"bucket": "test-bucket", "key": "PES/pending/STD-123.pdf"},
-        "error": {
-            "error_type": error_type,
-            "error_message": error_message,
-            "is_retriable": is_retriable,
-            "correlation_id": correlation_id,
-            "timestamp": "2026-03-20T00:00:00+00:00",
-            "stack_trace": "Traceback ...",
-        },
-        "retry_count": retry_count,
-    }
+from tests.conftest import make_dlq_message as _make_dlq_message
+from tests.conftest import make_sqs_record as _make_sqs_record
 
 
 @pytest.fixture
