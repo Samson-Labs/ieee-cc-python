@@ -38,7 +38,7 @@ The orchestrator reads `{ou}/metadata/{item_id}.meta.json` to determine routing.
     "media_type": "application/pdf",
     "filename": "STD-12345.pdf"
   },
-  "webhook_url": "https://drupal.example.com/hook"
+  "callback_url": "https://drupal.example.com/hook"
 }
 ```
 
@@ -57,7 +57,7 @@ The orchestrator reads `{ou}/metadata/{item_id}.meta.json` to determine routing.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `webhook_url` | string | URL for Drupal notification on completion |
+| `callback_url` | string | URL for Drupal notification on completion |
 
 ## Media Type Routing
 
@@ -126,7 +126,7 @@ On error, the source file remains in `/pending/` (no partial moves).
 
 ## Webhook Payload
 
-When `webhook_url` is provided and AI enrichment completes:
+When `callback_url` is provided and AI enrichment completes:
 
 ```json
 {

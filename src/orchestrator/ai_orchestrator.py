@@ -150,13 +150,19 @@ class AIOrchestrator:
             logger.warning("%s No text extracted — skipping Bedrock", correlation)
 
         # Step 5: Send webhook to Drupal
-        webhook_url = meta.get("webhook_url")
+        callback_url = meta.get("callback_url") or meta.get("webhook_url")
         webhook_sent = False
-        if webhook_url:
+        if callback_url:
+            signal = (
+                "transcription_ready"
+                if media_type in VIDEO_MEDIA_TYPES
+                else "extraction_ready"
+            )
             payload = {
+                "signal": signal,
+                "product_part_number": product_part_number,
                 "item_id": item_id,
                 "ou": ou,
-                "product_part_number": product_part_number,
                 "status": "completed",
                 "completed_at": datetime.now(timezone.utc)
                 .isoformat()
@@ -165,7 +171,7 @@ class AIOrchestrator:
                 "metadata": bedrock_result,
             }
             webhook_sent = self._webhook_sender.send(
-                webhook_url, DRUPAL_WEBHOOK_SECRET, payload, correlation,
+                callback_url, DRUPAL_WEBHOOK_SECRET, payload, correlation,
             )
 
         # Step 6: Move file from /pending/ to /processed/
