@@ -33,7 +33,7 @@ cat <<'EOF' | aws s3 cp - s3://dev-ieee-conference-cloud-bulk-uploads/PES/metada
   "product_part_number": "TEST_WEBHOOK",
   "ai_enrichment_enabled": true,
   "content": { "media_type": "application/pdf", "filename": "TEST_WEBHOOK.pdf" },
-  "webhook_url": "https://httpbin.org/post"
+  "callback_url": "https://httpbin.org/post"
 }
 EOF
 
@@ -104,7 +104,7 @@ cat <<'EOF' | aws s3 cp - s3://dev-ieee-conference-cloud-bulk-uploads/PES/metada
   "product_part_number": "TEST_RETRY",
   "ai_enrichment_enabled": true,
   "content": { "media_type": "application/pdf", "filename": "TEST_RETRY.pdf" },
-  "webhook_url": "https://httpbin.org/status/500"
+  "callback_url": "https://httpbin.org/status/500"
 }
 EOF
 ```
@@ -141,7 +141,7 @@ cat <<'EOF' | aws s3 cp - s3://dev-ieee-conference-cloud-bulk-uploads/PES/metada
   "product_part_number": "TEST_4XX",
   "ai_enrichment_enabled": true,
   "content": { "media_type": "application/pdf", "filename": "TEST_4XX.pdf" },
-  "webhook_url": "https://httpbin.org/status/401"
+  "callback_url": "https://httpbin.org/status/401"
 }
 EOF
 ```
@@ -201,7 +201,7 @@ EOF
 
 ### TC-7: No Webhook URL — Skip Silently
 
-**Purpose:** Verify no webhook is sent when `webhook_url` is absent from `.meta.json`.
+**Purpose:** Verify no webhook is sent when `callback_url` is absent from `.meta.json`.
 
 **Setup:**
 ```bash

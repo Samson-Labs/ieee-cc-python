@@ -136,7 +136,7 @@ S3: {ou}/pending/{file}.{pdf|mp4|mov|webm}
   "product_part_number": "STD-12345",
   "ai_enrichment_enabled": true,
   "content": { "media_type": "application/pdf", "filename": "STD-12345.pdf" },
-  "webhook_url": "https://drupal.example.com/hook"
+  "callback_url": "https://drupal.example.com/hook"
 }
 ```
 

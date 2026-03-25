@@ -67,7 +67,7 @@ cat <<'EOF' | aws s3 cp - s3://dev-ieee-conference-cloud-bulk-uploads/PES/metada
   "product_part_number": "TEST_PDF",
   "ai_enrichment_enabled": true,
   "content": { "media_type": "application/pdf", "filename": "TEST_PDF.pdf" },
-  "webhook_url": "https://httpbin.org/post"
+  "callback_url": "https://httpbin.org/post"
 }
 EOF
 ```
@@ -99,7 +99,7 @@ cat <<'EOF' | aws s3 cp - s3://dev-ieee-conference-cloud-bulk-uploads/PES/metada
   "product_part_number": "TEST_VIDEO",
   "ai_enrichment_enabled": true,
   "content": { "media_type": "video/mp4", "filename": "TEST_VIDEO.mp4" },
-  "webhook_url": "https://httpbin.org/post"
+  "callback_url": "https://httpbin.org/post"
 }
 EOF
 ```

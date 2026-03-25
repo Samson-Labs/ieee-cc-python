@@ -372,6 +372,7 @@ class TestWebhook:
         assert payload["item_id"] == "STD-12345"
         assert payload["ou"] == "PES"
         assert payload["status"] == "completed"
+        assert "completed_at" in payload
 
     @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
     def test_video_signal_is_transcription_ready(self, mock_send, orchestrator):
@@ -394,7 +395,7 @@ class TestWebhook:
 
     def test_no_callback_url_skips(self, orchestrator):
         orch, s3, lam = orchestrator
-        meta = _make_meta(ai_enabled=True)  # No webhook_url
+        meta = _make_meta(ai_enabled=True)  # No callback_url
         s3.get_object.return_value = _s3_get_object_response(meta)
 
         extraction_body = {"text": "text", "page_count": 5, "extraction_method": "text"}
