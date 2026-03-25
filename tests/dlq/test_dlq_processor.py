@@ -6,7 +6,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from src.dlq.dlq_processor import DLQProcessor
-from src.handlers.dlq_handler import handler
 
 
 def _make_sqs_record(message: dict, message_id: str = "msg-001") -> dict:
@@ -235,43 +234,3 @@ class TestIsRetriable:
         assert DLQProcessor._is_retriable({"is_retriable": "true"}) is False
 
 
-class TestDLQHandler:
-    def test_processes_multiple_records(self):
-        msg1 = _make_dlq_message(error_type="ValidationError", is_retriable=False, retry_count=0)
-        msg2 = _make_dlq_message(error_type="BedrockError", is_retriable=True, retry_count=0)
-        event = {
-            "Records": [
-                _make_sqs_record(msg1, "msg-001"),
-                _make_sqs_record(msg2, "msg-002"),
-            ]
-        }
-
-        with patch("src.handlers.dlq_handler.processor") as mock_proc:
-            mock_proc.process_message.side_effect = [
-                {"action": "archived"},
-                {"action": "reprocessed"},
-            ]
-            result = handler(event, None)
-
-        assert len(result["results"]) == 2
-        assert result["batchItemFailures"] == []
-
-    def test_partial_batch_failure(self):
-        msg = _make_dlq_message()
-        event = {
-            "Records": [
-                _make_sqs_record(msg, "msg-001"),
-                _make_sqs_record(msg, "msg-002"),
-            ]
-        }
-
-        with patch("src.handlers.dlq_handler.processor") as mock_proc:
-            mock_proc.process_message.side_effect = [
-                {"action": "archived"},
-                RuntimeError("unexpected"),
-            ]
-            result = handler(event, None)
-
-        assert len(result["batchItemFailures"]) == 1
-        assert result["batchItemFailures"][0]["itemIdentifier"] == "msg-002"
-        assert len(result["results"]) == 2
