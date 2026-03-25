@@ -17,7 +17,7 @@ from src.orchestrator.ai_orchestrator import AIOrchestrator
 def _make_meta(
     ai_enabled=True,
     media_type="application/pdf",
-    webhook_url=None,
+    callback_url=None,
 ):
     meta = {
         "item_id": "STD-12345",
@@ -29,8 +29,8 @@ def _make_meta(
             "filename": "STD-12345.pdf",
         },
     }
-    if webhook_url:
-        meta["webhook_url"] = webhook_url
+    if callback_url:
+        meta["callback_url"] = callback_url
     return meta
 
 
@@ -348,7 +348,7 @@ class TestWebhook:
     @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
     def test_sends_webhook_on_success(self, mock_send, orchestrator):
         orch, s3, lam = orchestrator
-        meta = _make_meta(ai_enabled=True, webhook_url="https://drupal.example.com/hook")
+        meta = _make_meta(ai_enabled=True, callback_url="https://drupal.example.com/hook")
         s3.get_object.return_value = _s3_get_object_response(meta)
 
         extraction_body = {"text": "text", "page_count": 5, "extraction_method": "text"}
@@ -367,12 +367,32 @@ class TestWebhook:
         call_args = mock_send.call_args
         assert call_args[0][0] == "https://drupal.example.com/hook"
         payload = call_args[0][2]
+        assert payload["signal"] == "extraction_ready"
+        assert payload["product_part_number"] == "STD-12345"
         assert payload["item_id"] == "STD-12345"
         assert payload["ou"] == "PES"
-        assert payload["product_part_number"] == "STD-12345"
         assert payload["status"] == "completed"
 
-    def test_no_webhook_url_skips(self, orchestrator):
+    @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
+    def test_video_signal_is_transcription_ready(self, mock_send, orchestrator):
+        orch, s3, lam = orchestrator
+        meta = _make_meta(ai_enabled=True, media_type="video/mp4", callback_url="https://drupal.example.com/hook")
+        meta["content"]["filename"] = "lecture.mp4"
+        s3.get_object.return_value = _s3_get_object_response(meta)
+
+        transcription_body = {"transcript": "text", "duration": "00:01:00", "duration_seconds": 60, "speaker_count": 1}
+        bedrock_body = {"abstract": "a", "keywords": [], "learning_level": "Expert", "intended_audience": "Seasoned", "category": "Research"}
+        lam.invoke.side_effect = [
+            _lambda_invoke_response(200, transcription_body),
+            _lambda_invoke_response(200, bedrock_body),
+        ]
+
+        orch.process("bucket", "AESS/pending/lecture.mp4")
+
+        payload = mock_send.call_args[0][2]
+        assert payload["signal"] == "transcription_ready"
+
+    def test_no_callback_url_skips(self, orchestrator):
         orch, s3, lam = orchestrator
         meta = _make_meta(ai_enabled=True)  # No webhook_url
         s3.get_object.return_value = _s3_get_object_response(meta)
@@ -391,7 +411,7 @@ class TestWebhook:
     @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=False)
     def test_webhook_failure_does_not_block(self, mock_send, orchestrator):
         orch, s3, lam = orchestrator
-        meta = _make_meta(ai_enabled=True, webhook_url="https://drupal.example.com/hook")
+        meta = _make_meta(ai_enabled=True, callback_url="https://drupal.example.com/hook")
         s3.get_object.return_value = _s3_get_object_response(meta)
 
         extraction_body = {"text": "text", "page_count": 5, "extraction_method": "text"}

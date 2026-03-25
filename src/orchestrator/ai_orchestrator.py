@@ -150,13 +150,19 @@ class AIOrchestrator:
             logger.warning("%s No text extracted — skipping Bedrock", correlation)
 
         # Step 5: Send webhook to Drupal
-        webhook_url = meta.get("webhook_url")
+        webhook_url = meta.get("callback_url")
         webhook_sent = False
         if webhook_url:
+            signal = (
+                "transcription_ready"
+                if media_type in VIDEO_MEDIA_TYPES
+                else "extraction_ready"
+            )
             payload = {
+                "signal": signal,
+                "product_part_number": product_part_number,
                 "item_id": item_id,
                 "ou": ou,
-                "product_part_number": product_part_number,
                 "status": "completed",
                 "completed_at": datetime.now(timezone.utc)
                 .isoformat()
