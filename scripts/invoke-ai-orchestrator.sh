@@ -39,7 +39,7 @@ aws lambda invoke \
     --function-name "${LAMBDA_FUNCTION_NAME}" \
     --region "${AWS_REGION}" \
     --payload "${PAYLOAD}" \
-    --cli-read-timeout 300 \
+    --cli-read-timeout 900 \
     "${OUTPUT_FILE}"
 
 echo ""

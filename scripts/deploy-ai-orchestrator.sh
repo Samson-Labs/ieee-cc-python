@@ -149,7 +149,7 @@ create_lambda() {
             --code "ImageUri=${ECR_URI}:${IMAGE_TAG}" \
             --role "${ROLE_ARN}" \
             --memory-size 512 \
-            --timeout 300 \
+            --timeout 900 \
             --architectures x86_64 \
             --environment "Variables={LOG_LEVEL=INFO,PDF_EXTRACTOR_FUNCTION=ieee-cc-pdf-extractor,VIDEO_TRANSCRIBER_FUNCTION=ieee-cc-video-transcriber,BEDROCK_FUNCTION=ieee-cc-bedrock-inference}"
 
@@ -191,7 +191,7 @@ create_lambda
 log "Deployment complete."
 log ""
 log "  ECR:     ${ECR_URI}:${IMAGE_TAG}"
-log "  Lambda:  ${LAMBDA_FUNCTION_NAME} (512 MB, 5 min timeout)"
+log "  Lambda:  ${LAMBDA_FUNCTION_NAME} (512 MB, 15 min timeout)"
 log ""
 log "  Invoke:"
 log "    ./scripts/invoke-ai-orchestrator.sh <bucket> <key>"
