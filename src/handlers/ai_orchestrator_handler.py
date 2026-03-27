@@ -12,6 +12,7 @@ import logging
 import os
 
 import boto3
+from botocore.config import Config
 from botocore.exceptions import ClientError
 
 from src.common.dlq import build_dlq_message
@@ -21,7 +22,12 @@ logger = logging.getLogger()
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 
 _s3_client = boto3.client("s3")
-_lambda_client = boto3.client("lambda")
+# Video transcriber can poll Transcribe for up to 10 min; set read timeout
+# high enough so the synchronous invoke doesn't time out at the HTTP layer.
+_lambda_client = boto3.client(
+    "lambda",
+    config=Config(read_timeout=900, connect_timeout=10),
+)
 _sqs_client = boto3.client("sqs")
 _orchestrator = AIOrchestrator(
     s3_client=_s3_client,
