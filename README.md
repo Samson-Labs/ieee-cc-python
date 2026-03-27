@@ -8,7 +8,7 @@ Python Lambda modules for the IEEE Content Conversion pipeline. Handles PDF text
 # Install dependencies
 pip install -r requirements.txt -r requirements-dev.txt
 
-# Run all tests (218 total)
+# Run all tests (353 total)
 python -m pytest tests/ -v
 
 # Deploy PDF Extractor
@@ -25,6 +25,15 @@ python -m pytest tests/ -v
 
 # Deploy AI Orchestrator
 ./scripts/deploy-ai-orchestrator.sh
+
+# Deploy DLQ Processor
+./scripts/deploy-dlq-processor.sh
+
+# Deploy Bulk Processor (manifest dispatcher)
+./scripts/deploy-bulk-processor.sh
+
+# Deploy Bulk Worker (SQS-triggered, per-item)
+./scripts/deploy-bulk-worker.sh
 ```
 
 ## Lambdas
@@ -119,12 +128,13 @@ S3: {ou}/pending/{file}.{pdf|mp4|mov|webm}
         |
         v
 +-----------------------------+
-|  ieee-rc-ai-orchestrator   |  (Python 3.12, boto3, 512MB, 5min)
+|  ieee-rc-ai-orchestrator   |  (Python 3.12, boto3, 512MB, 15min)
 |  +- Read .meta.json        |  {ou}/metadata/{item_id}.meta.json
 |  +- Route by media_type    |  PDF -> extractor, Video -> transcriber
 |  +- Invoke Bedrock         |  metadata generation
-|  +- Send webhook           |  POST to Drupal
+|  +- Send webhook           |  HMAC-SHA256 signed POST to Drupal
 |  +- Move to /processed/    |  copy + delete
+|  +- DLQ on failure         |  publish to SQS for retry
 +-----------------------------+
 ```
 
@@ -140,6 +150,59 @@ S3: {ou}/pending/{file}.{pdf|mp4|mov|webm}
 }
 ```
 
+### DLQ Processor
+
+Reads failed pipeline events from SQS dead-letter queue. Re-invokes the orchestrator for retriable errors (up to 2 attempts), archives permanently failed messages to S3, and sends SNS alerts.
+
+```
+SQS: ieee-rc-processing-dlq
+        |
+        v
++---------------------------+
+|  ieee-rc-dlq-processor   |  (Python 3.13, boto3, 256MB, 60s)
+|  +- Parse DLQ message     |  error_type, is_retriable, retry_count
+|  +- Retriable: reprocess  |  re-invoke orchestrator (max 2x)
+|  +- Permanent: archive    |  S3: failed/{correlation_id}/{ts}.json
+|  +- SNS alert             |  publish failure summary
++---------------------------+
+```
+
+### Bulk Processor (Manifest Dispatcher)
+
+Reads a batch manifest from S3, validates items, estimates cost, and publishes each item to an SQS queue for processing. Used for re-tagging existing catalog items through the AI pipeline.
+
+```
+Direct invoke: {"batch_id": "bulk-2026-03-17"}
+        |
+        v
++----------------------------+
+|  ieee-rc-bulk-processor   |  (Python 3.13, boto3, 512MB, 5min)
+|  +- Read manifest          |  bulk/manifests/{batch_id}.json
+|  +- Validate items         |  media_type, s3_key, resource_center
+|  +- Estimate cost          |  PDF ~$0.01, video ~$0.03 per item
+|  +- Publish to SQS         |  with configurable delay_between_ms
+|  +- Write progress         |  bulk/progress/{batch_id}_progress.json
++----------------------------+
+```
+
+### Bulk Worker (Per-Item Processor)
+
+SQS-triggered Lambda that processes individual catalog items. Copies files to `/pending/`, creates `.meta.json`, invokes the orchestrator, and tracks batch progress.
+
+```
+SQS: ieee-rc-bulk-processing-queue (MaxConcurrency=10)
+        |
+        v
++----------------------------+
+|  ieee-rc-bulk-worker      |  (Python 3.13, boto3, 512MB, 5min)
+|  +- Copy to /pending/      |  archive -> pending
+|  +- Create .meta.json      |  ai_enrichment_enabled: true
+|  +- Invoke orchestrator    |  synchronous (RequestResponse)
+|  +- Update progress        |  bulk/progress/{batch_id}_progress.json
+|  +- SNS on completion      |  when all items processed
++----------------------------+
+```
+
 ## AWS Resources
 
 | Resource | Name | Config |
@@ -150,12 +213,22 @@ S3: {ou}/pending/{file}.{pdf|mp4|mov|webm}
 | ECR | `ieee-cc-bedrock-inference` | Bedrock metadata image |
 | ECR | `ieee-cc-video-transcriber` | Video transcriber image |
 | ECR | `ieee-rc-ai-orchestrator` | AI orchestrator image |
+| ECR | `ieee-rc-dlq-processor` | DLQ processor image |
+| ECR | `ieee-rc-bulk-processor` | Bulk manifest dispatcher image |
+| ECR | `ieee-rc-bulk-worker` | Bulk per-item worker image |
 | Lambda | `ieee-cc-pdf-extractor` | 3 GB, 5 min timeout |
 | Lambda | `ieee-rc-image-generator` | 1024 MB, 60s timeout |
 | Lambda | `ieee-cc-bedrock-inference` | 512 MB, 120s timeout |
 | Lambda | `ieee-cc-video-transcriber` | 512 MB, 15 min timeout |
-| Lambda | `ieee-rc-ai-orchestrator` | 512 MB, 5 min timeout |
-| S3 Trigger | `actions/*.json` | -> image generator |
+| Lambda | `ieee-rc-ai-orchestrator` | 512 MB, 15 min timeout |
+| Lambda | `ieee-rc-dlq-processor` | 256 MB, 60s timeout |
+| Lambda | `ieee-rc-bulk-processor` | 512 MB, 5 min timeout |
+| Lambda | `ieee-rc-bulk-worker` | 512 MB, 5 min timeout |
+| SQS Queue | `ieee-rc-processing-dlq` | DLQ for failed pipeline events |
+| SQS Queue | `ieee-rc-bulk-processing-queue` | Bulk re-tagging work queue (MaxConcurrency 10) |
+| SQS Trigger | `ieee-rc-processing-dlq` | -> `ieee-rc-dlq-processor` (batch size 1) |
+| SQS Trigger | `ieee-rc-bulk-processing-queue` | -> `ieee-rc-bulk-worker` (batch size 1, MaxConcurrency 10) |
+| S3 Trigger | `actions/*.json` | -> `ieee-rc-image-generator` |
 
 ## Invoking
 
@@ -188,6 +261,21 @@ S3: {ou}/pending/{file}.{pdf|mp4|mov|webm}
 ./scripts/invoke-ai-orchestrator.sh dev-ieee-conference-cloud-bulk-uploads PES/pending/STD-12345.pdf
 ```
 
+**DLQ Processor:**
+```bash
+./scripts/invoke-dlq-processor.sh
+```
+
+**Bulk Processor:**
+```bash
+./scripts/invoke-bulk-processor.sh bulk-2026-03-17
+```
+
+**Bulk Worker:**
+```bash
+./scripts/invoke-bulk-worker.sh
+```
+
 ## Project Structure
 
 ```
@@ -209,30 +297,63 @@ src/
     AIOrchestratorDockerfile       # Python 3.12 + boto3
     ai_orchestrator_requirements.txt
     ai_orchestrator.py             # Central routing orchestrator
+  common/
+    exceptions.py                 # PipelineError hierarchy
+    retry.py                      # @with_retry decorator
+    error_handler.py              # Structured error responses
+    logging.py                    # JSON structured logger
+    dlq.py                        # DLQ message builder
+  webhook/
+    sender.py                     # HMAC-SHA256 webhook sender with retry
+  dlq/
+    Dockerfile                    # Python 3.13 + boto3
+    dlq_processor.py              # DLQ message processor
+  bulk/
+    Dockerfile.processor          # Python 3.13 + boto3 (manifest dispatcher)
+    Dockerfile.worker             # Python 3.13 + boto3 (per-item worker)
+    bulk_processor.py             # Manifest reader + SQS publisher
+    bulk_worker.py                # Per-item orchestrator invoker
   handlers/
     pdf_handler.py                # PDF extractor Lambda entry point
     image_overlay_handler.py      # Image overlay Lambda entry point
     bedrock_handler.py            # Bedrock inference Lambda entry point
     video_transcriber_handler.py  # Video transcriber Lambda entry point
     ai_orchestrator_handler.py    # AI orchestrator Lambda entry point
+    dlq_handler.py                # DLQ processor Lambda entry point
+    bulk_processor_handler.py     # Bulk processor Lambda entry point
+    bulk_worker_handler.py        # Bulk worker Lambda entry point
 tests/
-  extractors/test_pdf_extractor.py           # 21 tests
-  extractors/test_video_transcriber.py       # 35 tests
-  generators/test_image_overlay_generator.py # 43 tests
-  ai/test_bedrock_inference.py               # 25 tests
-  orchestrator/test_ai_orchestrator.py       # 29 tests
+  conftest.py                                    # Shared fixtures
+  extractors/test_pdf_extractor.py               # 21 tests
+  extractors/test_video_transcriber.py           # 34 tests
+  generators/test_image_overlay_generator.py     # 43 tests
+  ai/test_bedrock_inference.py                   # 25 tests
+  orchestrator/test_ai_orchestrator.py           # 30 tests
+  common/test_exceptions.py                      # 21 tests
+  common/test_error_handler.py                   # 13 tests
+  common/test_retry.py                           # 12 tests
+  common/test_logging.py                         # 10 tests
+  common/test_dlq.py                             #  9 tests
+  webhook/test_sender.py                         # 11 tests
+  dlq/test_dlq_processor.py                      # 17 tests
+  bulk/test_bulk_processor.py                    # 17 tests
+  bulk/test_bulk_worker.py                       # 20 tests
   handlers/
-    test_pdf_handler.py                      # 9 tests
-    test_image_overlay_handler.py            # 12 tests
-    test_bedrock_handler.py                  # 9 tests
-    test_video_transcriber_handler.py        # 18 tests
-    test_ai_orchestrator_handler.py          # 17 tests
+    test_pdf_handler.py                          #  9 tests
+    test_image_overlay_handler.py                # 12 tests
+    test_bedrock_handler.py                      #  9 tests
+    test_video_transcriber_handler.py            # 19 tests
+    test_ai_orchestrator_handler.py              # 17 tests
+    test_dlq_handler.py                          #  4 tests
 scripts/
   deploy.sh / invoke.sh / teardown.sh                        # PDF extractor
-  deploy-image-overlay.sh / invoke-image-overlay.sh / teardown-image-overlay.sh  # Image overlay
-  deploy-bedrock.sh / invoke-bedrock.sh / teardown-bedrock.sh                    # Bedrock metadata
-  deploy-video-transcriber.sh / invoke-video-transcriber.sh / teardown-video-transcriber.sh  # Video transcriber
-  deploy-ai-orchestrator.sh / invoke-ai-orchestrator.sh / teardown-ai-orchestrator.sh        # AI orchestrator
+  deploy-image-overlay.sh / invoke-image-overlay.sh / ...    # Image overlay
+  deploy-bedrock.sh / invoke-bedrock.sh / ...                # Bedrock metadata
+  deploy-video-transcriber.sh / invoke-video-transcriber.sh / ...  # Video transcriber
+  deploy-ai-orchestrator.sh / invoke-ai-orchestrator.sh / ...     # AI orchestrator
+  deploy-dlq-processor.sh / invoke-dlq-processor.sh / ...         # DLQ processor
+  deploy-bulk-processor.sh / invoke-bulk-processor.sh / ...       # Bulk processor
+  deploy-bulk-worker.sh / invoke-bulk-worker.sh / ...             # Bulk worker
 ```
 
 ## Documentation
@@ -241,9 +362,17 @@ scripts/
 - [Image Overlay Generator](docs/image-overlay-generator.md) — trigger schema, text layout, output formats
 - [Bedrock Metadata Generator](docs/bedrock-inference.md) — system prompt, validation, retry logic
 - [Video Transcriber Module](docs/video-transcriber.md) — AWS Transcribe integration, speaker diarization, Haiku cleanup
-- [Deployment Guide](docs/deployment.md) — AWS CLI deploy, teardown, configuration
 - [AI Orchestrator Module](docs/ai-orchestrator.md) — routing logic, .meta.json schema, Lambda dispatch
+- [Deployment Guide](docs/deployment.md) — AWS CLI deploy, teardown, configuration
+- [DevOps CI/CD Handoff](docs/devops-cicd-handoff.md) — architecture, build matrix, environment config
 - **QA Testing Guides:**
+  - [Integrated AWS Testing](docs/qa-integrated-aws-testing.md) — end-to-end pipeline test scenarios
+  - [PDF Extractor QA](docs/qa-pdf-extractor.md) — PDF extraction test cases
   - [Image Overlay QA](docs/qa-image-overlay.md) — Image overlay test cases and results
   - [Video Transcriber QA](docs/qa-video-transcriber.md) — Video transcription test cases and AWS live results
   - [AI Orchestrator QA](docs/qa-ai-orchestrator.md) — Orchestrator test cases and AWS live results
+  - [Bedrock Inference QA](docs/qa-bedrock-inference.md) — Bedrock metadata generation test cases
+  - [Webhook Signing QA](docs/qa-webhook-signing.md) — HMAC-SHA256 webhook signing test cases
+  - [Error Handling & DLQ QA](docs/qa-error-handling-dlq.md) — Error handling, retry, and DLQ test cases
+  - [Bulk Processor QA](docs/qa-bulk-processor.md) — Bulk re-tagging test cases
+  - [Testing Guide](docs/qa-testing-guide.md) — General testing guide
