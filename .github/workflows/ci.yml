@@ -1,0 +1,203 @@
+name: CI - Build & Push Docker Images to ECR
+
+on:
+  push:
+    branches:
+      - development
+      - main
+    paths:
+      - "**/*.py"
+      - "src/**"
+      - "**/Dockerfile*"
+      - "**/requirements*.txt"
+  workflow_dispatch: {}
+
+# -------------------------------------------------------------------------
+# CONCURRENCY STRATEGY
+# On 'main': ANY new push cancels previous running builds on main.
+# On other branches: cancellation only for same user + same branch.
+# -------------------------------------------------------------------------
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.ref != 'refs/heads/main' && github.actor || 'global' }}
+  cancel-in-progress: true
+
+env:
+  AWS_REGION: "us-east-1"
+  ACCOUNT_ID: "141770997341"
+
+jobs:
+  test:
+    name: Test & Lint
+    runs-on: [self-hosted, cc3]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          clean: true
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt flake8
+
+      - name: Lint
+        run: flake8 src/ tests/ --max-line-length=120 --ignore=E501,W503
+
+      - name: Run tests
+        run: python -m pytest tests/ -v --tb=short
+
+  build-and-push:
+    name: Build & Push ${{ matrix.name }}
+    runs-on: [self-hosted, cc3]
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: pdf-extractor
+            ecr_repo: ieee-cc-pdf-extractor
+            dockerfile: src/extractors/Dockerfile
+            lambda_name: ieee-cc-pdf-extractor
+            src_path: src/extractors
+
+          - name: image-overlay
+            ecr_repo: ieee-rc-image-generator
+            dockerfile: src/generators/Dockerfile
+            lambda_name: ieee-rc-image-generator
+            src_path: src/generators
+
+          - name: bedrock-inference
+            ecr_repo: ieee-cc-bedrock-inference
+            dockerfile: src/ai/Dockerfile
+            lambda_name: ieee-cc-bedrock-inference
+            src_path: src/ai
+
+          - name: video-transcriber
+            ecr_repo: ieee-cc-video-transcriber
+            dockerfile: src/extractors/VideoTranscriberDockerfile
+            lambda_name: ieee-cc-video-transcriber
+            src_path: src/extractors
+
+          - name: ai-orchestrator
+            ecr_repo: ieee-rc-ai-orchestrator
+            dockerfile: src/orchestrator/AIOrchestratorDockerfile
+            lambda_name: ieee-rc-ai-orchestrator
+            src_path: src/orchestrator
+
+          - name: dlq-processor
+            ecr_repo: ieee-rc-dlq-processor
+            dockerfile: src/dlq/Dockerfile
+            lambda_name: ieee-rc-dlq-processor
+            src_path: src/dlq
+
+          - name: bulk-processor
+            ecr_repo: ieee-rc-bulk-processor
+            dockerfile: src/bulk/Dockerfile.processor
+            lambda_name: ieee-rc-bulk-processor
+            src_path: src/bulk
+
+          - name: bulk-worker
+            ecr_repo: ieee-rc-bulk-worker
+            dockerfile: src/bulk/Dockerfile.worker
+            lambda_name: ieee-rc-bulk-worker
+            src_path: src/bulk
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          clean: true
+
+      - name: Detect relevant changes
+        id: changed
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          BASE="${{ github.event.before }}"
+          if git diff --name-only "${BASE}" HEAD | grep -qE "^(${{ matrix.src_path }}/|src/common/)"; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Debug Docker & AWS identity
+        if: steps.changed.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          echo "=== Docker version ==="
+          docker version
+          echo "=== AWS identity ==="
+          aws sts get-caller-identity
+
+      - name: Login to Amazon ECR
+        if: steps.changed.outputs.changed == 'true'
+        uses: aws-actions/amazon-ecr-login@v2
+        with:
+          registry-type: private
+          mask-password: true
+          skip-logout: false
+
+      - name: Build & push ${{ matrix.name }}
+        if: steps.changed.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+
+          IMAGE_TAG="${GITHUB_SHA::7}"
+          BASE_URI="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${{ matrix.ecr_repo }}"
+          IMAGE_URI="${BASE_URI}:${IMAGE_TAG}"
+          LATEST_URI="${BASE_URI}:latest"
+
+          docker build \
+            --platform linux/amd64 \
+            --provenance=false \
+            -f "${{ matrix.dockerfile }}" \
+            -t "${IMAGE_URI}" .
+          docker tag "${IMAGE_URI}" "${LATEST_URI}"
+          docker push "${IMAGE_URI}"
+          docker push "${LATEST_URI}"
+
+          aws lambda update-function-code \
+            --function-name "${{ matrix.lambda_name }}" \
+            --region "${AWS_REGION}" \
+            --image-uri "${LATEST_URI}"
+
+          timeout 300 aws lambda wait function-updated-v2 \
+            --function-name "${{ matrix.lambda_name }}" \
+            --region "${AWS_REGION}" || {
+            echo "ERROR: ${{ matrix.lambda_name }} did not become active within 300s" >&2
+            exit 1
+          }
+
+          {
+            echo "## ${{ matrix.name }} Build Summary"
+            echo ""
+            echo "**Commit**: \`${GITHUB_SHA}\`"
+            echo "**Branch**: \`${GITHUB_REF_NAME}\`"
+            echo "**ECR repo**: \`${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${{ matrix.ecr_repo }}\`"
+            echo "**Image tag**: \`${IMAGE_TAG}\`"
+            echo "**Image URI (sha)**: \`${IMAGE_URI}\`"
+            echo "**Image URI (latest)**: \`${LATEST_URI}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Skipped — no relevant changes
+        if: steps.changed.outputs.changed != 'true'
+        run: echo "No changes detected for ${{ matrix.name }}, skipping build."
+
+      - name: Docker cleanup
+        if: always()
+        run: |
+          docker image prune -af || true
+          docker builder prune -af || true
