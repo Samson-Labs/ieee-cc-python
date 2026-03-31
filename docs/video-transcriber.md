@@ -1,0 +1,184 @@
+# Video Transcriber Module
+
+Transcribes video files (MP4, MOV, WEBM) from S3 using AWS Transcribe with speaker diarization. Optionally cleans transcripts via Claude 3.5 Haiku to remove filler words and fix formatting.
+
+## Pipeline
+
+```
+S3: {ou}/pending/{file}.{mp4|mov|webm}
+        |
+        v
+  1. Validate format (mp4/mov/webm)
+  2. Start AWS Transcribe job (en-US, max 2 speakers)
+  3. Poll every 30s (timeout: 600s)
+  4. Fetch & parse transcript JSON
+  5. Optional: clean via Claude Haiku
+  6. Write duration metadata to S3
+        |
+        v
+  Response: {transcript, duration, duration_seconds, speaker_count}
+  S3: {ou}/metadata/{product_part_number}.mp4.json
+```
+
+## API
+
+### `VideoTranscriber(s3_client=None, transcribe_client=None, bedrock_client=None)`
+
+All clients are optional — defaults to `boto3.client(...)`.
+
+### `transcribe(bucket, key, ou, product_part_number, clean_transcript=True) -> TranscriptionResult`
+
+Full end-to-end transcription pipeline.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `bucket` | str | S3 bucket containing the video |
+| `key` | str | S3 key of the video file |
+| `ou` | str | Organizational unit (e.g. PES) |
+| `product_part_number` | str | Product identifier |
+| `clean_transcript` | bool | Whether to clean via Claude Haiku (default: True) |
+
+### `TranscriptionResult` (TypedDict)
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `transcript` | str | Full transcript text (cleaned or raw) |
+| `duration` | str | Video duration as HH:MM:SS |
+| `duration_seconds` | int | Video duration in seconds |
+| `speaker_count` | int | Number of distinct speakers detected |
+
+## S3 Paths
+
+| Path | Description |
+|------|-------------|
+| `{ou}/pending/{file}.mp4` | Input video (also .mov, .webm) |
+| `{ou}/metadata/{part_number}.mp4.json` | Duration metadata output |
+
+### Metadata JSON Format
+
+```json
+{
+  "duration": "01:23:45",
+  "durationSeconds": 5025,
+  "extractedAt": "2026-03-17T12:00:00Z"
+}
+```
+
+## AWS Transcribe Settings
+
+| Setting | Value |
+|---------|-------|
+| Language | en-US |
+| Speaker diarization | Enabled, max 2 speakers |
+| Poll interval | 30 seconds |
+| Poll timeout | 600 seconds (10 min) |
+| Job name format | `ieee-rc-{safe_id}-{timestamp}` |
+
+## Claude Haiku Cleanup
+
+When `clean_transcript=True` (default), the raw transcript is sent to Claude 3.5 Haiku via Bedrock to:
+- Remove filler words (uh, um, like, you know, etc.)
+- Fix sentence boundaries and capitalization
+- Format speaker transitions as `Speaker 1:` / `Speaker 2:`
+
+| Setting | Value |
+|---------|-------|
+| Model | `us.anthropic.claude-3-5-haiku-20241022-v1:0` |
+| Max tokens | 4096 |
+| Temperature | 0.1 |
+| Truncation limit | 100,000 chars |
+| Fallback | If cleanup fails, raw transcript is returned |
+
+The model ID is configurable via `CLEANUP_MODEL_ID` environment variable.
+
+## Lambda Handler
+
+Entry point: `src.handlers.video_transcriber_handler.handler`
+
+### Direct Invocation
+
+```json
+{
+  "bucket": "dev-ieee-conference-cloud-bulk-uploads",
+  "key": "PES/pending/lecture.mp4",
+  "ou": "PES",
+  "product_part_number": "LECTURE-001",
+  "clean_transcript": true
+}
+```
+
+### S3 Event Trigger
+
+Automatically derives `ou` and `product_part_number` from the S3 key pattern `{ou}/pending/{filename}.{ext}`.
+
+### Response Format
+
+```json
+{
+  "statusCode": 200,
+  "body": {
+    "transcript": "Speaker 1: Welcome to the lecture...",
+    "duration": "01:23:45",
+    "duration_seconds": 5025,
+    "speaker_count": 2
+  }
+}
+```
+
+## Deployment
+
+```bash
+# Full deploy (ECR + IAM + Lambda)
+./scripts/deploy-video-transcriber.sh
+
+# Update code only
+./scripts/deploy-video-transcriber.sh update
+
+# Invoke
+./scripts/invoke-video-transcriber.sh <bucket> <key> <ou> <product_part_number>
+
+# Teardown
+./scripts/teardown-video-transcriber.sh
+```
+
+| Resource | Value |
+|----------|-------|
+| Lambda | `ieee-cc-video-transcriber` |
+| ECR | `ieee-cc-video-transcriber` |
+| IAM Role | `ieee-cc-video-transcriber-role` |
+| Memory | 512 MB |
+| Timeout | 15 minutes (900s) |
+| Runtime | Python 3.13 (Docker) |
+
+### IAM Permissions
+
+- `s3:GetObject`, `s3:PutObject` on the shared bucket
+- `transcribe:StartTranscriptionJob`, `transcribe:GetTranscriptionJob`
+- `bedrock:InvokeModel` (for Haiku cleanup)
+- `AWSLambdaBasicExecutionRole` (CloudWatch logs)
+
+## Tests
+
+53 unit tests (35 transcriber + 18 handler):
+
+| Test Class | Count | Description |
+|-----------|-------|-------------|
+| TestFormatDetection | 6 | Supported/unsupported format validation |
+| TestJobNameGeneration | 3 | Job name format and special character handling |
+| TestDurationFormatting | 4 | HH:MM:SS conversion edge cases |
+| TestParseS3Uri | 3 | s3:// and https:// URI parsing |
+| TestTranscriptParsing | 6 | Transcribe JSON output parsing |
+| TestStartJob | 1 | Transcribe API call parameters |
+| TestPollJob | 4 | Polling, timeout, and failure handling |
+| TestHaikuCleanup | 2 | Bedrock cleanup call and fallback |
+| TestTranscribeFlow | 4 | End-to-end integration (mocked) |
+| TestMetadataWriting | 1 | S3 metadata JSON output |
+| TestDirectInvocation | 4 | Handler direct event parsing |
+| TestS3EventInvocation | 5 | Handler S3 event parsing |
+| TestErrorHandling | 5 | Handler error status codes |
+| TestParseEvent | 5 | Event format detection |
+
+```bash
+python -m pytest tests/extractors/test_video_transcriber.py -v
+python -m pytest tests/handlers/test_video_transcriber_handler.py -v
+```

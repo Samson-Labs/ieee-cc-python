@@ -1,0 +1,12 @@
+FROM public.ecr.aws/lambda/python:3.13
+
+COPY src/bulk/bulk_worker_requirements.txt ${LAMBDA_TASK_ROOT}/requirements.txt
+RUN pip install --no-cache-dir -r ${LAMBDA_TASK_ROOT}/requirements.txt
+
+COPY src/common/ ${LAMBDA_TASK_ROOT}/src/common/
+COPY src/bulk/ ${LAMBDA_TASK_ROOT}/src/bulk/
+COPY src/handlers/bulk_worker_handler.py ${LAMBDA_TASK_ROOT}/src/handlers/bulk_worker_handler.py
+COPY src/__init__.py ${LAMBDA_TASK_ROOT}/src/__init__.py
+COPY src/handlers/__init__.py ${LAMBDA_TASK_ROOT}/src/handlers/__init__.py
+
+CMD ["src.handlers.bulk_worker_handler.handler"]

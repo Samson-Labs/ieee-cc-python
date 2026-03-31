@@ -103,6 +103,11 @@ create_lambda_role() {
                 \"Effect\": \"Allow\",
                 \"Action\": [\"s3:DeleteObject\"],
                 \"Resource\": \"arn:aws:s3:::${TRIGGER_BUCKET_NAME}/actions/*\"
+            },
+            {
+                \"Effect\": \"Allow\",
+                \"Action\": [\"s3:ListBucket\"],
+                \"Resource\": \"arn:aws:s3:::${TRIGGER_BUCKET_NAME}\"
             }
         ]
     }"
