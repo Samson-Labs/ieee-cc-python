@@ -204,3 +204,54 @@ jobs:
         run: |
           docker image prune -af || true
           docker builder prune -af || true
+
+  # -------------------------------------------------------------------------
+  # CI Summary: runs after all matrix builds, shows next steps for CD
+  # -------------------------------------------------------------------------
+  ci-summary:
+    name: CI Summary & Next Steps
+    runs-on: [self-hosted, cc3]
+    needs: build-and-push
+    if: always()
+    steps:
+      - name: Write CI summary
+        run: |
+          set -euo pipefail
+
+          IMAGE_TAG="${GITHUB_SHA::7}"
+          BASE_URI="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          REPO_URL="${{ github.server_url }}/${{ github.repository }}"
+          CD_URL="${REPO_URL}/actions/workflows/cd-deploy.yml"
+
+          {
+            echo "## CI Build Summary"
+            echo ""
+            echo "**Commit**: \`${GITHUB_SHA}\`  |  **Branch**: \`${GITHUB_REF_NAME}\`  |  **Image tag**: \`${IMAGE_TAG}\`"
+            echo ""
+            echo "### Images built"
+            echo "| Lambda | ECR repo | Image tag | Image URI |"
+            echo "|--------|----------|-----------|-----------|"
+            echo "| pdf-extractor | \`ieee-cc-pdf-extractor\` | \`${IMAGE_TAG}\` | \`${BASE_URI}/ieee-cc-pdf-extractor:${IMAGE_TAG}\` |"
+            echo "| image-overlay | \`ieee-rc-image-generator\` | \`${IMAGE_TAG}\` | \`${BASE_URI}/ieee-rc-image-generator:${IMAGE_TAG}\` |"
+            echo "| bedrock-inference | \`ieee-cc-bedrock-inference\` | \`${IMAGE_TAG}\` | \`${BASE_URI}/ieee-cc-bedrock-inference:${IMAGE_TAG}\` |"
+            echo "| video-transcriber | \`ieee-cc-video-transcriber\` | \`${IMAGE_TAG}\` | \`${BASE_URI}/ieee-cc-video-transcriber:${IMAGE_TAG}\` |"
+            echo "| ai-orchestrator | \`ieee-rc-ai-orchestrator\` | \`${IMAGE_TAG}\` | \`${BASE_URI}/ieee-rc-ai-orchestrator:${IMAGE_TAG}\` |"
+            echo "| dlq-processor | \`ieee-rc-dlq-processor\` | \`${IMAGE_TAG}\` | \`${BASE_URI}/ieee-rc-dlq-processor:${IMAGE_TAG}\` |"
+            echo "| bulk-processor | \`ieee-rc-bulk-processor\` | \`${IMAGE_TAG}\` | \`${BASE_URI}/ieee-rc-bulk-processor:${IMAGE_TAG}\` |"
+            echo "| bulk-worker | \`ieee-rc-bulk-worker\` | \`${IMAGE_TAG}\` | \`${BASE_URI}/ieee-rc-bulk-worker:${IMAGE_TAG}\` |"
+            echo ""
+            echo "## Next Steps — CD Deploy"
+            echo ""
+            echo "Open the [CD - Deploy to Lambda](${CD_URL}) workflow and use the tag \`${IMAGE_TAG}\` for each Lambda you want to deploy."
+            echo ""
+            echo "| Input field | Value to enter |"
+            echo "|-------------|----------------|"
+            echo "| pdf_extractor_tag | \`${IMAGE_TAG}\` |"
+            echo "| image_overlay_tag | \`${IMAGE_TAG}\` |"
+            echo "| bedrock_tag | \`${IMAGE_TAG}\` |"
+            echo "| video_transcriber_tag | \`${IMAGE_TAG}\` |"
+            echo "| ai_orchestrator_tag | \`${IMAGE_TAG}\` |"
+            echo "| dlq_processor_tag | \`${IMAGE_TAG}\` |"
+            echo "| bulk_processor_tag | \`${IMAGE_TAG}\` |"
+            echo "| bulk_worker_tag | \`${IMAGE_TAG}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
