@@ -5,7 +5,6 @@ on:
     branches:
       - development
       - main
-      - cc3_ci
     paths:
       - "**/*.py"
       - "src/**"
@@ -129,7 +128,11 @@ jobs:
             exit 0
           fi
           BASE="${{ github.event.before }}"
-          if git diff --name-only "${BASE}" HEAD | grep -qE "^(${{ matrix.src_path }}/|src/common/)"; then
+          # Handle first push on a new branch (all-zeros SHA)
+          if [[ "${BASE}" == "0000000000000000000000000000000000000000" ]]; then
+            BASE="HEAD~1"
+          fi
+          if git diff --name-only "${BASE}" HEAD | grep -qE "^(${{ matrix.src_path }}/|src/common/|src/handlers/|requirements.*\.txt|${{ matrix.dockerfile }})"; then
             echo "changed=true" >> "$GITHUB_OUTPUT"
           else
             echo "changed=false" >> "$GITHUB_OUTPUT"
