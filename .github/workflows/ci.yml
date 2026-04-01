@@ -5,6 +5,7 @@ on:
     branches:
       - development
       - main
+      - cc3_ci
     paths:
       - "**/*.py"
       - "src/**"
