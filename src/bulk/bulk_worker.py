@@ -103,7 +103,6 @@ class BulkWorker:
         except Exception as exc:
             logger.error("[%s] Orchestrator failed for item %s: %s", batch_id, item_id, exc)
             action = "failed"
-            orch_result = {}
 
         # Step 4: Update progress.
         success = action == "processed"

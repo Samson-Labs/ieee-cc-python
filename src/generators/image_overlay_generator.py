@@ -257,7 +257,6 @@ class ImageOverlayGenerator:
         draw = ImageDraw.Draw(img)
 
         w, h = img.size
-        content_h = h * (1 - LOGO_BAR_RATIO)  # area above logo bar
 
         title_font_size = max(20, int(h * TITLE_FONT_RATIO))
         author_font_size = max(14, int(h * AUTHOR_FONT_RATIO))

@@ -372,4 +372,3 @@ class AIOrchestrator:
 
         logger.info("%s Bedrock metadata generated", correlation)
         return body
-
