@@ -12,7 +12,14 @@ on:
       - "**/Dockerfile*"
       - "**/requirements*.txt"
       - ".github/workflows/**"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      force_rebuild:
+        description: "Force rebuild all images even if no source changes detected"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
 
 # -------------------------------------------------------------------------
 # CONCURRENCY STRATEGY
@@ -125,7 +132,7 @@ jobs:
         id: changed
         run: |
           set -euo pipefail
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ github.event.inputs.force_rebuild }}" == "true" ]]; then
             echo "changed=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
