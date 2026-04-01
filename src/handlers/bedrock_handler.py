@@ -22,7 +22,11 @@ logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 
 _bedrock_client = boto3.client("bedrock-runtime", region_name="us-east-1")
 _s3_client = boto3.client("s3")
-_inference = BedrockInference(bedrock_client=_bedrock_client)
+_cloudwatch_client = boto3.client("cloudwatch")
+_inference = BedrockInference(
+    bedrock_client=_bedrock_client,
+    cloudwatch_client=_cloudwatch_client,
+)
 
 
 def handler(event: dict, context) -> dict:
@@ -52,7 +56,7 @@ def handler(event: dict, context) -> dict:
             "body": {"error": f"Internal error: {type(exc).__name__}"},
         }
 
-    return {"statusCode": 200, "body": dict(result)}
+    return {"statusCode": 200, "body": dict(result)}  # includes input_tokens, output_tokens
 
 
 def _parse_event(event: dict) -> tuple[str, list[str] | None]:

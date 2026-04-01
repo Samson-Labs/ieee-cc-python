@@ -16,6 +16,8 @@ from typing import TypedDict
 import boto3
 from botocore.exceptions import ClientError
 
+from src.common.metrics import publish_metrics
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL_ID = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
@@ -94,18 +96,21 @@ class InferenceResult(TypedDict):
     intended_audience: str
     category: str
     processing_time_ms: int
+    input_tokens: int
+    output_tokens: int
 
 
 class BedrockInference:
     """Calls AWS Bedrock Claude to generate structured metadata from document text."""
 
-    def __init__(self, bedrock_client=None, model_id: str | None = None):
+    def __init__(self, bedrock_client=None, model_id: str | None = None, cloudwatch_client=None):
         self._bedrock = bedrock_client or boto3.client(
             "bedrock-runtime", region_name="us-east-1"
         )
         self._model_id = model_id or os.environ.get(
             "BEDROCK_MODEL_ID", DEFAULT_MODEL_ID
         )
+        self._cloudwatch = cloudwatch_client
 
     def generate_metadata(
         self,
@@ -139,14 +144,16 @@ class BedrockInference:
             )
 
         # First attempt
-        raw = self._invoke(system_prompt, truncated_text)
+        raw, input_tokens, output_tokens = self._invoke(system_prompt, truncated_text)
         parsed = self._try_parse_json(raw)
 
         # If JSON parsing failed, retry once with explicit JSON instruction
         if parsed is None:
             logger.warning("Invalid JSON response, retrying with explicit instruction")
             retry_prompt = system_prompt + JSON_RETRY_SUFFIX
-            raw = self._invoke(retry_prompt, truncated_text)
+            raw, retry_in, retry_out = self._invoke(retry_prompt, truncated_text)
+            input_tokens += retry_in
+            output_tokens += retry_out
             parsed = self._try_parse_json(raw)
             if parsed is None:
                 raise ValueError(
@@ -157,6 +164,11 @@ class BedrockInference:
 
         elapsed_ms = int((time.monotonic() - start) * 1000)
 
+        publish_metrics(self._cloudwatch, [
+            {"MetricName": "bedrock-input-tokens", "Value": input_tokens, "Unit": "Count"},
+            {"MetricName": "bedrock-output-tokens", "Value": output_tokens, "Unit": "Count"},
+        ])
+
         return InferenceResult(
             abstract=parsed["abstract"],
             keywords=parsed["keywords"],
@@ -164,14 +176,20 @@ class BedrockInference:
             intended_audience=parsed["intended_audience"],
             category=parsed["category"],
             processing_time_ms=elapsed_ms,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
         )
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _invoke(self, system_prompt: str, user_text: str) -> str:
-        """Call Bedrock converse API with exponential backoff on throttling."""
+    def _invoke(self, system_prompt: str, user_text: str) -> tuple[str, int, int]:
+        """Call Bedrock converse API with exponential backoff on throttling.
+
+        Returns:
+            Tuple of (response_text, input_tokens, output_tokens).
+        """
         body = json.dumps({
             "anthropic_version": "bedrock-2023-05-31",
             "max_tokens": MAX_TOKENS,
@@ -191,7 +209,12 @@ class BedrockInference:
                     body=body,
                 )
                 result = json.loads(response["body"].read())
-                return result["content"][0]["text"]
+                usage = result.get("usage", {})
+                return (
+                    result["content"][0]["text"],
+                    usage.get("input_tokens", 0),
+                    usage.get("output_tokens", 0),
+                )
 
             except ClientError as exc:
                 error_code = exc.response["Error"]["Code"]
