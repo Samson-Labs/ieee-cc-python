@@ -98,7 +98,7 @@ class BulkWorker:
 
         # Step 3: Invoke orchestrator.
         try:
-            orch_result = self._invoke_orchestrator(bucket, pending_key)
+            self._invoke_orchestrator(bucket, pending_key)
             action = "processed"
         except Exception as exc:
             logger.error("[%s] Orchestrator failed for item %s: %s", batch_id, item_id, exc)
