@@ -125,7 +125,8 @@ class BedrockInference:
 
         Returns:
             InferenceResult with abstract, keywords, learning_level,
-            intended_audience, category, and processing_time_ms.
+            intended_audience, category, processing_time_ms,
+            input_tokens, and output_tokens.
 
         Raises:
             ValueError: If Bedrock response fails validation after retries.
@@ -185,7 +186,7 @@ class BedrockInference:
     # ------------------------------------------------------------------
 
     def _invoke(self, system_prompt: str, user_text: str) -> tuple[str, int, int]:
-        """Call Bedrock converse API with exponential backoff on throttling.
+        """Call Bedrock invoke_model API with exponential backoff on throttling.
 
         Returns:
             Tuple of (response_text, input_tokens, output_tokens).

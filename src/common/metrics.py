@@ -38,22 +38,23 @@ def publish_metrics(
         cloudwatch_client: A boto3 CloudWatch client.
         metrics: Sequence of metric dicts.
     """
-    if cloudwatch_client is None:
+    if cloudwatch_client is None or not metrics:
         return
 
-    metric_data = []
-    for m in metrics:
-        dims = list(DEFAULT_DIMENSIONS)
-        if "Dimensions" in m:
-            dims = dims + m["Dimensions"]
-        metric_data.append({
-            "MetricName": m["MetricName"],
-            "Value": m["Value"],
-            "Unit": m.get("Unit", "None"),
-            "Dimensions": dims,
-        })
-
     try:
+        metric_data = []
+        for m in metrics:
+            dims = list(DEFAULT_DIMENSIONS)
+            custom_dims = m.get("Dimensions")
+            if isinstance(custom_dims, list):
+                dims.extend(custom_dims)
+            metric_data.append({
+                "MetricName": m["MetricName"],
+                "Value": m["Value"],
+                "Unit": m.get("Unit", "None"),
+                "Dimensions": dims,
+            })
+
         cloudwatch_client.put_metric_data(
             Namespace=METRIC_NAMESPACE,
             MetricData=metric_data,
@@ -61,6 +62,6 @@ def publish_metrics(
     except Exception:
         logger.warning(
             "Failed to publish CloudWatch metrics: %s",
-            [m["MetricName"] for m in metric_data],
+            [m.get("MetricName", "unknown") for m in metrics],
             exc_info=True,
         )
