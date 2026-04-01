@@ -76,49 +76,41 @@ jobs:
           - name: pdf-extractor
             ecr_repo: ieee-cc-pdf-extractor
             dockerfile: src/extractors/Dockerfile
-            lambda_name: ieee-cc-pdf-extractor
             src_path: src/extractors
 
           - name: image-overlay
             ecr_repo: ieee-rc-image-generator
             dockerfile: src/generators/Dockerfile
-            lambda_name: ieee-rc-image-generator
             src_path: src/generators
 
           - name: bedrock-inference
             ecr_repo: ieee-cc-bedrock-inference
             dockerfile: src/ai/Dockerfile
-            lambda_name: ieee-cc-bedrock-inference
             src_path: src/ai
 
           - name: video-transcriber
             ecr_repo: ieee-cc-video-transcriber
             dockerfile: src/extractors/VideoTranscriberDockerfile
-            lambda_name: ieee-cc-video-transcriber
             src_path: src/extractors
 
           - name: ai-orchestrator
             ecr_repo: ieee-rc-ai-orchestrator
             dockerfile: src/orchestrator/AIOrchestratorDockerfile
-            lambda_name: ieee-rc-ai-orchestrator
             src_path: src/orchestrator
 
           - name: dlq-processor
             ecr_repo: ieee-rc-dlq-processor
             dockerfile: src/dlq/Dockerfile
-            lambda_name: ieee-rc-dlq-processor
             src_path: src/dlq
 
           - name: bulk-processor
             ecr_repo: ieee-rc-bulk-processor
             dockerfile: src/bulk/Dockerfile.processor
-            lambda_name: ieee-rc-bulk-processor
             src_path: src/bulk
 
           - name: bulk-worker
             ecr_repo: ieee-rc-bulk-worker
             dockerfile: src/bulk/Dockerfile.worker
-            lambda_name: ieee-rc-bulk-worker
             src_path: src/bulk
 
     steps:
@@ -178,18 +170,6 @@ jobs:
           docker tag "${IMAGE_URI}" "${LATEST_URI}"
           docker push "${IMAGE_URI}"
           docker push "${LATEST_URI}"
-
-          aws lambda update-function-code \
-            --function-name "${{ matrix.lambda_name }}" \
-            --region "${AWS_REGION}" \
-            --image-uri "${LATEST_URI}"
-
-          timeout 300 aws lambda wait function-updated-v2 \
-            --function-name "${{ matrix.lambda_name }}" \
-            --region "${AWS_REGION}" || {
-            echo "ERROR: ${{ matrix.lambda_name }} did not become active within 300s" >&2
-            exit 1
-          }
 
           {
             echo "## ${{ matrix.name }} Build Summary"

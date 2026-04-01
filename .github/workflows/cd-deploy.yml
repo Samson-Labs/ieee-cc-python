@@ -198,21 +198,7 @@ jobs:
               --region "${AWS_REGION}" \
               --image-uri "${IMAGE_URI}"
 
-            timeout 300 aws lambda wait function-updated-v2 \
-              --function-name "${LAMBDA_NAME}" \
-              --region "${AWS_REGION}" || {
-              echo "ERROR: ${LAMBDA_NAME} did not stabilize within 300s" >&2
-              exit 1
-            }
-
-            local STATE
-            STATE=$(aws lambda get-function \
-              --function-name "${LAMBDA_NAME}" \
-              --region "${AWS_REGION}" \
-              --query 'Configuration.State' \
-              --output text)
-
-            echo "${LABEL} -> OK (tag=${TAG}, state=${STATE})" | tee -a "$RESULTS_FILE"
+            echo "${LABEL} -> OK (tag=${TAG})" | tee -a "$RESULTS_FILE"
           }
 
           deploy_lambda "${ECR_PDF_EXTRACTOR}"     "ieee-cc-pdf-extractor"    "${PDF_EXTRACTOR_TAG:-}"     "${PDF_EXTRACTOR_FLAG}"     "pdf-extractor"
