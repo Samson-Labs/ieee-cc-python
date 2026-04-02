@@ -11,7 +11,6 @@ import json
 import logging
 import re
 from datetime import datetime, timezone
-from io import BytesIO
 from typing import TypedDict
 
 import boto3

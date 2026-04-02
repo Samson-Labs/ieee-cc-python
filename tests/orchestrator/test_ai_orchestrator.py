@@ -54,6 +54,18 @@ def orchestrator():
     return orch, s3, lam
 
 
+@pytest.fixture
+def orchestrator_with_cw():
+    s3 = MagicMock()
+    lam = MagicMock()
+    sns = MagicMock()
+    cw = MagicMock()
+    orch = AIOrchestrator(
+        s3_client=s3, lambda_client=lam, sns_client=sns, cloudwatch_client=cw
+    )
+    return orch, s3, lam, cw
+
+
 # ---------------------------------------------------------------
 # Key Parsing
 # ---------------------------------------------------------------
@@ -427,6 +439,101 @@ class TestWebhook:
         # Should still succeed — webhook failure is non-fatal
         assert result["action"] == "enriched"
         assert result["details"]["webhook_sent"] is False
+
+
+# ---------------------------------------------------------------
+# CloudWatch Metrics
+# ---------------------------------------------------------------
+
+class TestMetrics:
+    def test_submission_processed_ai_disabled(self, orchestrator_with_cw):
+        orch, s3, lam, cw = orchestrator_with_cw
+        meta = _make_meta(ai_enabled=False)
+        s3.get_object.return_value = _s3_get_object_response(meta)
+
+        orch.process("bucket", "PES/pending/STD-12345.pdf")
+
+        cw.put_metric_data.assert_called_once()
+        metric_data = cw.put_metric_data.call_args[1]["MetricData"]
+        assert metric_data[0]["MetricName"] == "submission-processed"
+        assert metric_data[0]["Value"] == 1
+        # Check AiToggleEnabled dimension
+        dim_map = {d["Name"]: d["Value"] for d in metric_data[0]["Dimensions"]}
+        assert dim_map["AiToggleEnabled"] == "false"
+
+    def test_submission_processed_ai_enabled(self, orchestrator_with_cw):
+        orch, s3, lam, cw = orchestrator_with_cw
+        meta = _make_meta(ai_enabled=True, media_type="application/pdf")
+        s3.get_object.return_value = _s3_get_object_response(meta)
+
+        extraction_body = {"text": "text", "page_count": 5}
+        bedrock_body = {
+            "abstract": "a", "keywords": [], "input_tokens": 1000,
+            "output_tokens": 500, "learning_level": "Expert",
+        }
+        lam.invoke.side_effect = [
+            _lambda_invoke_response(200, extraction_body),
+            _lambda_invoke_response(200, bedrock_body),
+        ]
+
+        orch.process("bucket", "PES/pending/STD-12345.pdf")
+
+        # Should have one put_metric_data call with cost + submission metrics
+        cw.put_metric_data.assert_called_once()
+        metric_data = cw.put_metric_data.call_args[1]["MetricData"]
+        names = {m["MetricName"]: m for m in metric_data}
+        assert "processing-cost-estimate" in names
+        assert "submission-processed" in names
+        dim_map = {d["Name"]: d["Value"] for d in names["submission-processed"]["Dimensions"]}
+        assert dim_map["AiToggleEnabled"] == "true"
+
+    def test_cost_estimate_pdf(self, orchestrator_with_cw):
+        orch, s3, lam, cw = orchestrator_with_cw
+        meta = _make_meta(ai_enabled=True, media_type="application/pdf")
+        s3.get_object.return_value = _s3_get_object_response(meta)
+
+        extraction_body = {"text": "text", "page_count": 5}
+        bedrock_body = {
+            "abstract": "a", "keywords": [], "input_tokens": 1_000_000,
+            "output_tokens": 100_000, "learning_level": "Expert",
+        }
+        lam.invoke.side_effect = [
+            _lambda_invoke_response(200, extraction_body),
+            _lambda_invoke_response(200, bedrock_body),
+        ]
+
+        orch.process("bucket", "PES/pending/STD-12345.pdf")
+
+        metric_data = cw.put_metric_data.call_args[1]["MetricData"]
+        cost_metric = next(m for m in metric_data if m["MetricName"] == "processing-cost-estimate")
+        # 1M input * $3/M + 100K output * $15/M = $3 + $1.5 = $4.5
+        assert abs(cost_metric["Value"] - 4.5) < 0.001
+
+    def test_cost_estimate_video_includes_transcribe(self, orchestrator_with_cw):
+        orch, s3, lam, cw = orchestrator_with_cw
+        meta = _make_meta(ai_enabled=True, media_type="video/mp4")
+        meta["content"]["filename"] = "lecture.mp4"
+        s3.get_object.return_value = _s3_get_object_response(meta)
+
+        transcription_body = {
+            "transcript": "text", "duration": "00:10:00",
+            "duration_seconds": 600, "speaker_count": 1,
+        }
+        bedrock_body = {
+            "abstract": "a", "keywords": [], "input_tokens": 0,
+            "output_tokens": 0, "learning_level": "Expert",
+        }
+        lam.invoke.side_effect = [
+            _lambda_invoke_response(200, transcription_body),
+            _lambda_invoke_response(200, bedrock_body),
+        ]
+
+        orch.process("bucket", "AESS/pending/lecture.mp4")
+
+        metric_data = cw.put_metric_data.call_args[1]["MetricData"]
+        cost_metric = next(m for m in metric_data if m["MetricName"] == "processing-cost-estimate")
+        # 600s / 60 * $0.024 = $0.24
+        assert abs(cost_metric["Value"] - 0.24) < 0.001
 
 
 # ---------------------------------------------------------------

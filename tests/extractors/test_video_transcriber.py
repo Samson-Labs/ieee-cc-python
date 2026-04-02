@@ -529,3 +529,69 @@ class TestMetadataWriting:
         assert metadata["duration"] == "01:23:45"
         assert metadata["durationSeconds"] == 5025
         assert metadata["extractedAt"].endswith("Z")
+
+
+# ---------------------------------------------------------------------------
+# Tests: CloudWatch metrics
+# ---------------------------------------------------------------------------
+
+
+class TestCloudWatchMetrics:
+    @patch("src.extractors.video_transcriber.time.sleep")
+    def test_publishes_transcribe_minutes(self, mock_sleep):
+        s3_mock = MagicMock()
+        t_mock = MagicMock()
+        bedrock_mock = MagicMock()
+        cw_mock = MagicMock()
+
+        transcript_json = _make_transcribe_json(
+            "hello world", end_time="600.0", speaker_count=1
+        )
+        _mock_s3_transcript(s3_mock, transcript_json)
+        _mock_transcribe_complete(t_mock)
+        _mock_bedrock_cleanup(bedrock_mock, "hello world")
+
+        transcriber = VideoTranscriber(
+            s3_client=s3_mock,
+            transcribe_client=t_mock,
+            bedrock_client=bedrock_mock,
+            cloudwatch_client=cw_mock,
+        )
+
+        result = transcriber.transcribe(
+            bucket="test-bucket",
+            key="PES/pending/video.mp4",
+            ou="PES",
+            product_part_number="VID-001",
+        )
+
+        cw_mock.put_metric_data.assert_called_once()
+        metric_data = cw_mock.put_metric_data.call_args[1]["MetricData"]
+        assert len(metric_data) == 1
+        assert metric_data[0]["MetricName"] == "transcribe-minutes"
+        assert metric_data[0]["Value"] == 10.0  # 600s / 60
+
+    @patch("src.extractors.video_transcriber.time.sleep")
+    def test_no_metrics_without_cloudwatch_client(self, mock_sleep):
+        s3_mock = MagicMock()
+        t_mock = MagicMock()
+        bedrock_mock = MagicMock()
+
+        transcript_json = _make_transcribe_json("hello", end_time="60.0")
+        _mock_s3_transcript(s3_mock, transcript_json)
+        _mock_transcribe_complete(t_mock)
+        _mock_bedrock_cleanup(bedrock_mock, "hello")
+
+        transcriber = VideoTranscriber(
+            s3_client=s3_mock,
+            transcribe_client=t_mock,
+            bedrock_client=bedrock_mock,
+        )
+
+        # Should not raise
+        transcriber.transcribe(
+            bucket="test-bucket",
+            key="PES/pending/video.mp4",
+            ou="PES",
+            product_part_number="VID-002",
+        )

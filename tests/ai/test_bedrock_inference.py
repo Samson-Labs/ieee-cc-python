@@ -51,11 +51,12 @@ def _valid_metadata() -> dict:
     }
 
 
-def _bedrock_response(content: str) -> dict:
+def _bedrock_response(content: str, input_tokens: int = 100, output_tokens: int = 50) -> dict:
     """Create a mock Bedrock invoke_model response."""
     body_bytes = json.dumps({
         "content": [{"type": "text", "text": content}],
         "stop_reason": "end_turn",
+        "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
     }).encode()
     return {"body": BytesIO(body_bytes)}
 
@@ -402,3 +403,55 @@ class TestValidation:
             )
             result = inference.generate_metadata(text="text")
             assert result["category"] == cat
+
+
+# ---------------------------------------------------------------------------
+# Tests: CloudWatch metrics
+# ---------------------------------------------------------------------------
+
+
+class TestCloudWatchMetrics:
+    def test_publishes_token_metrics(self, bedrock_mock):
+        cw_mock = MagicMock()
+        inference = BedrockInference(bedrock_client=bedrock_mock, cloudwatch_client=cw_mock)
+        metadata = _valid_metadata()
+        bedrock_mock.invoke_model.return_value = _bedrock_response(
+            json.dumps(metadata), input_tokens=500, output_tokens=200
+        )
+
+        result = inference.generate_metadata(text="text")
+
+        assert result["input_tokens"] == 500
+        assert result["output_tokens"] == 200
+        cw_mock.put_metric_data.assert_called_once()
+        metric_data = cw_mock.put_metric_data.call_args[1]["MetricData"]
+        names = {m["MetricName"]: m for m in metric_data}
+        assert names["bedrock-input-tokens"]["Value"] == 500
+        assert names["bedrock-input-tokens"]["Unit"] == "Count"
+        assert names["bedrock-output-tokens"]["Value"] == 200
+        assert names["bedrock-output-tokens"]["Unit"] == "Count"
+
+    def test_accumulates_tokens_on_json_retry(self, bedrock_mock):
+        cw_mock = MagicMock()
+        inference = BedrockInference(bedrock_client=bedrock_mock, cloudwatch_client=cw_mock)
+        metadata = _valid_metadata()
+        bedrock_mock.invoke_model.side_effect = [
+            _bedrock_response("not json", input_tokens=100, output_tokens=50),
+            _bedrock_response(json.dumps(metadata), input_tokens=100, output_tokens=50),
+        ]
+
+        result = inference.generate_metadata(text="text")
+
+        assert result["input_tokens"] == 200
+        assert result["output_tokens"] == 100
+
+    def test_no_metrics_without_cloudwatch_client(self, inference, bedrock_mock):
+        metadata = _valid_metadata()
+        bedrock_mock.invoke_model.return_value = _bedrock_response(
+            json.dumps(metadata)
+        )
+
+        result = inference.generate_metadata(text="text")
+
+        assert result["input_tokens"] == 100
+        assert result["output_tokens"] == 50

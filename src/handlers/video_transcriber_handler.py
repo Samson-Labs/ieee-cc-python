@@ -21,10 +21,12 @@ logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 _s3_client = boto3.client("s3")
 _transcribe_client = boto3.client("transcribe")
 _bedrock_client = boto3.client("bedrock-runtime", region_name="us-east-1")
+_cloudwatch_client = boto3.client("cloudwatch")
 _transcriber = VideoTranscriber(
     s3_client=_s3_client,
     transcribe_client=_transcribe_client,
     bedrock_client=_bedrock_client,
+    cloudwatch_client=_cloudwatch_client,
 )
 
 # Pattern: {ou}/pending/{filename}.{mp4|mov|webm}
