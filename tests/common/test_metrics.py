@@ -86,6 +86,27 @@ class TestPublishMetrics:
             {"MetricName": "m", "Value": 1, "Unit": "Count"},
         ])
 
+    def test_noop_when_metrics_empty(self):
+        cw = MagicMock()
+        publish_metrics(cw, [])
+        cw.put_metric_data.assert_not_called()
+
+    def test_batches_in_chunks_of_20(self):
+        cw = MagicMock()
+
+        metrics = [
+            {"MetricName": f"m{i}", "Value": i, "Unit": "Count"}
+            for i in range(25)
+        ]
+
+        publish_metrics(cw, metrics)
+
+        assert cw.put_metric_data.call_count == 2
+        first_batch = cw.put_metric_data.call_args_list[0][1]["MetricData"]
+        second_batch = cw.put_metric_data.call_args_list[1][1]["MetricData"]
+        assert len(first_batch) == 20
+        assert len(second_batch) == 5
+
     def test_swallows_exceptions(self):
         cw = MagicMock()
         cw.put_metric_data.side_effect = RuntimeError("CloudWatch down")
@@ -93,3 +114,9 @@ class TestPublishMetrics:
         publish_metrics(cw, [
             {"MetricName": "m", "Value": 1, "Unit": "Count"},
         ])
+
+    def test_swallows_malformed_metric(self):
+        cw = MagicMock()
+
+        # Missing MetricName key — should not raise
+        publish_metrics(cw, [{"Value": 1}])

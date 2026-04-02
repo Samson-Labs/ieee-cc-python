@@ -55,10 +55,12 @@ def publish_metrics(
                 "Dimensions": dims,
             })
 
-        cloudwatch_client.put_metric_data(
-            Namespace=METRIC_NAMESPACE,
-            MetricData=metric_data,
-        )
+        for i in range(0, len(metric_data), 20):
+            batch = metric_data[i : i + 20]
+            cloudwatch_client.put_metric_data(
+                Namespace=METRIC_NAMESPACE,
+                MetricData=batch,
+            )
     except Exception:
         logger.warning(
             "Failed to publish CloudWatch metrics: %s",

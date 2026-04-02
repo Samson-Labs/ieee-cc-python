@@ -24,10 +24,17 @@ from src.webhook.sender import WebhookSender
 
 logger = logging.getLogger(__name__)
 
-# Pricing constants for cost estimation (USD)
-BEDROCK_INPUT_COST_PER_TOKEN = 3.00 / 1_000_000    # $3/M input tokens
-BEDROCK_OUTPUT_COST_PER_TOKEN = 15.00 / 1_000_000   # $15/M output tokens
-TRANSCRIBE_COST_PER_MINUTE = 0.024                   # $0.024/min
+# Pricing constants for cost estimation (USD) — configurable via env vars
+# to support different Bedrock models (defaults are for Claude Sonnet 4.5).
+BEDROCK_INPUT_COST_PER_TOKEN = float(
+    os.environ.get("BEDROCK_INPUT_COST_PER_MILLION", "3.00")
+) / 1_000_000
+BEDROCK_OUTPUT_COST_PER_TOKEN = float(
+    os.environ.get("BEDROCK_OUTPUT_COST_PER_MILLION", "15.00")
+) / 1_000_000
+TRANSCRIBE_COST_PER_MINUTE = float(
+    os.environ.get("TRANSCRIBE_COST_PER_MINUTE", "0.024")
+)
 
 # Media type routing
 PDF_MEDIA_TYPES = {"application/pdf"}
