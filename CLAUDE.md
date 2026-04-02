@@ -113,7 +113,7 @@ Docker-based Lambdas deployed via AWS CLI (no CDK/SAM). Each Lambda has its own 
 | Lambda | `ieee-rc-image-generator` | 1024 MB, 60s timeout, Python 3.12 |
 | Lambda | `ieee-cc-bedrock-inference` | 512 MB, 120s timeout, Python 3.13 |
 | Lambda | `ieee-cc-video-transcriber` | 512 MB, 15 min timeout, Python 3.13 |
-| Lambda | `ieee-rc-ai-orchestrator` | 512 MB, 15 min timeout, Python 3.13 |
+| Lambda | `ieee-rc-ai-orchestrator` | 512 MB, 15 min timeout, Python 3.12 |
 | Lambda | `ieee-rc-dlq-processor` | 256 MB, 60s timeout, Python 3.13 |
 | Lambda | `ieee-rc-bulk-processor` | 512 MB, 5 min timeout, Python 3.13 |
 | Lambda | `ieee-rc-bulk-worker` | 512 MB, 5 min timeout, Python 3.13 |

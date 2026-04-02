@@ -19,9 +19,22 @@ from typing import TypedDict
 import boto3
 from botocore.exceptions import ClientError
 
+from src.common.metrics import publish_metrics
 from src.webhook.sender import WebhookSender
 
 logger = logging.getLogger(__name__)
+
+# Pricing constants for cost estimation (USD) — configurable via env vars
+# to support different Bedrock models (defaults are for Claude Sonnet 4.5).
+BEDROCK_INPUT_COST_PER_TOKEN = float(
+    os.environ.get("BEDROCK_INPUT_COST_PER_MILLION", "3.00")
+) / 1_000_000
+BEDROCK_OUTPUT_COST_PER_TOKEN = float(
+    os.environ.get("BEDROCK_OUTPUT_COST_PER_MILLION", "15.00")
+) / 1_000_000
+TRANSCRIBE_COST_PER_MINUTE = float(
+    os.environ.get("TRANSCRIBE_COST_PER_MINUTE", "0.024")
+)
 
 # Media type routing
 PDF_MEDIA_TYPES = {"application/pdf"}
@@ -71,10 +84,12 @@ class AIOrchestrator:
         s3_client=None,
         lambda_client=None,
         sns_client=None,
+        cloudwatch_client=None,
     ):
         self._s3 = s3_client or boto3.client("s3")
         self._lambda = lambda_client or boto3.client("lambda")
         self._webhook_sender = WebhookSender(sns_client=sns_client)
+        self._cloudwatch = cloudwatch_client
 
     def process(
         self,
@@ -120,6 +135,17 @@ class AIOrchestrator:
             self._move_file(bucket, key, destination_key, correlation)
             elapsed = int((time.time() - start) * 1000)
             logger.info("%s Moved to /processed/ (AI disabled) in %dms", correlation, elapsed)
+
+            publish_metrics(self._cloudwatch, [
+                {
+                    "MetricName": "submission-processed",
+                    "Value": 1,
+                    "Unit": "Count",
+                    "Dimensions": [
+                        {"Name": "AiToggleEnabled", "Value": "false"},
+                    ],
+                },
+            ])
 
             return OrchestratorResult(
                 item_id=item_id,
@@ -177,6 +203,11 @@ class AIOrchestrator:
 
         elapsed = int((time.time() - start) * 1000)
         logger.info("%s Enrichment complete in %dms", correlation, elapsed)
+
+        # Step 7: Publish cost estimate and submission metric
+        self._publish_enrichment_metrics(
+            extraction_result, bedrock_result, media_type
+        )
 
         return OrchestratorResult(
             item_id=item_id,
@@ -284,6 +315,45 @@ class AIOrchestrator:
             Key=dest_key,
         )
         self._s3.delete_object(Bucket=bucket, Key=source_key)
+
+    # ------------------------------------------------------------------
+    # Metrics
+    # ------------------------------------------------------------------
+
+    def _publish_enrichment_metrics(
+        self,
+        extraction_result: dict,
+        bedrock_result: dict,
+        media_type: str,
+    ) -> None:
+        """Compute and publish cost estimate and submission-processed metrics."""
+        input_tokens = bedrock_result.get("input_tokens", 0)
+        output_tokens = bedrock_result.get("output_tokens", 0)
+
+        cost = (
+            input_tokens * BEDROCK_INPUT_COST_PER_TOKEN
+            + output_tokens * BEDROCK_OUTPUT_COST_PER_TOKEN
+        )
+
+        if media_type in VIDEO_MEDIA_TYPES:
+            duration_seconds = extraction_result.get("duration_seconds", 0)
+            cost += (duration_seconds / 60) * TRANSCRIBE_COST_PER_MINUTE
+
+        publish_metrics(self._cloudwatch, [
+            {
+                "MetricName": "processing-cost-estimate",
+                "Value": round(cost, 6),
+                "Unit": "None",
+            },
+            {
+                "MetricName": "submission-processed",
+                "Value": 1,
+                "Unit": "Count",
+                "Dimensions": [
+                    {"Name": "AiToggleEnabled", "Value": "true"},
+                ],
+            },
+        ])
 
     # ------------------------------------------------------------------
     # Lambda dispatch
