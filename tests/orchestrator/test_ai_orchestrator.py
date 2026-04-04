@@ -20,6 +20,7 @@ def _make_meta(
     callback_url=None,
 ):
     meta = {
+        "request_id": 42,
         "item_id": "STD-12345",
         "ou": "PES",
         "product_part_number": "STD-12345",
@@ -27,6 +28,7 @@ def _make_meta(
         "content": {
             "media_type": media_type,
             "filename": "STD-12345.pdf",
+            "resource_center": "PES",
         },
     }
     if callback_url:
@@ -382,8 +384,10 @@ class TestWebhook:
         assert payload["signal"] == "extraction_ready"
         assert payload["product_part_number"] == "STD-12345"
         assert payload["item_id"] == "STD-12345"
+        assert payload["request_id"] == 42
         assert payload["ou"] == "PES"
-        assert payload["status"] == "completed"
+        assert payload["status"] == "success"
+        assert "data" in payload
         assert "completed_at" in payload
 
     @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
