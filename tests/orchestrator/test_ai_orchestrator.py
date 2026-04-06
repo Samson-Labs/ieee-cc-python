@@ -20,6 +20,7 @@ def _make_meta(
     callback_url=None,
 ):
     meta = {
+        "request_id": 42,
         "item_id": "STD-12345",
         "ou": "PES",
         "product_part_number": "STD-12345",
@@ -27,6 +28,7 @@ def _make_meta(
         "content": {
             "media_type": media_type,
             "filename": "STD-12345.pdf",
+            "resource_center": "PES",
         },
     }
     if callback_url:
@@ -323,6 +325,35 @@ class TestVideoFlow:
         with pytest.raises(ValueError, match="Unsupported media type"):
             orch.process("bucket", "PES/pending/image.png")
 
+    def test_drupal_video_media_type_normalized(self, orchestrator):
+        """Drupal sends 'Video' instead of 'video/mp4' — verify normalization."""
+        orch, s3, lam = orchestrator
+        meta = _make_meta(ai_enabled=True, media_type="Video")
+        meta["content"]["filename"] = "lecture.mp4"
+        s3.get_object.return_value = _s3_get_object_response(meta)
+
+        lam.invoke.side_effect = [
+            _lambda_invoke_response(200, {"transcript": "text", "duration": "00:01:00", "duration_seconds": 60, "speaker_count": 1}),
+            _lambda_invoke_response(200, {"abstract": "a", "keywords": [], "learning_level": "Expert"}),
+        ]
+
+        result = orch.process("bucket", "PES/pending/lecture.mp4")
+        assert result["action"] == "enriched"
+
+    def test_drupal_pdf_media_type_normalized(self, orchestrator):
+        """Drupal sends 'PDF' instead of 'application/pdf' — verify normalization."""
+        orch, s3, lam = orchestrator
+        meta = _make_meta(ai_enabled=True, media_type="PDF")
+        s3.get_object.return_value = _s3_get_object_response(meta)
+
+        lam.invoke.side_effect = [
+            _lambda_invoke_response(200, {"text": "extracted", "page_count": 5}),
+            _lambda_invoke_response(200, {"abstract": "a", "keywords": [], "learning_level": "Expert"}),
+        ]
+
+        result = orch.process("bucket", "PES/pending/STD-12345.pdf")
+        assert result["action"] == "enriched"
+
 
 # ---------------------------------------------------------------
 # Lambda Dispatch Errors
@@ -382,9 +413,28 @@ class TestWebhook:
         assert payload["signal"] == "extraction_ready"
         assert payload["product_part_number"] == "STD-12345"
         assert payload["item_id"] == "STD-12345"
+        assert payload["request_id"] == 42
         assert payload["ou"] == "PES"
-        assert payload["status"] == "completed"
+        assert payload["status"] == "success"
+        assert "data" in payload
         assert "completed_at" in payload
+
+    @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
+    def test_request_id_falls_back_to_lambda_request_id(self, mock_send, orchestrator):
+        orch, s3, lam = orchestrator
+        meta = _make_meta(ai_enabled=True, callback_url="https://drupal.example.com/hook")
+        del meta["request_id"]  # simulate missing request_id in .meta.json
+        s3.get_object.return_value = _s3_get_object_response(meta)
+
+        lam.invoke.side_effect = [
+            _lambda_invoke_response(200, {"text": "text", "page_count": 5}),
+            _lambda_invoke_response(200, {"abstract": "a", "keywords": [], "learning_level": "Expert"}),
+        ]
+
+        orch.process("bucket", "PES/pending/STD-12345.pdf", request_id="lambda-req-abc")
+
+        payload = mock_send.call_args[0][2]
+        assert payload["request_id"] == "lambda-req-abc"
 
     @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
     def test_video_signal_is_transcription_ready(self, mock_send, orchestrator):

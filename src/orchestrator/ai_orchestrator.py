@@ -40,6 +40,12 @@ TRANSCRIBE_COST_PER_MINUTE = float(
 PDF_MEDIA_TYPES = {"application/pdf"}
 VIDEO_MEDIA_TYPES = {"video/mp4", "video/quicktime", "video/webm"}
 
+# Normalize Drupal-style media types to MIME types.
+MEDIA_TYPE_MAP = {
+    "PDF": "application/pdf",
+    "Video": "video/mp4",
+}
+
 # Lambda function names for dispatch (configurable via env vars)
 PDF_EXTRACTOR_FUNCTION = os.environ.get("PDF_EXTRACTOR_FUNCTION", "ieee-cc-pdf-extractor")
 VIDEO_TRANSCRIBER_FUNCTION = os.environ.get("VIDEO_TRANSCRIBER_FUNCTION", "ieee-cc-video-transcriber")
@@ -52,15 +58,15 @@ DRUPAL_WEBHOOK_SECRET = os.environ.get("DRUPAL_WEBHOOK_SECRET", "")
 S3_READ_MAX_RETRIES = 3
 S3_READ_BACKOFF_BASE = 1  # seconds
 
-# Required fields in .meta.json
+# Required fields in .meta.json (relaxed to accept Drupal's actual schema).
+# Fields like 'ou' and 'product_part_number' are derived from the S3 key
+# or meta content if not present at the top level.
 REQUIRED_META_FIELDS = {
     "item_id",
-    "ou",
-    "product_part_number",
     "ai_enrichment_enabled",
     "content",
 }
-REQUIRED_CONTENT_FIELDS = {"media_type", "filename"}
+REQUIRED_CONTENT_FIELDS = {"media_type"}
 
 
 class OrchestratorResult(TypedDict):
@@ -119,6 +125,12 @@ class AIOrchestrator:
         meta = self._read_meta_json(bucket, meta_key, correlation)
         self._validate_meta(meta)
 
+        # Normalize media type from Drupal format ('Video', 'PDF') to MIME.
+        raw_media_type = meta["content"]["media_type"]
+        meta["content"]["media_type"] = MEDIA_TYPE_MAP.get(
+            raw_media_type, raw_media_type
+        )
+
         logger.info(
             "%s ai_enrichment_enabled=%s, media_type=%s",
             correlation,
@@ -126,7 +138,14 @@ class AIOrchestrator:
             meta["content"]["media_type"],
         )
 
-        product_part_number = meta["product_part_number"]
+        # Derive fields that may not be in .meta.json top level.
+        # Use meta["item_id"] (entity ID) consistently for derivation.
+        meta_item_id = meta["item_id"]
+        meta_ou = meta.get("ou", meta["content"].get("resource_center", ou))
+        product_part_number = meta.get(
+            "product_part_number",
+            meta["content"].get("resource_center", meta_ou) + "_" + meta_item_id,
+        )
         destination_key = f"{ou}/processed/{item_id}.{ext}"
 
         # Step 2: Route based on ai_enrichment_enabled
@@ -182,17 +201,19 @@ class AIOrchestrator:
                 if media_type in VIDEO_MEDIA_TYPES
                 else "extraction_ready"
             )
+            # Use entity IDs from .meta.json (not filename-derived).
             payload = {
+                "request_id": meta.get("request_id") or request_id,
+                "item_id": meta_item_id,
+                "status": "success",
                 "signal": signal,
                 "product_part_number": product_part_number,
-                "item_id": item_id,
-                "ou": ou,
-                "status": "completed",
+                "ou": meta_ou,
                 "completed_at": datetime.now(timezone.utc)
                 .isoformat()
                 .replace("+00:00", "Z"),
                 "extraction": extraction_result,
-                "metadata": bedrock_result,
+                "data": bedrock_result,
             }
             webhook_sent = self._webhook_sender.send(
                 callback_url, DRUPAL_WEBHOOK_SECRET, payload, correlation,
