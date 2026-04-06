@@ -1,9 +1,12 @@
-"""HMAC-SHA256 signed webhook sender with retry and SNS dead-letter alerting."""
+"""Webhook sender with Bearer auth, retry, and SNS dead-letter alerting.
+
+Sends JSON payloads to the Drupal IPLR webhook endpoint using a plain
+shared secret in the ``Authorization: Bearer`` header.  Retries on 5xx
+and connection errors with exponential backoff.
+"""
 
 from __future__ import annotations
 
-import hashlib
-import hmac
 import json
 import logging
 import os
@@ -21,15 +24,10 @@ SNS_TOPIC_ENV = "WEBHOOK_FAILURES_SNS_TOPIC_ARN"
 
 
 class WebhookSender:
-    """Sends HMAC-SHA256 signed webhook POSTs with retry and SNS alerting."""
+    """Sends Bearer-authenticated webhook POSTs with retry and SNS alerting."""
 
     def __init__(self, sns_client=None):
         self._sns = sns_client or boto3.client("sns")
-
-    @staticmethod
-    def _sign(secret: str, body_bytes: bytes) -> str:
-        """Compute HMAC-SHA256 hex digest."""
-        return hmac.new(secret.encode(), body_bytes, hashlib.sha256).hexdigest()
 
     def send(
         self,
@@ -38,11 +36,11 @@ class WebhookSender:
         payload: dict,
         correlation: str = "",
     ) -> bool:
-        """Send a signed webhook POST.
+        """Send an authenticated webhook POST.
 
         Args:
             url: Destination URL.
-            secret: HMAC-SHA256 shared secret.
+            secret: Shared secret sent as ``Authorization: Bearer {secret}``.
             payload: JSON-serialisable dict to POST.
             correlation: Logging correlation tag.
 
@@ -50,14 +48,13 @@ class WebhookSender:
             True on success (2xx), False on permanent failure.
         """
         body_bytes = json.dumps(payload).encode()
-        signature = self._sign(secret, body_bytes)
 
         req = urllib.request.Request(
             url,
             data=body_bytes,
             headers={
                 "Content-Type": "application/json",
-                "X-Webhook-Signature": signature,
+                "Authorization": f"Bearer {secret}",
             },
             method="POST",
         )

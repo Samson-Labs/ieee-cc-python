@@ -1,11 +1,9 @@
 """Tests for WebhookSender."""
 
-import hashlib
-import hmac
 import json
 import urllib.error
 from io import BytesIO
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -20,7 +18,7 @@ def sender():
 
 URL = "https://drupal.example.com/hook"
 SECRET = "test-secret-key"
-PAYLOAD = {"item_id": "STD-12345", "status": "completed"}
+PAYLOAD = {"item_id": "STD-12345", "status": "success"}
 CORRELATION = "[req:STD-12345]"
 
 
@@ -32,24 +30,9 @@ def _mock_success_response():
     return resp
 
 
-class TestSign:
-    def test_sign_produces_correct_hmac(self):
-        body = json.dumps(PAYLOAD).encode()
-        expected = hmac.new(SECRET.encode(), body, hashlib.sha256).hexdigest()
-        assert WebhookSender._sign(SECRET, body) == expected
-
-    def test_hmac_matches_drupal_hash_equals(self):
-        """Verify hex digest format is compatible with PHP hash_equals(hash_hmac('sha256', $body, $secret))."""
-        body = b'{"test":"data"}'
-        result = WebhookSender._sign("my-secret", body)
-        # PHP hash_hmac('sha256', ...) returns lowercase hex — verify same format
-        assert all(c in "0123456789abcdef" for c in result)
-        assert len(result) == 64  # SHA-256 hex digest is 64 chars
-
-
 class TestHeaders:
     @patch("src.webhook.sender.urllib.request.urlopen")
-    def test_sets_signature_and_content_type_headers(self, mock_urlopen, sender):
+    def test_sets_bearer_auth_and_content_type(self, mock_urlopen, sender):
         ws, _ = sender
         mock_urlopen.return_value = _mock_success_response()
 
@@ -57,12 +40,17 @@ class TestHeaders:
 
         req = mock_urlopen.call_args[0][0]
         assert req.get_header("Content-type") == "application/json"
-        assert req.get_header("X-webhook-signature") is not None
+        assert req.get_header("Authorization") == f"Bearer {SECRET}"
 
-        # Verify the signature matches the body
-        body_bytes = json.dumps(PAYLOAD).encode()
-        expected_sig = WebhookSender._sign(SECRET, body_bytes)
-        assert req.get_header("X-webhook-signature") == expected_sig
+    @patch("src.webhook.sender.urllib.request.urlopen")
+    def test_no_hmac_signature_header(self, mock_urlopen, sender):
+        ws, _ = sender
+        mock_urlopen.return_value = _mock_success_response()
+
+        ws.send(URL, SECRET, PAYLOAD, CORRELATION)
+
+        req = mock_urlopen.call_args[0][0]
+        assert req.get_header("X-webhook-signature") is None
 
 
 class TestSuccessPath:
