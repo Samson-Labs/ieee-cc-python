@@ -99,6 +99,10 @@ SYSTEM_PROMPT = (
     '2. **keywords** — An array of 8–12 keyword strings. Before selecting keywords, '
     "use the search_ieee_thesaurus tool to find standardized IEEE terms for the "
     "content's main topics (make 2-3 searches covering different topic areas). "
+    "When using an IEEE Thesaurus term, copy the exact preferred_term string from the "
+    "tool result — do not change capitalization, punctuation, pluralization, or wording "
+    '(e.g., use "Deep learning" not "Deep Learning", "Rectennas" not "Rectenna", '
+    '"DC-DC power converters" not "DC DC Converter"). '
     "Strongly prefer IEEE Thesaurus terms. If the content covers topics not "
     "well-represented in the IEEE Thesaurus, you may include a small number of "
     "specific non-thesaurus terms, but thesaurus terms should be the majority.\n\n"
@@ -125,6 +129,10 @@ SYSTEM_PROMPT_NO_TOOL = SYSTEM_PROMPT.replace(
     '2. **keywords** — An array of 8–12 keyword strings. Before selecting keywords, '
     "use the search_ieee_thesaurus tool to find standardized IEEE terms for the "
     "content's main topics (make 2-3 searches covering different topic areas). "
+    "When using an IEEE Thesaurus term, copy the exact preferred_term string from the "
+    "tool result — do not change capitalization, punctuation, pluralization, or wording "
+    '(e.g., use "Deep learning" not "Deep Learning", "Rectennas" not "Rectenna", '
+    '"DC-DC power converters" not "DC DC Converter"). '
     "Strongly prefer IEEE Thesaurus terms. If the content covers topics not "
     "well-represented in the IEEE Thesaurus, you may include a small number of "
     "specific non-thesaurus terms, but thesaurus terms should be the majority.",
