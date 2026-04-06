@@ -17,6 +17,10 @@ DEFAULT_DATA_PATH = os.path.join(
     os.path.dirname(__file__), "data", "ieee_thesaurus_v104.json"
 )
 
+DEFAULT_CUSTOM_SYNONYMS_PATH = os.path.join(
+    os.path.dirname(__file__), "data", "custom_synonyms.json"
+)
+
 
 def _stem(word: str) -> str:
     """Crude stemmer: strip common suffixes for fuzzy word matching."""
@@ -30,7 +34,7 @@ def _stem(word: str) -> str:
 class ThesaurusSearch:
     """Search index over IEEE Thesaurus v1.04 for keyword grounding."""
 
-    def __init__(self, data_path: str | None = None):
+    def __init__(self, data_path: str | None = None, custom_synonyms_path: str | None = None):
         self._preferred_terms: set[str] = set()
         self._preferred_lower: dict[str, str] = {}  # lowered → original
         self._synonym_index: dict[str, str] = {}  # lowered synonym → preferred term
@@ -44,6 +48,10 @@ class ThesaurusSearch:
             self._load(path)
         else:
             logger.warning("Thesaurus file not found: %s", path)
+
+        synonyms_path = custom_synonyms_path or DEFAULT_CUSTOM_SYNONYMS_PATH
+        if os.path.exists(synonyms_path):
+            self._load_custom_synonyms(synonyms_path)
 
     @property
     def term_count(self) -> int:
@@ -79,11 +87,65 @@ class ThesaurusSearch:
                             self._word_index[word].add(pref)
                             self._stem_index[_stem(word)].add(pref)
 
+        # Auto-generate singular forms for plural preferred terms.
+        # Many thesaurus terms are plural ("Rectennas", "AC motors") but the LLM
+        # often outputs singulars. This adds the singular as a synonym so
+        # normalize_keyword() can resolve it.
+        auto_count = 0
+        for pref in list(self._preferred_terms):
+            pref_lower = pref.lower()
+            for suffix, cut in [("ies", 1), ("ses", 2), ("es", 2), ("s", 1)]:
+                if pref_lower.endswith(suffix) and len(pref) > len(suffix) + 3:
+                    singular = pref[:-cut] if cut else pref
+                    singular_lower = singular.lower()
+                    # Only add if the singular isn't already a term or synonym
+                    if (
+                        singular_lower not in self._preferred_lower
+                        and singular_lower not in self._synonym_index
+                    ):
+                        self._synonym_index[singular_lower] = pref
+                        auto_count += 1
+                    break  # only apply the first matching suffix rule
+
         logger.info(
-            "Loaded IEEE Thesaurus: %d preferred terms, %d synonyms",
+            "Loaded IEEE Thesaurus: %d preferred terms, %d synonyms "
+            "(%d auto-generated singular forms)",
             len(self._preferred_terms),
             len(self._synonym_index),
+            auto_count,
         )
+
+    def _load_custom_synonyms(self, path: str) -> None:
+        """Load additional synonym mappings from a JSON file.
+
+        Format: {"synonym": "Preferred Term", ...}
+
+        These supplement the IEEE Thesaurus USE FOR entries to handle
+        common abbreviations, singular/plural variants, and other
+        mappings that the thesaurus doesn't cover natively.
+        """
+        with open(path) as f:
+            mappings = json.load(f)
+
+        count = 0
+        for synonym, preferred_term in mappings.items():
+            if synonym.startswith("_"):
+                continue
+            synonym_lower = synonym.strip().lower()
+            # Only add if the preferred term actually exists in the thesaurus
+            if preferred_term.strip().lower() in self._preferred_lower:
+                self._synonym_index[synonym_lower] = self._preferred_lower[
+                    preferred_term.strip().lower()
+                ]
+                count += 1
+            else:
+                logger.warning(
+                    "Custom synonym %r maps to %r which is not a preferred term",
+                    synonym, preferred_term,
+                )
+
+        if count:
+            logger.info("Loaded %d custom synonym mappings from %s", count, path)
 
     def search(self, query: str, limit: int = 20) -> list[dict]:
         """Search for thesaurus terms matching a query string.
