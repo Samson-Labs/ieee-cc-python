@@ -126,8 +126,8 @@ class VideoTranscriber:
         )
         if subtitles_output:
             vtt_uri = subtitles_output[0]
-            _, vtt_s3_key = self._parse_s3_uri(vtt_uri)
-            logger.info("WebVTT subtitle file: s3://%s/%s", bucket, vtt_s3_key)
+            vtt_bucket, vtt_s3_key = self._parse_s3_uri(vtt_uri)
+            logger.info("WebVTT subtitle file: s3://%s/%s", vtt_bucket, vtt_s3_key)
 
         logger.info(
             "Transcription complete: %d chars, %d speakers, %ds duration",
