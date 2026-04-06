@@ -139,9 +139,12 @@ class AIOrchestrator:
         )
 
         # Derive fields that may not be in .meta.json top level.
+        # Use meta["item_id"] (entity ID) consistently for derivation.
+        meta_item_id = meta["item_id"]
+        meta_ou = meta.get("ou", meta["content"].get("resource_center", ou))
         product_part_number = meta.get(
             "product_part_number",
-            meta["content"].get("resource_center", ou) + "_" + item_id,
+            meta["content"].get("resource_center", meta_ou) + "_" + meta_item_id,
         )
         destination_key = f"{ou}/processed/{item_id}.{ext}"
 
@@ -200,12 +203,12 @@ class AIOrchestrator:
             )
             # Use entity IDs from .meta.json (not filename-derived).
             payload = {
-                "request_id": meta.get("request_id"),
-                "item_id": meta.get("item_id", item_id),
+                "request_id": meta.get("request_id") or request_id,
+                "item_id": meta_item_id,
                 "status": "success",
                 "signal": signal,
                 "product_part_number": product_part_number,
-                "ou": ou,
+                "ou": meta_ou,
                 "completed_at": datetime.now(timezone.utc)
                 .isoformat()
                 .replace("+00:00", "Z"),
