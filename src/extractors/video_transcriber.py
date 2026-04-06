@@ -19,6 +19,8 @@ from typing import TypedDict
 
 import boto3
 
+from src.common.metrics import publish_metrics
+
 logger = logging.getLogger(__name__)
 
 # Transcribe settings
@@ -62,12 +64,14 @@ class VideoTranscriber:
         s3_client=None,
         transcribe_client=None,
         bedrock_client=None,
+        cloudwatch_client=None,
     ):
         self._s3 = s3_client or boto3.client("s3")
         self._transcribe = transcribe_client or boto3.client("transcribe")
         self._bedrock = bedrock_client or boto3.client(
             "bedrock-runtime", region_name="us-east-1"
         )
+        self._cloudwatch = cloudwatch_client
 
     def transcribe(
         self,
@@ -137,6 +141,14 @@ class VideoTranscriber:
             bucket, metadata_key, duration_str, duration_seconds
         )
         logger.info("Wrote metadata to s3://%s/%s", bucket, metadata_key)
+
+        publish_metrics(self._cloudwatch, [
+            {
+                "MetricName": "transcribe-minutes",
+                "Value": round(duration_seconds / 60, 2),
+                "Unit": "None",
+            },
+        ])
 
         return TranscriptionResult(
             transcript=transcript,

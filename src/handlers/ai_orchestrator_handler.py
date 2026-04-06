@@ -29,9 +29,11 @@ _lambda_client = boto3.client(
     config=Config(read_timeout=900, connect_timeout=10),
 )
 _sqs_client = boto3.client("sqs")
+_cloudwatch_client = boto3.client("cloudwatch")
 _orchestrator = AIOrchestrator(
     s3_client=_s3_client,
     lambda_client=_lambda_client,
+    cloudwatch_client=_cloudwatch_client,
 )
 
 DLQ_QUEUE_URL = os.environ.get("DLQ_QUEUE_URL", "")
