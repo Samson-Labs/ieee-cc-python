@@ -3,6 +3,9 @@
 Sends extracted document text to AWS Bedrock (Claude Sonnet) with the IEEE
 Technical Metadata Specialist system prompt (v1.2) and returns structured
 metadata: abstract, keywords, learning_level, intended_audience, category.
+
+Supports IEEE Thesaurus grounding via Bedrock tool use: the LLM can search
+the thesaurus during generation to select standardized IEEE terms as keywords.
 """
 
 from __future__ import annotations
@@ -16,6 +19,7 @@ from typing import TypedDict
 import boto3
 from botocore.exceptions import ClientError
 
+from src.ai.thesaurus import ThesaurusSearch
 from src.common.metrics import publish_metrics
 
 logger = logging.getLogger(__name__)
@@ -28,6 +32,9 @@ TEXT_TRUNCATION_LIMIT = 180_000  # characters — fits within Claude's context w
 # Retry configuration for Bedrock throttling (429)
 MAX_RETRIES = 3
 BACKOFF_BASE = 1  # seconds: 1, 2, 4
+
+# Tool-use conversation loop limit
+MAX_TOOL_ITERATIONS = 5
 
 VALID_LEARNING_LEVELS = frozenset([
     "Foundational",
@@ -49,6 +56,30 @@ VALID_CATEGORIES = frozenset([
     "Technical Tutorial",
 ])
 
+THESAURUS_TOOL = {
+    "name": "search_ieee_thesaurus",
+    "description": (
+        "Search the IEEE Thesaurus for official standardized terms related to a "
+        "topic. Use this to find IEEE taxonomy terms for the content's topics "
+        "before selecting keywords. Make 2-3 searches covering different topic "
+        "areas in the content."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": (
+                    "Topic or concept to search for (e.g., "
+                    "'machine learning neural networks', "
+                    "'power grid renewable energy')"
+                ),
+            }
+        },
+        "required": ["query"],
+    },
+}
+
 SYSTEM_PROMPT = (
     "You are a Technical Metadata Specialist for the IEEE (Institute of Electrical "
     "and Electronics Engineers). Your role is to analyze technical content and "
@@ -65,10 +96,12 @@ SYSTEM_PROMPT = (
     "The first paragraph should describe the main topic, approach, and scope of the "
     "presentation or publication. "
     "The second paragraph should cover key findings, contributions, and implications.\n\n"
-    '2. **keywords** — An array of 8–12 keyword strings that capture the content\'s '
-    "core topics, technologies, methodologies, and application domains. Prefer specific "
-    "technical terms over generic ones. When a relevant IEEE Thesaurus term exists, "
-    "prefer it over a synonym.\n\n"
+    '2. **keywords** — An array of 8–12 keyword strings. Before selecting keywords, '
+    "use the search_ieee_thesaurus tool to find standardized IEEE terms for the "
+    "content's main topics (make 2-3 searches covering different topic areas). "
+    "Strongly prefer IEEE Thesaurus terms. If the content covers topics not "
+    "well-represented in the IEEE Thesaurus, you may include a small number of "
+    "specific non-thesaurus terms, but thesaurus terms should be the majority.\n\n"
     '3. **learning_level** — One of the following:\n'
     '   - "Foundational" — introductory material suitable for students or newcomers\n'
     '   - "Professional" — intermediate material for practicing engineers\n'
@@ -87,6 +120,14 @@ SYSTEM_PROMPT = (
     "before or after the JSON. Do not wrap it in markdown code fences."
 )
 
+# Fallback keyword instruction when thesaurus tool is not available
+KEYWORDS_NO_TOOL = (
+    '2. **keywords** — An array of 8–12 keyword strings that capture the content\'s '
+    "core topics, technologies, methodologies, and application domains. Prefer specific "
+    "technical terms over generic ones. When a relevant IEEE Thesaurus term exists, "
+    "prefer it over a synonym.\n\n"
+)
+
 JSON_RETRY_SUFFIX = (
     "\n\nIMPORTANT: Your previous response was not valid JSON. "
     "Return ONLY a raw JSON object — no markdown, no explanation, no text outside "
@@ -103,12 +144,19 @@ class InferenceResult(TypedDict):
     processing_time_ms: int
     input_tokens: int
     output_tokens: int
+    thesaurus_coverage: int
 
 
 class BedrockInference:
     """Calls AWS Bedrock Claude to generate structured metadata from document text."""
 
-    def __init__(self, bedrock_client=None, model_id: str | None = None, cloudwatch_client=None):
+    def __init__(
+        self,
+        bedrock_client=None,
+        model_id: str | None = None,
+        cloudwatch_client=None,
+        thesaurus: ThesaurusSearch | None = None,
+    ):
         self._bedrock = bedrock_client or boto3.client(
             "bedrock-runtime", region_name="us-east-1"
         )
@@ -116,6 +164,7 @@ class BedrockInference:
             "BEDROCK_MODEL_ID", DEFAULT_MODEL_ID
         )
         self._cloudwatch = cloudwatch_client
+        self._thesaurus = thesaurus if thesaurus is not None else ThesaurusSearch()
 
     def generate_metadata(
         self,
@@ -124,14 +173,21 @@ class BedrockInference:
     ) -> InferenceResult:
         """Generate structured metadata from extracted document text.
 
+        When the IEEE Thesaurus is loaded, uses Bedrock tool use so the LLM
+        can search the thesaurus during keyword selection. Falls back to the
+        original single-request path when the thesaurus is unavailable or
+        when explicit thesaurus_terms are provided.
+
         Args:
             text: Extracted document text (will be truncated if too long).
             thesaurus_terms: Optional IEEE Thesaurus terms to prioritize for keywords.
+                When provided, uses the legacy prompt-injection approach instead
+                of tool use.
 
         Returns:
             InferenceResult with abstract, keywords, learning_level,
             intended_audience, category, processing_time_ms,
-            input_tokens, and output_tokens.
+            input_tokens, output_tokens, and thesaurus_coverage.
 
         Raises:
             ValueError: If Bedrock response fails validation after retries.
@@ -140,23 +196,30 @@ class BedrockInference:
         start = time.monotonic()
 
         truncated_text = text[:TEXT_TRUNCATION_LIMIT]
+        use_tool = self._thesaurus.term_count > 0 and not thesaurus_terms
 
-        system_prompt = SYSTEM_PROMPT
-        if thesaurus_terms:
-            terms_str = ", ".join(thesaurus_terms)
-            system_prompt += (
-                f"\n\nWhen selecting keywords, prioritize terms from this "
-                f"IEEE Thesaurus subset: {terms_str}"
+        if use_tool:
+            raw, input_tokens, output_tokens = self._invoke_with_tools(
+                SYSTEM_PROMPT, truncated_text
+            )
+        else:
+            system_prompt = SYSTEM_PROMPT
+            if thesaurus_terms:
+                terms_str = ", ".join(thesaurus_terms)
+                system_prompt += (
+                    f"\n\nWhen selecting keywords, prioritize terms from this "
+                    f"IEEE Thesaurus subset: {terms_str}"
+                )
+            raw, input_tokens, output_tokens = self._invoke(
+                system_prompt, truncated_text
             )
 
-        # First attempt
-        raw, input_tokens, output_tokens = self._invoke(system_prompt, truncated_text)
         parsed = self._try_parse_json(raw)
 
         # If JSON parsing failed, retry once with explicit JSON instruction
         if parsed is None:
             logger.warning("Invalid JSON response, retrying with explicit instruction")
-            retry_prompt = system_prompt + JSON_RETRY_SUFFIX
+            retry_prompt = SYSTEM_PROMPT + JSON_RETRY_SUFFIX
             raw, retry_in, retry_out = self._invoke(retry_prompt, truncated_text)
             input_tokens += retry_in
             output_tokens += retry_out
@@ -167,6 +230,17 @@ class BedrockInference:
                 )
 
         self._validate_result(parsed)
+
+        # Measure thesaurus coverage
+        coverage_count = 0
+        if self._thesaurus.term_count > 0:
+            coverage_count, matched = self._thesaurus.coverage(parsed["keywords"])
+            logger.info(
+                "Thesaurus coverage: %d/%d keywords matched: %s",
+                coverage_count,
+                len(parsed["keywords"]),
+                matched,
+            )
 
         elapsed_ms = int((time.monotonic() - start) * 1000)
 
@@ -184,6 +258,7 @@ class BedrockInference:
             processing_time_ms=elapsed_ms,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            thesaurus_coverage=coverage_count,
         )
 
     # ------------------------------------------------------------------
@@ -206,6 +281,93 @@ class BedrockInference:
             ],
         })
 
+        return self._call_bedrock(body)
+
+    def _invoke_with_tools(
+        self, system_prompt: str, user_text: str
+    ) -> tuple[str, int, int]:
+        """Call Bedrock with thesaurus tool use, handling multi-turn conversation.
+
+        The LLM can call search_ieee_thesaurus to look up IEEE terms before
+        selecting keywords. We loop until the LLM produces a final text response
+        or we hit the iteration limit.
+
+        Returns:
+            Tuple of (response_text, total_input_tokens, total_output_tokens).
+        """
+        messages = [{"role": "user", "content": user_text}]
+        total_input = 0
+        total_output = 0
+
+        for iteration in range(MAX_TOOL_ITERATIONS):
+            body = json.dumps({
+                "anthropic_version": "bedrock-2023-05-31",
+                "max_tokens": MAX_TOKENS,
+                "temperature": TEMPERATURE,
+                "system": system_prompt,
+                "messages": messages,
+                "tools": [THESAURUS_TOOL],
+            })
+
+            result = self._call_bedrock_raw(body)
+            usage = result.get("usage", {})
+            total_input += usage.get("input_tokens", 0)
+            total_output += usage.get("output_tokens", 0)
+
+            stop_reason = result.get("stop_reason", "end_turn")
+            content_blocks = result.get("content", [])
+
+            if stop_reason != "tool_use":
+                # Final response — extract text
+                text = self._extract_text(content_blocks)
+                return text, total_input, total_output
+
+            # Process tool calls
+            messages.append({"role": "assistant", "content": content_blocks})
+
+            tool_results = []
+            for block in content_blocks:
+                if block.get("type") != "tool_use":
+                    continue
+
+                tool_id = block["id"]
+                tool_name = block["name"]
+                tool_input = block.get("input", {})
+
+                if tool_name == "search_ieee_thesaurus":
+                    query = tool_input.get("query", "")
+                    logger.info("Thesaurus tool call: query=%r", query)
+                    search_results = self._thesaurus.search(query, limit=20)
+                    result_text = json.dumps(search_results, indent=2)
+                else:
+                    result_text = json.dumps({"error": f"Unknown tool: {tool_name}"})
+
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": tool_id,
+                    "content": result_text,
+                })
+
+            messages.append({"role": "user", "content": tool_results})
+            logger.info(
+                "Tool iteration %d/%d completed, %d tool calls",
+                iteration + 1, MAX_TOOL_ITERATIONS, len(tool_results),
+            )
+
+        # Exhausted iterations — try to extract any text from last response
+        logger.warning("Tool use loop reached max iterations (%d)", MAX_TOOL_ITERATIONS)
+        text = self._extract_text(content_blocks)
+        return text, total_input, total_output
+
+    def _call_bedrock(self, body: str) -> tuple[str, int, int]:
+        """Call invoke_model and return (text, input_tokens, output_tokens)."""
+        result = self._call_bedrock_raw(body)
+        usage = result.get("usage", {})
+        text = self._extract_text(result.get("content", []))
+        return text, usage.get("input_tokens", 0), usage.get("output_tokens", 0)
+
+    def _call_bedrock_raw(self, body: str) -> dict:
+        """Call invoke_model with retry on throttling, return full response dict."""
         for attempt in range(MAX_RETRIES):
             try:
                 response = self._bedrock.invoke_model(
@@ -214,13 +376,7 @@ class BedrockInference:
                     accept="application/json",
                     body=body,
                 )
-                result = json.loads(response["body"].read())
-                usage = result.get("usage", {})
-                return (
-                    result["content"][0]["text"],
-                    usage.get("input_tokens", 0),
-                    usage.get("output_tokens", 0),
-                )
+                return json.loads(response["body"].read())
 
             except ClientError as exc:
                 error_code = exc.response["Error"]["Code"]
@@ -233,6 +389,14 @@ class BedrockInference:
                     time.sleep(wait)
                     continue
                 raise
+
+    @staticmethod
+    def _extract_text(content_blocks: list[dict]) -> str:
+        """Extract text from Bedrock response content blocks."""
+        for block in content_blocks:
+            if block.get("type") == "text":
+                return block["text"]
+        return ""
 
     @staticmethod
     def _try_parse_json(raw: str) -> dict | None:
