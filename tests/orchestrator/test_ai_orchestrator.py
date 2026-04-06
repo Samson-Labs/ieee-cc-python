@@ -487,6 +487,35 @@ class TestWebhook:
         assert payload["vtt_s3_key"] == "PES/subtitles/STD-12345.vtt"
 
     @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
+    def test_video_no_vtt_skips_copy(self, mock_send, orchestrator):
+        """When vtt_s3_key is empty, orchestrator should not attempt copy."""
+        orch, s3, lam = orchestrator
+        meta = _make_meta(ai_enabled=True, media_type="video/mp4", callback_url="https://drupal.example.com/hook")
+        meta["content"]["filename"] = "lecture.mp4"
+        s3.get_object.return_value = _s3_get_object_response(meta)
+
+        transcription_body = {
+            "transcript": "text", "duration": "00:05:00",
+            "duration_seconds": 300, "speaker_count": 1,
+            "vtt_s3_key": "",
+        }
+        bedrock_body = {"abstract": "a", "keywords": [], "learning_level": "Expert"}
+        lam.invoke.side_effect = [
+            _lambda_invoke_response(200, transcription_body),
+            _lambda_invoke_response(200, bedrock_body),
+        ]
+
+        orch.process("bucket", "AESS/pending/lecture.mp4")
+
+        # copy_object should only be called once (for file move), not for VTT
+        copy_calls = s3.copy_object.call_args_list
+        vtt_copies = [c for c in copy_calls if "subtitles" in str(c)]
+        assert len(vtt_copies) == 0
+
+        payload = mock_send.call_args[0][2]
+        assert payload["vtt_s3_key"] is None
+
+    @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
     def test_pdf_webhook_has_no_vtt_key(self, mock_send, orchestrator):
         orch, s3, lam = orchestrator
         meta = _make_meta(ai_enabled=True, callback_url="https://drupal.example.com/hook")

@@ -608,3 +608,103 @@ class TestCloudWatchMetrics:
             ou="PES",
             product_part_number="VID-002",
         )
+
+
+# ---------------------------------------------------------------------------
+# Tests: WebVTT subtitles
+# ---------------------------------------------------------------------------
+
+
+class TestWebVTTSubtitles:
+    @patch("src.extractors.video_transcriber.time.sleep")
+    def test_vtt_key_empty_when_no_subtitles_in_response(self, mock_sleep):
+        """Transcribe job completes without Subtitles output."""
+        s3_mock = MagicMock()
+        t_mock = MagicMock()
+        bedrock_mock = MagicMock()
+
+        transcript_json = _make_transcribe_json("hello", end_time="60.0")
+        _mock_s3_transcript(s3_mock, transcript_json)
+        _mock_bedrock_cleanup(bedrock_mock, "hello")
+
+        # Job response without Subtitles key
+        t_mock.get_transcription_job.return_value = {
+            "TranscriptionJob": {
+                "TranscriptionJobStatus": "COMPLETED",
+                "Transcript": {
+                    "TranscriptFileUri": "s3://output-bucket/transcripts/job.json"
+                },
+            }
+        }
+
+        transcriber = VideoTranscriber(
+            s3_client=s3_mock,
+            transcribe_client=t_mock,
+            bedrock_client=bedrock_mock,
+        )
+
+        result = transcriber.transcribe(
+            bucket="test-bucket",
+            key="PES/pending/video.mp4",
+            ou="PES",
+            product_part_number="VID-001",
+        )
+
+        assert result["vtt_s3_key"] == ""
+
+    @patch("src.extractors.video_transcriber.time.sleep")
+    def test_vtt_key_empty_when_subtitle_uris_empty(self, mock_sleep):
+        """Transcribe job has Subtitles but empty SubtitleFileUris."""
+        s3_mock = MagicMock()
+        t_mock = MagicMock()
+        bedrock_mock = MagicMock()
+
+        transcript_json = _make_transcribe_json("hello", end_time="60.0")
+        _mock_s3_transcript(s3_mock, transcript_json)
+        _mock_bedrock_cleanup(bedrock_mock, "hello")
+
+        t_mock.get_transcription_job.return_value = {
+            "TranscriptionJob": {
+                "TranscriptionJobStatus": "COMPLETED",
+                "Transcript": {
+                    "TranscriptFileUri": "s3://output-bucket/transcripts/job.json"
+                },
+                "Subtitles": {
+                    "SubtitleFileUris": [],
+                    "Formats": ["vtt"],
+                },
+            }
+        }
+
+        transcriber = VideoTranscriber(
+            s3_client=s3_mock,
+            transcribe_client=t_mock,
+            bedrock_client=bedrock_mock,
+        )
+
+        result = transcriber.transcribe(
+            bucket="test-bucket",
+            key="PES/pending/video.mp4",
+            ou="PES",
+            product_part_number="VID-001",
+        )
+
+        assert result["vtt_s3_key"] == ""
+
+    def test_start_job_with_output_bucket_includes_subtitles(self):
+        """Verify Subtitles param is present even when OutputBucketName is set."""
+        t_mock = MagicMock()
+        transcriber = VideoTranscriber(
+            s3_client=MagicMock(),
+            transcribe_client=t_mock,
+            bedrock_client=MagicMock(),
+        )
+
+        transcriber._start_job(
+            "test-job", "s3://bucket/video.mp4", "mp4", output_bucket="my-bucket"
+        )
+
+        call_kwargs = t_mock.start_transcription_job.call_args[1]
+        assert "Subtitles" in call_kwargs
+        assert call_kwargs["Subtitles"] == {"Formats": ["vtt"], "OutputStartIndex": 1}
+        assert call_kwargs["OutputBucketName"] == "my-bucket"
