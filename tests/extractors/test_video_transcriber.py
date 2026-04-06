@@ -62,16 +62,24 @@ def _make_transcribe_json(
     }
 
 
-def _mock_transcribe_complete(transcribe_mock, job_name_pattern=None):
+def _mock_transcribe_complete(transcribe_mock, job_name_pattern=None, vtt_uri=None):
     """Set up Transcribe mock for a successful job."""
-    transcribe_mock.get_transcription_job.return_value = {
+    job_result = {
         "TranscriptionJob": {
             "TranscriptionJobStatus": "COMPLETED",
             "Transcript": {
                 "TranscriptFileUri": "s3://output-bucket/transcripts/job.json"
             },
+            "Subtitles": {
+                "SubtitleFileUris": [
+                    vtt_uri or "s3://output-bucket/transcribe-output/job.vtt"
+                ],
+                "Formats": ["vtt"],
+                "OutputStartIndex": 1,
+            },
         }
     }
+    transcribe_mock.get_transcription_job.return_value = job_result
 
 
 def _mock_s3_transcript(s3_mock, transcript_json=None):
@@ -258,6 +266,10 @@ class TestStartJob:
                 "ShowSpeakerLabels": True,
                 "MaxSpeakerLabels": MAX_SPEAKERS,
             },
+            Subtitles={
+                "Formats": ["vtt"],
+                "OutputStartIndex": 1,
+            },
         )
 
 
@@ -420,6 +432,7 @@ class TestTranscribeFlow:
         assert result["duration"] == "01:01:01"
         assert result["duration_seconds"] == 3661
         assert result["speaker_count"] == 2
+        assert result["vtt_s3_key"] == "transcribe-output/job.vtt"
 
         # Verify metadata was written
         put_calls = [

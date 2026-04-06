@@ -54,6 +54,7 @@ class TranscriptionResult(TypedDict):
     duration: str  # HH:MM:SS
     duration_seconds: int
     speaker_count: int
+    vtt_s3_key: str  # S3 key of the generated WebVTT subtitle file
 
 
 class VideoTranscriber:
@@ -112,11 +113,21 @@ class VideoTranscriber:
         # Step 2: Poll for completion
         job = self._poll_job(job_name)
 
-        # Step 3: Fetch transcript
+        # Step 3: Fetch transcript and VTT subtitle key
         transcript_uri = job["TranscriptionJob"]["Transcript"]["TranscriptFileUri"]
         raw_transcript, duration_seconds, speaker_count = self._fetch_transcript(
             transcript_uri
         )
+
+        # Extract VTT S3 key from Subtitles output
+        vtt_s3_key = ""
+        subtitles_output = job["TranscriptionJob"].get("Subtitles", {}).get(
+            "SubtitleFileUris", []
+        )
+        if subtitles_output:
+            vtt_uri = subtitles_output[0]
+            _, vtt_s3_key = self._parse_s3_uri(vtt_uri)
+            logger.info("WebVTT subtitle file: s3://%s/%s", bucket, vtt_s3_key)
 
         logger.info(
             "Transcription complete: %d chars, %d speakers, %ds duration",
@@ -155,6 +166,7 @@ class VideoTranscriber:
             duration=duration_str,
             duration_seconds=duration_seconds,
             speaker_count=speaker_count,
+            vtt_s3_key=vtt_s3_key,
         )
 
     def transcribe_from_uri(
@@ -189,6 +201,10 @@ class VideoTranscriber:
             "Settings": {
                 "ShowSpeakerLabels": True,
                 "MaxSpeakerLabels": MAX_SPEAKERS,
+            },
+            "Subtitles": {
+                "Formats": ["vtt"],
+                "OutputStartIndex": 1,
             },
         }
         if output_bucket:

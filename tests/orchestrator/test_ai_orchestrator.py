@@ -455,6 +455,53 @@ class TestWebhook:
         payload = mock_send.call_args[0][2]
         assert payload["signal"] == "transcription_ready"
 
+    @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
+    def test_video_webhook_includes_vtt_key(self, mock_send, orchestrator):
+        orch, s3, lam = orchestrator
+        meta = _make_meta(ai_enabled=True, media_type="video/mp4", callback_url="https://drupal.example.com/hook")
+        meta["content"]["filename"] = "lecture.mp4"
+        s3.get_object.return_value = _s3_get_object_response(meta)
+
+        transcription_body = {
+            "transcript": "text", "duration": "00:05:00",
+            "duration_seconds": 300, "speaker_count": 1,
+            "vtt_s3_key": "transcribe-output/job.vtt",
+        }
+        bedrock_body = {"abstract": "a", "keywords": [], "learning_level": "Expert"}
+        lam.invoke.side_effect = [
+            _lambda_invoke_response(200, transcription_body),
+            _lambda_invoke_response(200, bedrock_body),
+        ]
+
+        orch.process("bucket", "AESS/pending/lecture.mp4")
+
+        # VTT file should be copied to subtitles path (meta_ou = "PES" from fixture)
+        s3.copy_object.assert_any_call(
+            Bucket="bucket",
+            CopySource={"Bucket": "bucket", "Key": "transcribe-output/job.vtt"},
+            Key="PES/subtitles/STD-12345.vtt",
+        )
+
+        # Webhook should include vtt_s3_key
+        payload = mock_send.call_args[0][2]
+        assert payload["vtt_s3_key"] == "PES/subtitles/STD-12345.vtt"
+
+    @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
+    def test_pdf_webhook_has_no_vtt_key(self, mock_send, orchestrator):
+        orch, s3, lam = orchestrator
+        meta = _make_meta(ai_enabled=True, callback_url="https://drupal.example.com/hook")
+        s3.get_object.return_value = _s3_get_object_response(meta)
+
+        lam.invoke.side_effect = [
+            _lambda_invoke_response(200, {"text": "text", "page_count": 5}),
+            _lambda_invoke_response(200, {"abstract": "a", "keywords": [], "learning_level": "Expert"}),
+        ]
+
+        orch.process("bucket", "PES/pending/STD-12345.pdf")
+
+        payload = mock_send.call_args[0][2]
+        assert payload["vtt_s3_key"] is None
+
     def test_no_callback_url_skips(self, orchestrator):
         orch, s3, lam = orchestrator
         meta = _make_meta(ai_enabled=True)  # No callback_url

@@ -192,6 +192,22 @@ class AIOrchestrator:
         else:
             logger.warning("%s No text extracted — skipping Bedrock", correlation)
 
+        # Step 5a: Copy VTT subtitle file if present (video transcriptions)
+        vtt_key = ""
+        if media_type in VIDEO_MEDIA_TYPES:
+            source_vtt_key = extraction_result.get("vtt_s3_key", "")
+            if source_vtt_key:
+                vtt_key = f"{meta_ou}/subtitles/{product_part_number}.vtt"
+                self._s3.copy_object(
+                    Bucket=bucket,
+                    CopySource={"Bucket": bucket, "Key": source_vtt_key},
+                    Key=vtt_key,
+                )
+                logger.info(
+                    "%s Copied VTT subtitle to s3://%s/%s",
+                    correlation, bucket, vtt_key,
+                )
+
         # Step 5: Send webhook to Drupal
         callback_url = meta.get("callback_url") or meta.get("webhook_url")
         webhook_sent = False
@@ -214,6 +230,7 @@ class AIOrchestrator:
                 .replace("+00:00", "Z"),
                 "extraction": extraction_result,
                 "data": bedrock_result,
+                "vtt_s3_key": vtt_key if vtt_key else None,
             }
             webhook_sent = self._webhook_sender.send(
                 callback_url, DRUPAL_WEBHOOK_SECRET, payload, correlation,
