@@ -246,6 +246,20 @@ class BedrockInference:
 
         self._validate_result(parsed)
 
+        # Normalize keywords: resolve case, synonyms, and acronyms to exact
+        # IEEE Thesaurus preferred terms (e.g., "Deep Learning" → "Deep learning",
+        # "AI" → "Artificial intelligence", "Rectenna" → "Rectennas").
+        if self._thesaurus.term_count > 0:
+            raw_keywords = parsed["keywords"]
+            parsed["keywords"] = self._thesaurus.normalize_keywords(raw_keywords)
+            changes = [
+                f"{old!r} → {new!r}"
+                for old, new in zip(raw_keywords, parsed["keywords"])
+                if old != new
+            ]
+            if changes:
+                logger.info("Normalized keywords: %s", "; ".join(changes))
+
         # Measure thesaurus coverage
         coverage_count = 0
         if self._thesaurus.term_count > 0:

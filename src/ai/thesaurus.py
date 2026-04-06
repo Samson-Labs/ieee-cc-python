@@ -160,6 +160,42 @@ class ThesaurusSearch:
             for term, _score in sorted_terms
         ]
 
+    def normalize_keyword(self, keyword: str) -> str:
+        """Resolve a keyword to its exact IEEE Thesaurus preferred term.
+
+        Checks (in order):
+        1. Exact preferred term (case-insensitive) → return canonical form
+        2. USE FOR synonym (case-insensitive) → return preferred term
+        3. No match → return keyword unchanged
+
+        This fixes LLM issues like wrong capitalization ("Deep Learning" →
+        "Deep learning"), wrong pluralization ("Rectenna" → "Rectennas"),
+        and acronyms ("AI" → "Artificial intelligence").
+        """
+        lower = keyword.strip().lower()
+
+        # Check preferred terms
+        if lower in self._preferred_lower:
+            return self._preferred_lower[lower]
+
+        # Check synonyms (includes acronyms)
+        if lower in self._synonym_index:
+            return self._synonym_index[lower]
+
+        return keyword
+
+    def normalize_keywords(self, keywords: list[str]) -> list[str]:
+        """Normalize a list of keywords, preserving order and deduplicating."""
+        seen: set[str] = set()
+        normalized: list[str] = []
+        for kw in keywords:
+            norm = self.normalize_keyword(kw)
+            key = norm.lower()
+            if key not in seen:
+                seen.add(key)
+                normalized.append(norm)
+        return normalized
+
     def is_preferred_term(self, term: str) -> bool:
         """Check if a term exists in the thesaurus (case-insensitive)."""
         return term.strip().lower() in self._preferred_lower

@@ -243,6 +243,32 @@ class TestCoverage:
 # ---------------------------------------------------------------------------
 
 
+class TestNormalize:
+    def test_case_correction(self, thesaurus):
+        assert thesaurus.normalize_keyword("Deep Learning") == "Deep learning"
+        assert thesaurus.normalize_keyword("MACHINE LEARNING") == "Machine learning"
+
+    def test_synonym_resolution(self, thesaurus):
+        assert thesaurus.normalize_keyword("ML") == "Machine learning"
+        assert thesaurus.normalize_keyword("AI") == "Artificial intelligence"
+        assert thesaurus.normalize_keyword("ANN") == "Neural networks"
+
+    def test_unknown_unchanged(self, thesaurus):
+        assert thesaurus.normalize_keyword("Monetary Policy") == "Monetary Policy"
+
+    def test_normalize_list(self, thesaurus):
+        result = thesaurus.normalize_keywords([
+            "Deep Learning", "ML", "Monetary Policy",
+        ])
+        assert result == ["Deep learning", "Machine learning", "Monetary Policy"]
+
+    def test_deduplication(self, thesaurus):
+        result = thesaurus.normalize_keywords([
+            "Machine learning", "ML",  # both resolve to same
+        ])
+        assert result == ["Machine learning"]
+
+
 class TestRealThesaurus:
     """Integration tests using the actual IEEE Thesaurus file if available."""
 
