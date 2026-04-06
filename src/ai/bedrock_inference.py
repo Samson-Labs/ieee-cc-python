@@ -120,12 +120,18 @@ SYSTEM_PROMPT = (
     "before or after the JSON. Do not wrap it in markdown code fences."
 )
 
-# Fallback keyword instruction when thesaurus tool is not available
-KEYWORDS_NO_TOOL = (
+# System prompt WITHOUT tool reference — used for JSON retry and non-tool path
+SYSTEM_PROMPT_NO_TOOL = SYSTEM_PROMPT.replace(
+    '2. **keywords** — An array of 8–12 keyword strings. Before selecting keywords, '
+    "use the search_ieee_thesaurus tool to find standardized IEEE terms for the "
+    "content's main topics (make 2-3 searches covering different topic areas). "
+    "Strongly prefer IEEE Thesaurus terms. If the content covers topics not "
+    "well-represented in the IEEE Thesaurus, you may include a small number of "
+    "specific non-thesaurus terms, but thesaurus terms should be the majority.",
     '2. **keywords** — An array of 8–12 keyword strings that capture the content\'s '
     "core topics, technologies, methodologies, and application domains. Prefer specific "
     "technical terms over generic ones. When a relevant IEEE Thesaurus term exists, "
-    "prefer it over a synonym.\n\n"
+    "prefer it over a synonym.",
 )
 
 JSON_RETRY_SUFFIX = (
@@ -216,10 +222,11 @@ class BedrockInference:
 
         parsed = self._try_parse_json(raw)
 
-        # If JSON parsing failed, retry once with explicit JSON instruction
+        # If JSON parsing failed, retry once with explicit JSON instruction.
+        # Use the no-tool prompt to avoid the LLM hallucinating tool calls.
         if parsed is None:
             logger.warning("Invalid JSON response, retrying with explicit instruction")
-            retry_prompt = SYSTEM_PROMPT + JSON_RETRY_SUFFIX
+            retry_prompt = SYSTEM_PROMPT_NO_TOOL + JSON_RETRY_SUFFIX
             raw, retry_in, retry_out = self._invoke(retry_prompt, truncated_text)
             input_tokens += retry_in
             output_tokens += retry_out
