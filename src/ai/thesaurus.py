@@ -18,6 +18,15 @@ DEFAULT_DATA_PATH = os.path.join(
 )
 
 
+def _stem(word: str) -> str:
+    """Crude stemmer: strip common suffixes for fuzzy word matching."""
+    w = word.lower()
+    for suffix in ("tion", "sion", "ing", "ment", "ness", "ers", "ors", "es", "ed", "ly", "s"):
+        if len(w) > len(suffix) + 2 and w.endswith(suffix):
+            return w[: -len(suffix)]
+    return w
+
+
 class ThesaurusSearch:
     """Search index over IEEE Thesaurus v1.04 for keyword grounding."""
 
@@ -26,6 +35,7 @@ class ThesaurusSearch:
         self._preferred_lower: dict[str, str] = {}  # lowered → original
         self._synonym_index: dict[str, str] = {}  # lowered synonym → preferred term
         self._word_index: dict[str, set[str]] = defaultdict(set)  # word → preferred terms
+        self._stem_index: dict[str, set[str]] = defaultdict(set)  # stemmed word → preferred terms
         self._scope_notes: dict[str, str] = {}  # preferred term → scope note
         self._broader: dict[str, list[str]] = {}  # preferred term → broader terms
 
@@ -57,6 +67,7 @@ class ThesaurusSearch:
             for word in pref.lower().split():
                 if len(word) > 2:
                     self._word_index[word].add(pref)
+                    self._stem_index[_stem(word)].add(pref)
 
             # Index USE FOR synonyms
             for syn in entry.get("use_for", []):
@@ -66,6 +77,7 @@ class ThesaurusSearch:
                     for word in syn_stripped.lower().split():
                         if len(word) > 2:
                             self._word_index[word].add(pref)
+                            self._stem_index[_stem(word)].add(pref)
 
         logger.info(
             "Loaded IEEE Thesaurus: %d preferred terms, %d synonyms",
@@ -93,6 +105,7 @@ class ThesaurusSearch:
         results: dict[str, float] = {}
         query_lower = query.lower()
         query_words = {w for w in query_lower.split() if len(w) > 2}
+        query_stems = {_stem(w) for w in query_words}
 
         # Strategy 1: Exact match on preferred term or synonym (highest score)
         if query_lower in self._preferred_lower:
@@ -102,18 +115,37 @@ class ThesaurusSearch:
             pref = self._synonym_index[query_lower]
             results[pref] = results.get(pref, 0) + 90.0
 
+        # Strategy 1b: Multi-word sub-phrases from the query against terms/synonyms
+        words_list = query_lower.split()
+        for i in range(len(words_list)):
+            for j in range(i + 2, min(i + 5, len(words_list) + 1)):
+                phrase = " ".join(words_list[i:j])
+                if phrase in self._preferred_lower:
+                    pref = self._preferred_lower[phrase]
+                    results[pref] = max(results.get(pref, 0), 80.0)
+                if phrase in self._synonym_index:
+                    pref = self._synonym_index[phrase]
+                    results[pref] = max(results.get(pref, 0), 75.0)
+
         # Strategy 2: Substring match on preferred terms
         for pref_lower, pref in self._preferred_lower.items():
             if query_lower in pref_lower or pref_lower in query_lower:
                 results[pref] = max(results.get(pref, 0), 50.0)
 
-        # Strategy 3: Word-overlap scoring
+        # Strategy 3: Word-overlap scoring (exact words)
         for word in query_words:
             for pref in self._word_index.get(word, set()):
                 pref_words = set(pref.lower().split())
                 overlap = len(query_words & pref_words)
-                # Score based on overlap ratio relative to term length
                 score = (overlap / max(len(pref_words), 1)) * 30.0
+                results[pref] = max(results.get(pref, 0), score)
+
+        # Strategy 4: Stem-overlap scoring (handles plurals, -ing, -tion, etc.)
+        for stem in query_stems:
+            for pref in self._stem_index.get(stem, set()):
+                pref_stems = {_stem(w) for w in pref.lower().split() if len(w) > 2}
+                overlap = len(query_stems & pref_stems)
+                score = (overlap / max(len(pref_stems), 1)) * 25.0
                 results[pref] = max(results.get(pref, 0), score)
 
         # Sort by score descending, limit results
