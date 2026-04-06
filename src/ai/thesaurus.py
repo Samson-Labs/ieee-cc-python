@@ -23,11 +23,24 @@ DEFAULT_CUSTOM_SYNONYMS_PATH = os.path.join(
 
 
 def _stem(word: str) -> str:
-    """Crude stemmer: strip common suffixes for fuzzy word matching."""
+    """Crude stemmer: strip common suffixes for fuzzy word matching.
+
+    Aims for convergence: "detection", "detectors", "detecting" all → "detect".
+    Uses two-pass stripping for compound suffixes (e.g., -tion then -t).
+    """
     w = word.lower()
-    for suffix in ("tion", "sion", "ing", "ment", "ness", "ers", "ors", "es", "ed", "ly", "s"):
+    # Pass 1: strip primary suffixes
+    for suffix in ("ation", "tion", "sion", "ment", "ness", "ing", "ors", "ers", "or", "er", "es", "ed", "ly", "s"):
         if len(w) > len(suffix) + 2 and w.endswith(suffix):
-            return w[: -len(suffix)]
+            w = w[: -len(suffix)]
+            break
+    # Pass 2: normalize residual endings so "detec" → "detect" converges
+    # with "detect". We add back common consonant endings if the stem
+    # looks truncated (ends in vowel + consonant pair).
+    # Simpler approach: just use first N chars as the stem for matching.
+    # 5 chars is enough to distinguish most roots while allowing convergence.
+    if len(w) > 5:
+        return w[:5]
     return w
 
 
@@ -40,6 +53,7 @@ class ThesaurusSearch:
         self._synonym_index: dict[str, str] = {}  # lowered synonym → preferred term
         self._word_index: dict[str, set[str]] = defaultdict(set)  # word → preferred terms
         self._stem_index: dict[str, set[str]] = defaultdict(set)  # stemmed word → preferred terms
+        self._stem_to_terms: dict[frozenset, str] = {}  # frozenset of stems → preferred term
         self._scope_notes: dict[str, str] = {}  # preferred term → scope note
         self._broader: dict[str, list[str]] = {}  # preferred term → broader terms
 
@@ -86,6 +100,16 @@ class ThesaurusSearch:
                         if len(word) > 2:
                             self._word_index[word].add(pref)
                             self._stem_index[_stem(word)].add(pref)
+
+        # Build stem signature index for fuzzy normalization.
+        # Maps frozenset(stems) → preferred term for multi-word terms (≥2 words).
+        for pref in self._preferred_terms:
+            words = [w for w in pref.lower().split() if len(w) > 2]
+            if len(words) >= 2:
+                stems = frozenset(_stem(w) for w in words)
+                # Only store if not already claimed (first-come wins)
+                if stems not in self._stem_to_terms:
+                    self._stem_to_terms[stems] = pref
 
         # Auto-generate singular forms for plural preferred terms.
         # Many thesaurus terms are plural ("Rectennas", "AC motors") but the LLM
@@ -228,7 +252,10 @@ class ThesaurusSearch:
         Checks (in order):
         1. Exact preferred term (case-insensitive) → return canonical form
         2. USE FOR synonym (case-insensitive) → return preferred term
-        3. No match → return keyword unchanged
+        3. Fuzzy stem match — if the keyword's stems are a superset of a
+           preferred term's stems, return that term (e.g., "gas detection
+           sensor" → "Gas detectors" because stems {gas, detect} ⊆ {gas, detect, sensor})
+        4. No match → return keyword unchanged
 
         This fixes LLM issues like wrong capitalization ("Deep Learning" →
         "Deep learning"), wrong pluralization ("Rectenna" → "Rectennas"),
@@ -240,9 +267,26 @@ class ThesaurusSearch:
         if lower in self._preferred_lower:
             return self._preferred_lower[lower]
 
-        # Check synonyms (includes acronyms)
+        # Check synonyms (includes acronyms and auto-singulars)
         if lower in self._synonym_index:
             return self._synonym_index[lower]
+
+        # Fuzzy stem match: keyword stems must be a superset of a term's stems
+        kw_words = [w for w in lower.split() if len(w) > 2]
+        if len(kw_words) >= 2:
+            kw_stems = frozenset(_stem(w) for w in kw_words)
+            best_match = None
+            best_len = 0
+            for term_stems, pref in self._stem_to_terms.items():
+                # Term's stems must be a subset of keyword's stems
+                # and term must have ≥2 stems to avoid false positives
+                if len(term_stems) >= 2 and term_stems <= kw_stems:
+                    # Prefer the longest (most specific) match
+                    if len(term_stems) > best_len:
+                        best_len = len(term_stems)
+                        best_match = pref
+            if best_match:
+                return best_match
 
         return keyword
 

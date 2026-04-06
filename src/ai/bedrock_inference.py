@@ -260,6 +260,24 @@ class BedrockInference:
             if changes:
                 logger.info("Normalized keywords: %s", "; ".join(changes))
 
+            # When we have enough thesaurus matches (≥8), drop non-thesaurus
+            # terms — prefer a clean set of standardized terms.
+            thesaurus_kws = [
+                kw for kw in parsed["keywords"]
+                if self._thesaurus.is_preferred_term(kw)
+            ]
+            non_thesaurus = [
+                kw for kw in parsed["keywords"]
+                if not self._thesaurus.is_preferred_term(kw)
+            ]
+            if len(thesaurus_kws) >= 8:
+                if non_thesaurus:
+                    logger.info(
+                        "Dropping %d non-thesaurus keywords (have %d thesaurus matches): %s",
+                        len(non_thesaurus), len(thesaurus_kws), non_thesaurus,
+                    )
+                parsed["keywords"] = thesaurus_kws
+
         # Measure thesaurus coverage
         coverage_count = 0
         if self._thesaurus.term_count > 0:
