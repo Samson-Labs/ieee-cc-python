@@ -143,6 +143,8 @@ Docker-based Lambdas deployed via AWS CLI (no CDK/SAM). Each Lambda has its own 
 - Meta config: `{ou}/metadata/{item_id}.meta.json`
 - Processed output: `{ou}/processed/{item_id}.{ext}`
 - DLQ archive: `failed/{correlation_id}/{timestamp}.json`
+- WebVTT subtitle (transcribe output): `transcribe-output/{job_name}.vtt`
+- WebVTT subtitle (orchestrator copy): `{ou}/subtitles/{product_part_number}.vtt`
 - Bulk manifest: `bulk/manifests/{batch_id}.json`
 - Bulk progress: `bulk/progress/{batch_id}_progress.json`
 
