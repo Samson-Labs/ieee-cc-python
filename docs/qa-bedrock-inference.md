@@ -225,14 +225,48 @@ aws lambda invoke \
 - **Result:** PASSED (expected error)
 - **Response:** `statusCode: 400`, `error: "No extractedText in s3://..."`
 
+### Test 5: IEEE Thesaurus Tool Use — Engineering Content
+- **Date:** 2026-04-06
+- **Result:** PASSED
+- **Response:**
+  ```
+  statusCode: 200
+  keywords: Deep learning, Load forecasting, Deep reinforcement learning, Transfer learning,
+            Fault detection, Energy storage, Renewable energy sources, Photovoltaic systems,
+            Power systems, Smart grid, Microgrids, Model predictive control
+  thesaurus_coverage: 10/12
+  processing_time_ms: 13,136
+  input_tokens: 5,830
+  ```
+- **Tool calls:** LLM searched thesaurus for smart grid, deep learning, power systems topics
+- **Verification:** 10 of 12 keywords are IEEE Thesaurus preferred terms
+
+### Test 6: IEEE Thesaurus Tool Use — Non-IEEE Content (Economics)
+- **Date:** 2026-04-06
+- **Result:** PASSED (expected low coverage)
+- **Response:**
+  ```
+  statusCode: 200
+  keywords: monetary policy, interest rates, inflation, Consumer Price Index,
+            Federal Open Market Committee, interest rate policy, price stability,
+            household consumption, central banking, macroeconomics
+  thesaurus_coverage: 1/10
+  processing_time_ms: 21,017
+  input_tokens: 8,176
+  ```
+- **Tool calls:** LLM searched for monetary policy, consumer price index, macroeconomics topics
+- **Verification:** Only "macroeconomics" matched — expected, as IEEE Thesaurus does not cover monetary economics. LLM correctly fell back to domain-appropriate non-thesaurus terms.
+
 ### Results Summary
 
-| # | Test Case | Status | Processing Time |
-|---|-----------|--------|----------------|
-| 1 | Direct text — technical report | PASSED | 6,774ms |
-| 2 | Direct text with thesaurus terms | PASSED | 16,097ms |
-| 3 | Empty text rejection | PASSED | N/A |
-| 4 | S3 reference without extractedText | PASSED | N/A |
+| # | Test Case | Status | Processing Time | Thesaurus Coverage |
+|---|-----------|--------|----------------|-------------------|
+| 1 | Direct text — technical report | PASSED | 6,774ms | N/A (pre-thesaurus) |
+| 2 | Direct text with thesaurus terms | PASSED | 16,097ms | N/A (pre-thesaurus) |
+| 3 | Empty text rejection | PASSED | N/A | N/A |
+| 4 | S3 reference without extractedText | PASSED | N/A | N/A |
+| 5 | Thesaurus tool use — engineering | PASSED | 13,136ms | 10/12 (83%) |
+| 6 | Thesaurus tool use — economics | PASSED | 21,017ms | 1/10 (10%) |
 
 ---
 
@@ -240,31 +274,43 @@ aws lambda invoke \
 
 | Test File | Tests | Description |
 |-----------|-------|-------------|
-| `tests/ai/test_bedrock_inference.py` | 25 | Bedrock calls, retries, JSON parsing, validation, thesaurus |
+| `tests/ai/test_bedrock_inference.py` | 30 | Bedrock calls, retries, JSON parsing, validation, thesaurus, tool use |
+| `tests/ai/test_thesaurus.py` | 20 | Thesaurus loading, search, coverage, integration with real data |
 | `tests/handlers/test_bedrock_handler.py` | 9 | Direct invocation, S3 invocation, error handling |
-| **Total** | **34** | All passing |
+| **Total** | **59** | All passing |
 
-### Test Classes
+### Test Classes (bedrock_inference)
 
 | Class | Tests | Coverage |
 |-------|-------|----------|
-| `TestGenerateMetadata` | 3 | Successful generation, text truncation, thesaurus append |
-| `TestRetries` | 4 | Throttle retry with backoff, max retries exceeded, invalid JSON retry, non-retryable error |
-| `TestBuildMessages` | 3 | Message construction, system prompt, thesaurus context |
-| `TestValidation` | 9 | Abstract paragraphs, word count, keywords count, learning level, audience, category |
-| `TestProcessingTime` | 1 | processing_time_ms populated |
-| `TestDirectInvocation` | 3 | Success, thesaurus terms, empty text |
-| `TestS3Invocation` | 2 | S3 text read, empty extracted text |
-| `TestErrorHandling` | 3 | Validation 422, Bedrock 500, unexpected 500 |
+| `TestGenerateMetadata` | 6 | Successful generation, text truncation, thesaurus append, env model ID, processing time |
+| `TestThrottleRetry` | 4 | Throttle retry with backoff, max retries exceeded, exponential backoff, non-retryable error |
+| `TestInvalidJsonRetry` | 3 | Invalid JSON retry, retry failure, markdown fence stripping |
+| `TestValidation` | 12 | Abstract paragraphs, word count, keywords count, learning level, audience, category, all valid values |
+| `TestCloudWatchMetrics` | 3 | Token metrics, accumulation on retry, no metrics without client |
+| `TestToolUse` | 7 | Tool in request, tool-use loop, multiple calls, explicit thesaurus skip, coverage in result, zero coverage, max iterations safety |
+
+### Test Classes (thesaurus)
+
+| Class | Tests | Coverage |
+|-------|-------|----------|
+| `TestLoading` | 3 | Load terms, missing file, empty terms |
+| `TestSearch` | 11 | Exact match, case-insensitive, synonym, acronym, multi-word, substring, word-overlap, no match, empty query, limit, scope notes, broader terms |
+| `TestIsPreferredTerm` | 4 | Exact match, case-insensitive, synonym not preferred, unknown term |
+| `TestCoverage` | 4 | All matched, none matched, partial match, case-insensitive |
+| `TestRealThesaurus` | 4 | Loads thousands of terms, finds terms, economics terms, non-IEEE terms not preferred |
 
 ### Run Tests
 
 ```bash
-# All Bedrock tests
-python -m pytest tests/ai/test_bedrock_inference.py tests/handlers/test_bedrock_handler.py -v
+# All Bedrock + thesaurus tests
+python -m pytest tests/ai/ tests/handlers/test_bedrock_handler.py -v
 
-# Single test class
-python -m pytest tests/ai/test_bedrock_inference.py::TestRetries -v
+# Tool use tests only
+python -m pytest tests/ai/test_bedrock_inference.py::TestToolUse -v
+
+# Thesaurus tests only
+python -m pytest tests/ai/test_thesaurus.py -v
 ```
 
 ## Error Handling
