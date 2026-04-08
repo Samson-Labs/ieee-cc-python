@@ -95,7 +95,7 @@ _PROMPT_PREAMBLE = (
 )
 
 _KEYWORDS_WITH_TOOL = (
-    '2. **keywords** — An array of 8–12 keyword strings. Before selecting keywords, '
+    '**keywords** — An array of 8–12 keyword strings. Before selecting keywords, '
     "use the search_ieee_thesaurus tool to find standardized IEEE terms for the "
     "content's main topics (make 2-3 searches covering different topic areas). "
     "When using an IEEE Thesaurus term, copy the exact preferred_term string from the "
@@ -108,7 +108,7 @@ _KEYWORDS_WITH_TOOL = (
 )
 
 _KEYWORDS_NO_TOOL = (
-    '2. **keywords** — An array of 8–12 keyword strings that capture the content\'s '
+    '**keywords** — An array of 8–12 keyword strings that capture the content\'s '
     "core topics, technologies, methodologies, and application domains. Prefer specific "
     "technical terms over generic ones. When a relevant IEEE Thesaurus term exists, "
     "prefer it over a synonym.\n\n"
@@ -160,16 +160,11 @@ def _build_system_prompt(
     """Assemble system prompt with only the requested field instructions.
 
     Fields are numbered sequentially (1, 2, 3...) regardless of which are
-    included. The abstract instruction comes from _PROMPT_PREAMBLE (already
-    numbered as 1), and keywords from the tool/no-tool variant (numbered 2).
-    Remaining fields from _FIELD_INSTRUCTIONS are numbered starting after
-    keywords.
+    included. Each field instruction (from _FIELD_INSTRUCTIONS or keyword
+    constants) is prefixed with its number.
     """
     parts = [_PROMPT_PREAMBLE]
 
-    # Abstract is embedded in the preamble — only include preamble's abstract
-    # instruction when abstract is requested. We handle this by conditionally
-    # including the abstract block.
     num = 1
     if "abstract" in requested_fields:
         parts.append(f"{num}. {_FIELD_INSTRUCTIONS['abstract']}")
@@ -177,14 +172,11 @@ def _build_system_prompt(
 
     if "keywords" in requested_fields:
         kw_block = _KEYWORDS_WITH_TOOL if use_tool else _KEYWORDS_NO_TOOL
-        # Replace hardcoded "2." with dynamic numbering
-        kw_block = kw_block.replace("2. ", f"{num}. ", 1)
-        parts.append(kw_block)
+        parts.append(f"{num}. {kw_block}")
         num += 1
 
     for field in ["learning_level", "intended_audience", "category"]:
         if field in requested_fields:
-            # Replace hardcoded numbering with dynamic
             parts.append(f"{num}. {_FIELD_INSTRUCTIONS[field]}")
             num += 1
 

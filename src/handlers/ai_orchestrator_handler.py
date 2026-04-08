@@ -17,7 +17,7 @@ from botocore.exceptions import ClientError
 
 from src.ai.bedrock_inference import ALL_FIELDS
 from src.common.dlq import build_dlq_message
-from src.orchestrator.ai_orchestrator import AIOrchestrator
+from src.orchestrator.ai_orchestrator import AIOrchestrator, VALID_INPUT_TEXT_MODES
 
 logger = logging.getLogger()
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
@@ -152,9 +152,6 @@ def _parse_event(event: dict) -> tuple[str, str]:
     return bucket, key
 
 
-VALID_INPUT_TEXT_MODES = frozenset({"as_source", "as_abstract"})
-
-
 def _validate_direct_meta(meta: dict) -> None:
     """Validate meta dict for direct invocation (text-only path)."""
     if not isinstance(meta, dict):
@@ -166,6 +163,11 @@ def _validate_direct_meta(meta: dict) -> None:
     for field in ("item_id", "ai_enrichment_enabled"):
         if field not in meta:
             raise ValueError(f"Direct invocation meta missing required field: {field}")
+
+    # Validate content.media_type is present
+    content = meta.get("content")
+    if not isinstance(content, dict) or "media_type" not in content:
+        raise ValueError("Direct invocation meta must include content.media_type")
 
     mode = meta.get("input_text_mode", "as_source")
     if mode not in VALID_INPUT_TEXT_MODES:

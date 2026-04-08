@@ -172,3 +172,93 @@ class TestContextHandling:
 
         call_kwargs = mock_orchestrator.process.call_args[1]
         assert call_kwargs["request_id"] == ""
+
+
+# ---------------------------------------------------------------
+# CC3-858: Direct Meta Invocation
+# ---------------------------------------------------------------
+
+def _make_direct_meta_event(
+    input_text="User abstract text",
+    input_text_mode="as_source",
+    requested_fields=None,
+):
+    meta = {
+        "item_id": "12345",
+        "ai_enrichment_enabled": True,
+        "input_text": input_text,
+        "input_text_mode": input_text_mode,
+        "content": {"media_type": "text", "resource_center": "PES"},
+        "ou": "PES",
+        "callback_url": "https://drupal.example.com/hook",
+    }
+    if requested_fields:
+        meta["requested_fields"] = requested_fields
+    return {"bucket": "test-bucket", "meta": meta}
+
+
+class TestDirectMetaInvocation:
+    def test_happy_path_returns_200(self, mock_orchestrator):
+        event = _make_direct_meta_event()
+        result = handler(event, None)
+
+        assert result["statusCode"] == 200
+        call_kwargs = mock_orchestrator.process.call_args[1]
+        assert call_kwargs["key"] is None
+        assert call_kwargs["meta"]["input_text"] == "User abstract text"
+        assert call_kwargs["bucket"] == "test-bucket"
+
+    def test_missing_input_text_returns_400(self, mock_orchestrator):
+        event = _make_direct_meta_event()
+        del event["meta"]["input_text"]
+        result = handler(event, None)
+
+        assert result["statusCode"] == 400
+        assert "input_text" in result["body"]["error"]
+        mock_orchestrator.process.assert_not_called()
+
+    def test_invalid_input_text_mode_returns_400(self, mock_orchestrator):
+        event = _make_direct_meta_event(input_text_mode="bad_mode")
+        result = handler(event, None)
+
+        assert result["statusCode"] == 400
+        assert "input_text_mode" in result["body"]["error"]
+        mock_orchestrator.process.assert_not_called()
+
+    def test_missing_content_returns_400(self, mock_orchestrator):
+        event = _make_direct_meta_event()
+        del event["meta"]["content"]
+        result = handler(event, None)
+
+        assert result["statusCode"] == 400
+        assert "content" in result["body"]["error"]
+        mock_orchestrator.process.assert_not_called()
+
+    def test_s3_event_still_routes_correctly(self, mock_orchestrator):
+        """Backward compat: S3 events bypass the meta branch."""
+        event = {
+            "Records": [{
+                "s3": {
+                    "bucket": {"name": "bucket"},
+                    "object": {"key": "PES/pending/STD-12345.pdf"},
+                }
+            }]
+        }
+        result = handler(event, None)
+
+        assert result["statusCode"] == 200
+        call_kwargs = mock_orchestrator.process.call_args[1]
+        assert call_kwargs["key"] == "PES/pending/STD-12345.pdf"
+        assert "meta" not in call_kwargs or call_kwargs.get("meta") is None
+
+    @patch("src.handlers.ai_orchestrator_handler._sqs_client")
+    @patch("src.handlers.ai_orchestrator_handler.DLQ_QUEUE_URL", "https://sqs/dlq")
+    def test_processing_error_publishes_to_dlq(self, mock_sqs, mock_orchestrator):
+        """DLQ receives the original direct invocation event on failure."""
+        mock_orchestrator.process.side_effect = RuntimeError("Bedrock down")
+        event = _make_direct_meta_event()
+
+        result = handler(event, None)
+
+        assert result["statusCode"] == 500
+        mock_sqs.send_message.assert_called_once()
