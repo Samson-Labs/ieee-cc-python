@@ -39,8 +39,8 @@ def _stem(word: str) -> str:
     # looks truncated (ends in vowel + consonant pair).
     # Simpler approach: just use first N chars as the stem for matching.
     # 5 chars is enough to distinguish most roots while allowing convergence.
-    if len(w) > 5:
-        return w[:5]
+    if len(w) > 7:
+        return w[:7]
     return w
 
 
@@ -72,7 +72,7 @@ class ThesaurusSearch:
         return len(self._preferred_terms)
 
     def _load(self, path: str) -> None:
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             data = json.load(f)
 
         for entry in data.get("terms", []):
@@ -118,9 +118,9 @@ class ThesaurusSearch:
         auto_count = 0
         for pref in list(self._preferred_terms):
             pref_lower = pref.lower()
-            for suffix, cut in [("ies", 1), ("ses", 2), ("es", 2), ("s", 1)]:
+            for suffix, cut, add in [("ies", 3, "y"), ("ses", 2, ""), ("es", 2, ""), ("s", 1, "")]:
                 if pref_lower.endswith(suffix) and len(pref) > len(suffix) + 3:
-                    singular = pref[:-cut] if cut else pref
+                    singular = (pref[:-cut] + add) if cut else pref
                     singular_lower = singular.lower()
                     # Only add if the singular isn't already a term or synonym
                     if (
@@ -148,7 +148,7 @@ class ThesaurusSearch:
         common abbreviations, singular/plural variants, and other
         mappings that the thesaurus doesn't cover natively.
         """
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             mappings = json.load(f)
 
         count = 0

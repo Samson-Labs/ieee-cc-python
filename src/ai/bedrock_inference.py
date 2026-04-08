@@ -35,6 +35,7 @@ BACKOFF_BASE = 1  # seconds: 1, 2, 4
 
 # Tool-use conversation loop limit
 MAX_TOOL_ITERATIONS = 5
+MIN_THESAURUS_KEYWORDS = 8
 
 VALID_LEARNING_LEVELS = frozenset([
     "Foundational",
@@ -80,7 +81,7 @@ THESAURUS_TOOL = {
     },
 }
 
-SYSTEM_PROMPT = (
+_PROMPT_PREAMBLE = (
     "You are a Technical Metadata Specialist for the IEEE (Institute of Electrical "
     "and Electronics Engineers). Your role is to analyze technical content and "
     "generate structured metadata that helps categorize, discover, and recommend "
@@ -96,6 +97,9 @@ SYSTEM_PROMPT = (
     "The first paragraph should describe the main topic, approach, and scope of the "
     "presentation or publication. "
     "The second paragraph should cover key findings, contributions, and implications.\n\n"
+)
+
+_KEYWORDS_WITH_TOOL = (
     '2. **keywords** — An array of 8–12 keyword strings. Before selecting keywords, '
     "use the search_ieee_thesaurus tool to find standardized IEEE terms for the "
     "content's main topics (make 2-3 searches covering different topic areas). "
@@ -106,6 +110,16 @@ SYSTEM_PROMPT = (
     "Strongly prefer IEEE Thesaurus terms. If the content covers topics not "
     "well-represented in the IEEE Thesaurus, you may include a small number of "
     "specific non-thesaurus terms, but thesaurus terms should be the majority.\n\n"
+)
+
+_KEYWORDS_NO_TOOL = (
+    '2. **keywords** — An array of 8–12 keyword strings that capture the content\'s '
+    "core topics, technologies, methodologies, and application domains. Prefer specific "
+    "technical terms over generic ones. When a relevant IEEE Thesaurus term exists, "
+    "prefer it over a synonym.\n\n"
+)
+
+_PROMPT_SUFFIX = (
     '3. **learning_level** — One of the following:\n'
     '   - "Foundational" — introductory material suitable for students or newcomers\n'
     '   - "Professional" — intermediate material for practicing engineers\n'
@@ -124,23 +138,10 @@ SYSTEM_PROMPT = (
     "before or after the JSON. Do not wrap it in markdown code fences."
 )
 
+SYSTEM_PROMPT = _PROMPT_PREAMBLE + _KEYWORDS_WITH_TOOL + _PROMPT_SUFFIX
+
 # System prompt WITHOUT tool reference — used for JSON retry and non-tool path
-SYSTEM_PROMPT_NO_TOOL = SYSTEM_PROMPT.replace(
-    '2. **keywords** — An array of 8–12 keyword strings. Before selecting keywords, '
-    "use the search_ieee_thesaurus tool to find standardized IEEE terms for the "
-    "content's main topics (make 2-3 searches covering different topic areas). "
-    "When using an IEEE Thesaurus term, copy the exact preferred_term string from the "
-    "tool result — do not change capitalization, punctuation, pluralization, or wording "
-    '(e.g., use "Deep learning" not "Deep Learning", "Rectennas" not "Rectenna", '
-    '"DC-DC power converters" not "DC DC Converter"). '
-    "Strongly prefer IEEE Thesaurus terms. If the content covers topics not "
-    "well-represented in the IEEE Thesaurus, you may include a small number of "
-    "specific non-thesaurus terms, but thesaurus terms should be the majority.",
-    '2. **keywords** — An array of 8–12 keyword strings that capture the content\'s '
-    "core topics, technologies, methodologies, and application domains. Prefer specific "
-    "technical terms over generic ones. When a relevant IEEE Thesaurus term exists, "
-    "prefer it over a synonym.",
-)
+SYSTEM_PROMPT_NO_TOOL = _PROMPT_PREAMBLE + _KEYWORDS_NO_TOOL + _PROMPT_SUFFIX
 
 JSON_RETRY_SUFFIX = (
     "\n\nIMPORTANT: Your previous response was not valid JSON. "
@@ -244,8 +245,6 @@ class BedrockInference:
                     f"Bedrock returned invalid JSON after retry. Raw response: {raw[:500]}"
                 )
 
-        self._validate_result(parsed)
-
         # Normalize keywords: resolve case, synonyms, and acronyms to exact
         # IEEE Thesaurus preferred terms (e.g., "Deep Learning" → "Deep learning",
         # "AI" → "Artificial intelligence", "Rectenna" → "Rectennas").
@@ -260,7 +259,7 @@ class BedrockInference:
             if changes:
                 logger.info("Normalized keywords: %s", "; ".join(changes))
 
-            # When we have enough thesaurus matches (≥8), drop non-thesaurus
+            # When we have enough thesaurus matches, drop non-thesaurus
             # terms — prefer a clean set of standardized terms.
             thesaurus_kws = [
                 kw for kw in parsed["keywords"]
@@ -270,13 +269,16 @@ class BedrockInference:
                 kw for kw in parsed["keywords"]
                 if not self._thesaurus.is_preferred_term(kw)
             ]
-            if len(thesaurus_kws) >= 8:
+            if len(thesaurus_kws) >= MIN_THESAURUS_KEYWORDS:
                 if non_thesaurus:
                     logger.info(
                         "Dropping %d non-thesaurus keywords (have %d thesaurus matches): %s",
                         len(non_thesaurus), len(thesaurus_kws), non_thesaurus,
                     )
                 parsed["keywords"] = thesaurus_kws
+
+        # Validate after normalization/filtering so keyword count reflects final state
+        self._validate_result(parsed)
 
         # Measure thesaurus coverage
         coverage_count = 0
