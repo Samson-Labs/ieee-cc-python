@@ -15,12 +15,14 @@ import pytest
 from botocore.exceptions import ClientError
 
 from src.ai.bedrock_inference import (
+    ALL_FIELDS,
     BACKOFF_BASE,
     DEFAULT_MODEL_ID,
     MAX_RETRIES,
     MAX_TOKENS,
     MAX_TOOL_ITERATIONS,
     SYSTEM_PROMPT,
+    SYSTEM_PROMPT_NO_TOOL,
     TEMPERATURE,
     TEXT_TRUNCATION_LIMIT,
     THESAURUS_TOOL,
@@ -28,6 +30,7 @@ from src.ai.bedrock_inference import (
     VALID_CATEGORIES,
     VALID_LEARNING_LEVELS,
     BedrockInference,
+    _build_system_prompt,
 )
 from src.ai.thesaurus import ThesaurusSearch
 
@@ -137,7 +140,8 @@ class TestGenerateMetadata:
         body = json.loads(call_kwargs["body"])
         assert body["max_tokens"] == MAX_TOKENS
         assert body["temperature"] == TEMPERATURE
-        assert body["system"] == SYSTEM_PROMPT
+        # Empty thesaurus → no-tool prompt (tool references not sent without thesaurus)
+        assert body["system"] == SYSTEM_PROMPT_NO_TOOL
         assert body["messages"][0]["role"] == "user"
         assert body["messages"][0]["content"] == "Document text here"
 
