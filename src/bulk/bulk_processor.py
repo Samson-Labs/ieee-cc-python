@@ -18,7 +18,6 @@ DEFAULT_BUCKET = os.environ.get("S3_BUCKET", "dev-ieee-conference-cloud-bulk-upl
 
 REQUIRED_MANIFEST_FIELDS = {"batch_id", "callback_url", "items"}
 ALWAYS_REQUIRED_ITEM_FIELDS = {"item_id", "request_id", "resource_center"}
-FILE_REQUIRED_ITEM_FIELDS = {"s3_key", "media_type"}
 VALID_MEDIA_TYPES = {"PDF", "MP4", "MOV", "WEBM"}
 VALID_INPUT_TEXT_MODES = frozenset({"as_source", "as_abstract"})
 
@@ -123,13 +122,21 @@ class BulkProcessor:
                     f"Item {i} missing required fields: {sorted(item_missing)}"
                 )
 
-            has_file = "s3_key" in item
-            has_text = bool(item.get("input_text"))
+            # Use consistent truthiness checks (matches BulkWorker routing)
+            has_file = bool(item.get("s3_key"))
+            input_text = item.get("input_text")
+            has_text = isinstance(input_text, str) and bool(input_text.strip())
 
             # Must have at least one of s3_key or input_text
             if not has_file and not has_text:
                 raise ValidationError(
                     f"Item {i} must have at least one of 's3_key' or 'input_text'"
+                )
+
+            # Validate input_text is a non-empty string when present
+            if "input_text" in item and not has_text:
+                raise ValidationError(
+                    f"Item {i} 'input_text' must be a non-empty string"
                 )
 
             # File items require media_type from the original set
@@ -144,8 +151,20 @@ class BulkProcessor:
                         f"expected one of {sorted(VALID_MEDIA_TYPES)}"
                     )
 
+            # Validate source_bucket when present
+            source_bucket = item.get("source_bucket")
+            if source_bucket is not None:
+                if not isinstance(source_bucket, str) or not source_bucket.strip():
+                    raise ValidationError(
+                        f"Item {i} 'source_bucket' must be a non-empty string"
+                    )
+
             # Validate optional CC3-858 fields
             if "input_text_mode" in item:
+                if not has_text:
+                    raise ValidationError(
+                        f"Item {i} has 'input_text_mode' without 'input_text'"
+                    )
                 if item["input_text_mode"] not in VALID_INPUT_TEXT_MODES:
                     raise ValidationError(
                         f"Item {i} has invalid input_text_mode "
@@ -158,6 +177,13 @@ class BulkProcessor:
                 if not isinstance(requested_fields, list) or not requested_fields:
                     raise ValidationError(
                         f"Item {i} 'requested_fields' must be a non-empty array"
+                    )
+                if any(
+                    not isinstance(field, str) or not field.strip()
+                    for field in requested_fields
+                ):
+                    raise ValidationError(
+                        f"Item {i} 'requested_fields' must contain only non-empty strings"
                     )
 
     @staticmethod

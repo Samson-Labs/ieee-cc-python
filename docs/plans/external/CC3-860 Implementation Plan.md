@@ -25,7 +25,8 @@ FILE_REQUIRED_ITEM_FIELDS = {"s3_key", "media_type"}
 ```python
 VALID_INPUT_TEXT_MODES = frozenset({"as_source", "as_abstract"})
 ```
-Add `"text"` to `VALID_MEDIA_TYPES` for explicit text-only items.
+Keep `VALID_MEDIA_TYPES` limited to the original 4 file-backed types; do **not** add `"text"`.
+Text-only items are represented by omitting `media_type` and providing `input_text`.
 
 **1c. Rewrite `_validate_manifest()` per-item logic:**
 - Check `ALWAYS_REQUIRED_ITEM_FIELDS` present

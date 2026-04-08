@@ -179,30 +179,9 @@ class BulkWorker:
         return meta_key
 
     def _invoke_orchestrator(self, bucket: str, key: str) -> dict:
-        """Invoke the orchestrator Lambda synchronously."""
+        """Invoke the orchestrator Lambda with standard S3-key payload."""
         payload = json.dumps({"bucket": bucket, "key": key}).encode()
-
-        response = self._lambda.invoke(
-            FunctionName=ORCHESTRATOR_FUNCTION,
-            InvocationType="RequestResponse",
-            Payload=payload,
-        )
-
-        if response.get("FunctionError"):
-            raw = response["Payload"].read()
-            error_payload = raw.decode() if isinstance(raw, bytes) else raw
-            raise BulkProcessingError(
-                f"Orchestrator returned FunctionError: {error_payload}"
-            )
-
-        result = json.loads(response["Payload"].read())
-        status = result.get("statusCode", 0)
-        if status != 200:
-            raise BulkProcessingError(
-                f"Orchestrator returned status {status}: {result.get('body', {})}"
-            )
-
-        return result.get("body", {})
+        return self._invoke_lambda(payload)
 
     def _invoke_orchestrator_direct(
         self, bucket: str, item: dict, callback_url: str
@@ -222,21 +201,26 @@ class BulkWorker:
             meta["requested_fields"] = item["requested_fields"]
 
         payload = json.dumps({"bucket": bucket, "meta": meta}).encode()
+        return self._invoke_lambda(payload)
 
+    def _invoke_lambda(self, payload: bytes) -> dict:
+        """Invoke orchestrator Lambda and validate the response."""
         response = self._lambda.invoke(
             FunctionName=ORCHESTRATOR_FUNCTION,
             InvocationType="RequestResponse",
             Payload=payload,
         )
 
+        # Read payload once to avoid consuming the stream twice
+        raw_payload = response["Payload"].read()
+
         if response.get("FunctionError"):
-            raw = response["Payload"].read()
-            error_payload = raw.decode() if isinstance(raw, bytes) else raw
+            error_payload = raw_payload.decode() if isinstance(raw_payload, bytes) else raw_payload
             raise BulkProcessingError(
                 f"Orchestrator returned FunctionError: {error_payload}"
             )
 
-        result = json.loads(response["Payload"].read())
+        result = json.loads(raw_payload)
         status = result.get("statusCode", 0)
         if status != 200:
             raise BulkProcessingError(
