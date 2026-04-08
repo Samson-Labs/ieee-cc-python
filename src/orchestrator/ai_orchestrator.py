@@ -281,7 +281,12 @@ class AIOrchestrator:
             else:
                 signal = "extraction_ready"
 
-            generated_fields = sorted(effective_fields)
+            # Derive generated_fields from actual Bedrock output, not intent —
+            # avoids claiming fields were generated when Bedrock was skipped.
+            actual_fields = set(bedrock_result.keys()) & ALL_FIELDS
+            if input_text_mode == "as_abstract" and input_text:
+                actual_fields.discard("abstract")
+            generated_fields = sorted(actual_fields) if actual_fields else sorted(effective_fields)
 
             payload = {
                 "request_id": meta.get("request_id") or request_id,
@@ -316,7 +321,7 @@ class AIOrchestrator:
 
         return OrchestratorResult(
             item_id=item_id,
-            ou=ou,
+            ou=meta_ou,
             action="enriched",
             ai_enrichment_enabled=True,
             source_key=key or "",
@@ -408,22 +413,30 @@ class AIOrchestrator:
     @staticmethod
     def _validate_new_meta_fields(meta: dict, key: str | None) -> None:
         """Validate CC3-858 fields: input_text_mode, requested_fields."""
-        input_text_mode = meta.get("input_text_mode", "as_source")
-        if "input_text_mode" in meta and input_text_mode not in VALID_INPUT_TEXT_MODES:
-            raise ValueError(
-                f"Invalid input_text_mode: {input_text_mode!r}. "
-                f"Must be one of {sorted(VALID_INPUT_TEXT_MODES)}"
-            )
+        input_text = meta.get("input_text")
+        has_text = isinstance(input_text, str) and bool(input_text.strip())
+
+        # input_text_mode only valid when input_text is present
+        if "input_text_mode" in meta:
+            if not has_text:
+                raise ValueError("'input_text_mode' requires 'input_text' to be present")
+            if meta["input_text_mode"] not in VALID_INPUT_TEXT_MODES:
+                raise ValueError(
+                    f"Invalid input_text_mode: {meta['input_text_mode']!r}. "
+                    f"Must be one of {sorted(VALID_INPUT_TEXT_MODES)}"
+                )
 
         requested_fields = meta.get("requested_fields")
         if requested_fields is not None:
             if not isinstance(requested_fields, list) or not requested_fields:
                 raise ValueError("requested_fields must be a non-empty array")
+            if any(not isinstance(field, str) for field in requested_fields):
+                raise ValueError("requested_fields must contain only strings")
             invalid = set(requested_fields) - ALL_FIELDS
             if invalid:
                 raise ValueError(f"Invalid requested_fields: {sorted(invalid)}")
 
-        if key is None and not meta.get("input_text"):
+        if key is None and not has_text:
             raise ValueError("Direct invocation requires 'input_text' in meta")
 
     # ------------------------------------------------------------------

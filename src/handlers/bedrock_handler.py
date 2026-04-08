@@ -102,6 +102,8 @@ def _parse_requested_fields(event: dict) -> frozenset[str] | None:
         return None
     if not isinstance(raw, list) or not raw:
         raise ValueError("requested_fields must be a non-empty array")
+    if any(not isinstance(field, str) for field in raw):
+        raise ValueError("requested_fields must contain only strings")
     invalid = set(raw) - ALL_FIELDS
     if invalid:
         raise ValueError(f"Invalid requested_fields: {sorted(invalid)}")

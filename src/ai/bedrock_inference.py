@@ -246,11 +246,11 @@ class BedrockInference:
 
         Args:
             text: Extracted document text (will be truncated if too long).
-            thesaurus_terms: Optional IEEE Thesaurus terms to prioritize for keywords.
-                When provided, uses the legacy prompt-injection approach instead
-            requested_fields: Optional subset of ALL_FIELDS to generate.
-                When None, all 5 fields are generated (backward compatible).
-                of tool use.
+            thesaurus_terms: Optional IEEE Thesaurus terms to prioritize for
+                keywords. When provided, uses the legacy prompt-injection
+                approach instead of tool use.
+            requested_fields: Optional subset of ALL_FIELDS to generate. When
+                None, all 5 fields are generated (backward compatible).
 
         Returns:
             InferenceResult with abstract, keywords, learning_level,

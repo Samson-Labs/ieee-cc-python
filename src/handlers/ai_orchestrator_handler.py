@@ -157,8 +157,11 @@ def _validate_direct_meta(meta: dict) -> None:
     if not isinstance(meta, dict):
         raise ValueError("meta must be a JSON object")
 
-    if not meta.get("input_text"):
-        raise ValueError("Direct invocation requires 'input_text' in meta")
+    input_text = meta.get("input_text")
+    if not isinstance(input_text, str) or not input_text.strip():
+        raise ValueError(
+            "Direct invocation requires 'input_text' to be a non-empty string"
+        )
 
     for field in ("item_id", "ai_enrichment_enabled"):
         if field not in meta:
@@ -179,6 +182,8 @@ def _validate_direct_meta(meta: dict) -> None:
     if requested_fields is not None:
         if not isinstance(requested_fields, list) or not requested_fields:
             raise ValueError("requested_fields must be a non-empty array")
+        if any(not isinstance(field, str) for field in requested_fields):
+            raise ValueError("requested_fields must contain only strings")
         invalid = set(requested_fields) - ALL_FIELDS
         if invalid:
             raise ValueError(f"Invalid requested_fields: {sorted(invalid)}")
