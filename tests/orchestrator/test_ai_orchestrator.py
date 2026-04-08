@@ -663,6 +663,233 @@ class TestMetrics:
 
 
 # ---------------------------------------------------------------
+# CC3-858: Input text, direct invocation, selective fields
+# ---------------------------------------------------------------
+
+
+def _make_text_meta(
+    input_text="User-provided abstract text here.",
+    input_text_mode="as_source",
+    requested_fields=None,
+    callback_url="https://drupal.example.com/hook",
+):
+    meta = {
+        "request_id": 99,
+        "item_id": "ITEM-100",
+        "ou": "PES",
+        "product_part_number": "PES_ITEM-100",
+        "ai_enrichment_enabled": True,
+        "content": {"media_type": "text", "resource_center": "PES"},
+        "input_text": input_text,
+        "input_text_mode": input_text_mode,
+        "callback_url": callback_url,
+    }
+    if requested_fields is not None:
+        meta["requested_fields"] = requested_fields
+    return meta
+
+
+class TestInputTextAsSource:
+    """AC1: input_text with as_source mode — Bedrock generates all 5 fields."""
+
+    @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
+    def test_skips_extraction_uses_input_text(self, mock_send, orchestrator):
+        orch, s3, lam = orchestrator
+        meta = _make_text_meta(input_text_mode="as_source")
+        s3.get_object.return_value = _s3_get_object_response(meta)
+
+        bedrock_body = {"abstract": "a", "keywords": [], "learning_level": "Expert"}
+        lam.invoke.return_value = _lambda_invoke_response(200, bedrock_body)
+
+        result = orch.process("bucket", "PES/pending/ITEM-100.pdf")
+
+        assert result["action"] == "enriched"
+        # Only 1 Lambda call (Bedrock), not 2 (extraction + Bedrock)
+        assert lam.invoke.call_count == 1
+        bedrock_payload = json.loads(lam.invoke.call_args[1]["Payload"])
+        assert bedrock_payload["text"] == "User-provided abstract text here."
+
+    @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
+    def test_webhook_signal_metadata_ready(self, mock_send, orchestrator):
+        orch, s3, lam = orchestrator
+        meta = _make_text_meta()
+        s3.get_object.return_value = _s3_get_object_response(meta)
+        lam.invoke.return_value = _lambda_invoke_response(200, {"abstract": "a", "keywords": []})
+
+        orch.process("bucket", "PES/pending/ITEM-100.pdf")
+
+        payload = mock_send.call_args[0][2]
+        assert payload["signal"] == "metadata_ready"
+        assert payload["extraction"]["source"] == "user_provided"
+        assert "generated_fields" in payload
+
+
+class TestInputTextAsAbstract:
+    """AC2: input_text with as_abstract mode — abstract passed through."""
+
+    @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
+    def test_abstract_not_in_bedrock_requested_fields(self, mock_send, orchestrator):
+        orch, s3, lam = orchestrator
+        meta = _make_text_meta(input_text_mode="as_abstract")
+        s3.get_object.return_value = _s3_get_object_response(meta)
+        lam.invoke.return_value = _lambda_invoke_response(200, {"keywords": [], "learning_level": "Expert"})
+
+        orch.process("bucket", "PES/pending/ITEM-100.pdf")
+
+        bedrock_payload = json.loads(lam.invoke.call_args[1]["Payload"])
+        assert "abstract" not in bedrock_payload.get("requested_fields", [])
+
+    @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
+    def test_abstract_merged_from_input_text(self, mock_send, orchestrator):
+        orch, s3, lam = orchestrator
+        meta = _make_text_meta(
+            input_text="My custom abstract.",
+            input_text_mode="as_abstract",
+        )
+        s3.get_object.return_value = _s3_get_object_response(meta)
+        lam.invoke.return_value = _lambda_invoke_response(200, {"keywords": ["kw1"], "learning_level": "Expert"})
+
+        orch.process("bucket", "PES/pending/ITEM-100.pdf")
+
+        payload = mock_send.call_args[0][2]
+        assert payload["data"]["abstract"] == "My custom abstract."
+        assert "abstract" not in payload["generated_fields"]
+
+    @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
+    def test_bedrock_gets_framing_context(self, mock_send, orchestrator):
+        orch, s3, lam = orchestrator
+        meta = _make_text_meta(input_text_mode="as_abstract")
+        s3.get_object.return_value = _s3_get_object_response(meta)
+        lam.invoke.return_value = _lambda_invoke_response(200, {"keywords": []})
+
+        orch.process("bucket", "PES/pending/ITEM-100.pdf")
+
+        bedrock_payload = json.loads(lam.invoke.call_args[1]["Payload"])
+        assert "finalized abstract" in bedrock_payload["text"]
+
+
+class TestRequestedFieldsOrchestrator:
+    """AC3: requested_fields subset forwarded to Bedrock."""
+
+    @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
+    def test_forwards_requested_fields_to_bedrock(self, mock_send, orchestrator):
+        orch, s3, lam = orchestrator
+        meta = _make_text_meta(requested_fields=["keywords", "category"])
+        s3.get_object.return_value = _s3_get_object_response(meta)
+        lam.invoke.return_value = _lambda_invoke_response(200, {"keywords": [], "category": "Research"})
+
+        orch.process("bucket", "PES/pending/ITEM-100.pdf")
+
+        bedrock_payload = json.loads(lam.invoke.call_args[1]["Payload"])
+        assert sorted(bedrock_payload["requested_fields"]) == ["category", "keywords"]
+
+    @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
+    def test_generated_fields_in_webhook(self, mock_send, orchestrator):
+        orch, s3, lam = orchestrator
+        meta = _make_text_meta(requested_fields=["keywords", "category"])
+        s3.get_object.return_value = _s3_get_object_response(meta)
+        lam.invoke.return_value = _lambda_invoke_response(200, {"keywords": [], "category": "Research"})
+
+        orch.process("bucket", "PES/pending/ITEM-100.pdf")
+
+        payload = mock_send.call_args[0][2]
+        assert sorted(payload["generated_fields"]) == ["category", "keywords"]
+
+
+class TestDirectInvocation:
+    """AC4: Direct invocation with meta in event, no S3 file."""
+
+    @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
+    def test_no_file_read_or_move(self, mock_send, orchestrator):
+        orch, s3, lam = orchestrator
+        meta = _make_text_meta()
+        lam.invoke.return_value = _lambda_invoke_response(200, {"abstract": "a", "keywords": []})
+
+        result = orch.process(bucket="bucket", key=None, meta=meta)
+
+        assert result["action"] == "enriched"
+        assert result["source_key"] == ""
+        assert result["destination_key"] == ""
+        # No S3 reads (no meta.json from S3)
+        s3.get_object.assert_not_called()
+        # No file move
+        s3.copy_object.assert_not_called()
+        s3.delete_object.assert_not_called()
+
+    @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
+    def test_webhook_signal_metadata_ready(self, mock_send, orchestrator):
+        orch, s3, lam = orchestrator
+        meta = _make_text_meta()
+        lam.invoke.return_value = _lambda_invoke_response(200, {"abstract": "a"})
+
+        orch.process(bucket="bucket", key=None, meta=meta)
+
+        payload = mock_send.call_args[0][2]
+        assert payload["signal"] == "metadata_ready"
+        assert payload["item_id"] == "ITEM-100"
+        assert payload["ou"] == "PES"
+
+    def test_direct_invocation_without_input_text_raises(self, orchestrator):
+        orch, s3, lam = orchestrator
+        meta = _make_text_meta()
+        del meta["input_text"]
+
+        with pytest.raises(ValueError, match="input_text"):
+            orch.process(bucket="bucket", key=None, meta=meta)
+
+
+class TestCC858BackwardCompat:
+    """AC5: Existing meta.json without new fields works identically."""
+
+    def test_existing_pdf_flow_unchanged(self, orchestrator):
+        orch, s3, lam = orchestrator
+        meta = _make_meta(ai_enabled=True)
+        s3.get_object.return_value = _s3_get_object_response(meta)
+
+        extraction_body = {"text": "text", "page_count": 5}
+        bedrock_body = {"abstract": "a", "keywords": [], "learning_level": "Expert"}
+        lam.invoke.side_effect = [
+            _lambda_invoke_response(200, extraction_body),
+            _lambda_invoke_response(200, bedrock_body),
+        ]
+
+        result = orch.process("bucket", "PES/pending/STD-12345.pdf")
+
+        assert result["action"] == "enriched"
+        assert lam.invoke.call_count == 2  # extraction + Bedrock
+        bedrock_payload = json.loads(lam.invoke.call_args_list[1][1]["Payload"])
+        assert "requested_fields" not in bedrock_payload
+
+
+class TestCC858Validation:
+    """AC6: Validation of new meta fields."""
+
+    def test_invalid_input_text_mode_raises(self, orchestrator):
+        orch, s3, lam = orchestrator
+        meta = _make_text_meta(input_text_mode="invalid_mode")
+        s3.get_object.return_value = _s3_get_object_response(meta)
+
+        with pytest.raises(ValueError, match="input_text_mode"):
+            orch.process("bucket", "PES/pending/ITEM-100.pdf")
+
+    def test_invalid_requested_fields_raises(self, orchestrator):
+        orch, s3, lam = orchestrator
+        meta = _make_text_meta(requested_fields=["not_a_field"])
+        s3.get_object.return_value = _s3_get_object_response(meta)
+
+        with pytest.raises(ValueError, match="requested_fields"):
+            orch.process("bucket", "PES/pending/ITEM-100.pdf")
+
+    def test_empty_requested_fields_raises(self, orchestrator):
+        orch, s3, lam = orchestrator
+        meta = _make_text_meta(requested_fields=[])
+        s3.get_object.return_value = _s3_get_object_response(meta)
+
+        with pytest.raises(ValueError, match="non-empty"):
+            orch.process("bucket", "PES/pending/ITEM-100.pdf")
+
+
+# ---------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------
 

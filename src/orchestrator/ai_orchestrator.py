@@ -233,8 +233,10 @@ class AIOrchestrator:
                     "The following is a finalized abstract for an IEEE publication. "
                     "Generate metadata based on this abstract:\n\n" + extracted_text
                 )
+            # Only forward requested_fields when explicitly specified
+            bedrock_rf = effective_fields if requested_fields_raw or input_text_mode == "as_abstract" else None
             bedrock_result = self._invoke_bedrock(
-                bedrock_text, correlation, requested_fields=effective_fields
+                bedrock_text, correlation, requested_fields=bedrock_rf
             )
         else:
             logger.warning("%s No text available — skipping Bedrock", correlation)
