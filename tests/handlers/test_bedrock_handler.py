@@ -59,6 +59,7 @@ class TestDirectInvocation:
         mock_inference.generate_metadata.assert_called_once_with(
             text="This is extracted document text.",
             thesaurus_terms=None,
+            requested_fields=None,
         )
 
     def test_with_thesaurus_terms(self, mock_inference):
@@ -72,7 +73,36 @@ class TestDirectInvocation:
         mock_inference.generate_metadata.assert_called_once_with(
             text="Document text.",
             thesaurus_terms=["smart grid", "power systems"],
+            requested_fields=None,
         )
+
+    def test_with_requested_fields(self, mock_inference):
+        event = {
+            "text": "Document text.",
+            "requested_fields": ["keywords", "category"],
+        }
+        result = handler(event, None)
+
+        assert result["statusCode"] == 200
+        mock_inference.generate_metadata.assert_called_once_with(
+            text="Document text.",
+            thesaurus_terms=None,
+            requested_fields=frozenset({"keywords", "category"}),
+        )
+
+    def test_invalid_requested_fields_returns_400(self, mock_inference):
+        event = {"text": "text", "requested_fields": ["not_a_field"]}
+        result = handler(event, None)
+
+        assert result["statusCode"] == 400
+        assert "Invalid requested_fields" in result["body"]["error"]
+
+    def test_empty_requested_fields_returns_400(self, mock_inference):
+        event = {"text": "text", "requested_fields": []}
+        result = handler(event, None)
+
+        assert result["statusCode"] == 400
+        assert "non-empty" in result["body"]["error"]
 
     def test_empty_text_returns_400(self, mock_inference):
         event = {"text": "   "}
@@ -108,7 +138,7 @@ class TestS3Invocation:
             Bucket="my-bucket", Key="metadata/doc.json"
         )
         mock_inference.generate_metadata.assert_called_once_with(
-            text="S3 text", thesaurus_terms=None,
+            text="S3 text", thesaurus_terms=None, requested_fields=None,
         )
 
     def test_empty_extracted_text_returns_400(self, mock_inference, mock_s3):

@@ -15,8 +15,9 @@ import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
 
+from src.ai.bedrock_inference import ALL_FIELDS
 from src.common.dlq import build_dlq_message
-from src.orchestrator.ai_orchestrator import AIOrchestrator
+from src.orchestrator.ai_orchestrator import AIOrchestrator, VALID_INPUT_TEXT_MODES
 
 logger = logging.getLogger()
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
@@ -48,16 +49,25 @@ def handler(event: dict, context) -> dict:
     retry_count = event.get("retry_count", 0)
 
     try:
-        bucket, key = _parse_event(event)
+        if "meta" in event:
+            # Direct invocation with inline meta (text-only, no S3 file)
+            bucket = event.get("bucket", os.environ.get("S3_BUCKET", ""))
+            meta = event["meta"]
+            _validate_direct_meta(meta)
+            bucket_parsed, key_parsed, meta_parsed = bucket, None, meta
+        else:
+            bucket_parsed, key_parsed = _parse_event(event)
+            meta_parsed = None
     except (KeyError, ValueError) as exc:
         logger.error("Bad request: %s", exc)
         return {"statusCode": 400, "body": {"error": str(exc)}}
 
     try:
         result = _orchestrator.process(
-            bucket=bucket,
-            key=key,
+            bucket=bucket_parsed,
+            key=key_parsed,
             request_id=request_id,
+            meta=meta_parsed,
         )
     except ValueError as exc:
         logger.error("Validation error: %s", exc)
@@ -140,3 +150,40 @@ def _parse_event(event: dict) -> tuple[str, str]:
         )
 
     return bucket, key
+
+
+def _validate_direct_meta(meta: dict) -> None:
+    """Validate meta dict for direct invocation (text-only path)."""
+    if not isinstance(meta, dict):
+        raise ValueError("meta must be a JSON object")
+
+    input_text = meta.get("input_text")
+    if not isinstance(input_text, str) or not input_text.strip():
+        raise ValueError(
+            "Direct invocation requires 'input_text' to be a non-empty string"
+        )
+
+    for field in ("item_id", "ai_enrichment_enabled"):
+        if field not in meta:
+            raise ValueError(f"Direct invocation meta missing required field: {field}")
+
+    # Validate content.media_type is present
+    content = meta.get("content")
+    if not isinstance(content, dict) or "media_type" not in content:
+        raise ValueError("Direct invocation meta must include content.media_type")
+
+    mode = meta.get("input_text_mode", "as_source")
+    if mode not in VALID_INPUT_TEXT_MODES:
+        raise ValueError(
+            f"Invalid input_text_mode: {mode!r}. Must be one of {sorted(VALID_INPUT_TEXT_MODES)}"
+        )
+
+    requested_fields = meta.get("requested_fields")
+    if requested_fields is not None:
+        if not isinstance(requested_fields, list) or not requested_fields:
+            raise ValueError("requested_fields must be a non-empty array")
+        if any(not isinstance(field, str) for field in requested_fields):
+            raise ValueError("requested_fields must contain only strings")
+        invalid = set(requested_fields) - ALL_FIELDS
+        if invalid:
+            raise ValueError(f"Invalid requested_fields: {sorted(invalid)}")

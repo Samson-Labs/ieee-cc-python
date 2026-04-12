@@ -19,6 +19,7 @@ from typing import TypedDict
 import boto3
 from botocore.exceptions import ClientError
 
+from src.ai.bedrock_inference import ALL_FIELDS
 from src.common.metrics import publish_metrics
 from src.webhook.sender import WebhookSender
 
@@ -68,6 +69,8 @@ REQUIRED_META_FIELDS = {
 }
 REQUIRED_CONTENT_FIELDS = {"media_type"}
 
+VALID_INPUT_TEXT_MODES = frozenset({"as_source", "as_abstract"})
+
 
 class OrchestratorResult(TypedDict):
     """Result of an orchestration run."""
@@ -100,29 +103,44 @@ class AIOrchestrator:
     def process(
         self,
         bucket: str,
-        key: str,
+        key: str | None,
         request_id: str = "",
+        meta: dict | None = None,
     ) -> OrchestratorResult:
-        """Process an uploaded file based on its .meta.json.
+        """Process an uploaded file or direct text invocation.
 
         Args:
             bucket: S3 bucket name.
-            key: S3 key of the uploaded file (e.g. PES/pending/STD-12345.pdf).
+            key: S3 key (e.g. PES/pending/STD-12345.pdf). None for text-only.
             request_id: Lambda request ID for correlation logging.
+            meta: Inline meta dict for direct invocation. When provided,
+                  skips S3 meta read and key parsing.
 
         Returns:
             OrchestratorResult with routing outcome.
         """
         start = time.time()
+        has_file = key is not None
 
-        ou, item_id, ext = self._parse_key(key)
-        correlation = f"[{request_id}:{item_id}]" if request_id else f"[{item_id}]"
+        # Step 1: Obtain and validate meta
+        if meta is not None:
+            # Direct invocation — meta provided inline
+            item_id = str(meta["item_id"])
+            ou = meta.get("ou", "")
+            ext = ""
+            destination_key = ""
+            correlation = f"[{request_id}:{item_id}]" if request_id else f"[{item_id}]"
+            logger.info("%s Direct invocation (text-only)", correlation)
+        else:
+            # Standard S3-key flow
+            ou, item_id, ext = self._parse_key(key)
+            correlation = f"[{request_id}:{item_id}]" if request_id else f"[{item_id}]"
+            logger.info("%s Processing s3://%s/%s", correlation, bucket, key)
 
-        logger.info("%s Processing s3://%s/%s", correlation, bucket, key)
+            meta_key = f"{ou}/metadata/{item_id}.meta.json"
+            meta = self._read_meta_json(bucket, meta_key, correlation)
+            destination_key = f"{ou}/processed/{item_id}.{ext}"
 
-        # Step 1: Read and validate .meta.json
-        meta_key = f"{ou}/metadata/{item_id}.meta.json"
-        meta = self._read_meta_json(bucket, meta_key, correlation)
         self._validate_meta(meta)
 
         # Normalize media type from Drupal format ('Video', 'PDF') to MIME.
@@ -139,19 +157,17 @@ class AIOrchestrator:
         )
 
         # Derive fields that may not be in .meta.json top level.
-        # Use meta["item_id"] (entity ID) consistently for derivation.
-        meta_item_id = meta["item_id"]
+        meta_item_id = str(meta["item_id"])
         meta_ou = meta.get("ou", meta["content"].get("resource_center", ou))
         product_part_number = meta.get(
             "product_part_number",
             meta["content"].get("resource_center", meta_ou) + "_" + meta_item_id,
         )
-        destination_key = f"{ou}/processed/{item_id}.{ext}"
 
         # Step 2: Route based on ai_enrichment_enabled
         if not meta["ai_enrichment_enabled"]:
-            # Move file from /pending/ to /processed/
-            self._move_file(bucket, key, destination_key, correlation)
+            if has_file:
+                self._move_file(bucket, key, destination_key, correlation)
             elapsed = int((time.time() - start) * 1000)
             logger.info("%s Moved to /processed/ (AI disabled) in %dms", correlation, elapsed)
 
@@ -171,31 +187,69 @@ class AIOrchestrator:
                 ou=ou,
                 action="moved",
                 ai_enrichment_enabled=False,
-                source_key=key,
+                source_key=key or "",
                 destination_key=destination_key,
                 processing_time_ms=elapsed,
                 details={"reason": "ai_enrichment_disabled"},
             )
 
-        # Step 3: Dispatch to extraction/transcription
+        # Extract new CC3-858 fields from meta
+        input_text = meta.get("input_text")
+        input_text_mode = meta.get("input_text_mode", "as_source")
+        requested_fields_raw = meta.get("requested_fields")
+        self._validate_new_meta_fields(meta, key)
+
+        # Compute effective fields for Bedrock
+        requested_fields = frozenset(requested_fields_raw) if requested_fields_raw else None
+        effective_fields = requested_fields or ALL_FIELDS
+        if input_text_mode == "as_abstract":
+            effective_fields = effective_fields - {"abstract"}
+
+        # Step 3: Get text for Bedrock (user-provided or extracted)
         media_type = meta["content"]["media_type"]
-        extraction_result = self._dispatch_extraction(
-            bucket, key, ou, product_part_number, media_type, correlation
-        )
+        extraction_result = {}
+
+        if input_text:
+            # User-provided text — skip extraction entirely
+            extracted_text = input_text
+            extraction_result = {"source": "user_provided", "text": input_text}
+            logger.info("%s Using user-provided input_text (%s mode)", correlation, input_text_mode)
+        elif has_file:
+            # Standard extraction from file
+            extraction_result = self._dispatch_extraction(
+                bucket, key, ou, product_part_number, media_type, correlation
+            )
+            extracted_text = extraction_result.get("text") or extraction_result.get("transcript", "")
+        else:
+            raise ValueError("Direct invocation requires 'input_text' in meta")
 
         # Step 4: Invoke Bedrock for metadata generation
-        extracted_text = extraction_result.get("text") or extraction_result.get("transcript", "")
         bedrock_result = {}
 
         if extracted_text.strip():
-            bedrock_result = self._invoke_bedrock(extracted_text, correlation)
+            bedrock_text = extracted_text
+            if input_text_mode == "as_abstract":
+                bedrock_text = (
+                    "The following is a finalized abstract for an IEEE publication. "
+                    "Generate metadata based on this abstract:\n\n" + extracted_text
+                )
+            # Forward requested_fields to Bedrock when the caller specified a
+            # subset OR when as_abstract mode removed "abstract" from the set —
+            # so Bedrock only generates the fields we actually need.
+            bedrock_rf = effective_fields if requested_fields_raw or input_text_mode == "as_abstract" else None
+            bedrock_result = self._invoke_bedrock(
+                bedrock_text, correlation, requested_fields=bedrock_rf
+            )
         else:
-            logger.warning("%s No text extracted — skipping Bedrock", correlation)
+            logger.warning("%s No text available — skipping Bedrock", correlation)
 
-        # Step 5a: Copy VTT subtitle file if present (video transcriptions).
-        # Best-effort — subtitle copy failure should not block the pipeline.
+        # Post-Bedrock merge for as_abstract mode
+        if input_text_mode == "as_abstract" and input_text:
+            bedrock_result["abstract"] = input_text
+
+        # Step 5a: Copy VTT subtitle file if present (video, no input_text)
         vtt_key = ""
-        if media_type in VIDEO_MEDIA_TYPES:
+        if media_type in VIDEO_MEDIA_TYPES and not input_text:
             source_vtt_key = extraction_result.get("vtt_s3_key", "")
             if source_vtt_key:
                 destination_vtt_key = f"{meta_ou}/subtitles/{product_part_number}.vtt"
@@ -221,12 +275,21 @@ class AIOrchestrator:
         callback_url = meta.get("callback_url") or meta.get("webhook_url")
         webhook_sent = False
         if callback_url:
-            signal = (
-                "transcription_ready"
-                if media_type in VIDEO_MEDIA_TYPES
-                else "extraction_ready"
-            )
-            # Use entity IDs from .meta.json (not filename-derived).
+            # Determine signal based on text source
+            if input_text:
+                signal = "metadata_ready"
+            elif media_type in VIDEO_MEDIA_TYPES:
+                signal = "transcription_ready"
+            else:
+                signal = "extraction_ready"
+
+            # Derive generated_fields from actual Bedrock output, not intent —
+            # avoids claiming fields were generated when Bedrock was skipped.
+            actual_fields = set(bedrock_result.keys()) & ALL_FIELDS
+            if input_text_mode == "as_abstract" and input_text:
+                actual_fields.discard("abstract")
+            generated_fields = sorted(actual_fields)
+
             payload = {
                 "request_id": meta.get("request_id") or request_id,
                 "item_id": meta_item_id,
@@ -239,6 +302,7 @@ class AIOrchestrator:
                 .replace("+00:00", "Z"),
                 "extraction": extraction_result,
                 "data": bedrock_result,
+                "generated_fields": generated_fields,
                 "vtt_s3_key": vtt_key if vtt_key else None,
             }
             webhook_sent = self._webhook_sender.send(
@@ -246,7 +310,8 @@ class AIOrchestrator:
             )
 
         # Step 6: Move file from /pending/ to /processed/
-        self._move_file(bucket, key, destination_key, correlation)
+        if has_file:
+            self._move_file(bucket, key, destination_key, correlation)
 
         elapsed = int((time.time() - start) * 1000)
         logger.info("%s Enrichment complete in %dms", correlation, elapsed)
@@ -258,10 +323,10 @@ class AIOrchestrator:
 
         return OrchestratorResult(
             item_id=item_id,
-            ou=ou,
+            ou=meta_ou,
             action="enriched",
             ai_enrichment_enabled=True,
-            source_key=key,
+            source_key=key or "",
             destination_key=destination_key,
             processing_time_ms=elapsed,
             details={
@@ -346,6 +411,35 @@ class AIOrchestrator:
             raise ValueError(
                 f"Missing required content fields: {sorted(missing_content)}"
             )
+
+    @staticmethod
+    def _validate_new_meta_fields(meta: dict, key: str | None) -> None:
+        """Validate CC3-858 fields: input_text_mode, requested_fields."""
+        input_text = meta.get("input_text")
+        has_text = isinstance(input_text, str) and bool(input_text.strip())
+
+        # input_text_mode only valid when input_text is present
+        if "input_text_mode" in meta:
+            if not has_text:
+                raise ValueError("'input_text_mode' requires 'input_text' to be present")
+            if meta["input_text_mode"] not in VALID_INPUT_TEXT_MODES:
+                raise ValueError(
+                    f"Invalid input_text_mode: {meta['input_text_mode']!r}. "
+                    f"Must be one of {sorted(VALID_INPUT_TEXT_MODES)}"
+                )
+
+        requested_fields = meta.get("requested_fields")
+        if requested_fields is not None:
+            if not isinstance(requested_fields, list) or not requested_fields:
+                raise ValueError("requested_fields must be a non-empty array")
+            if any(not isinstance(field, str) for field in requested_fields):
+                raise ValueError("requested_fields must contain only strings")
+            invalid = set(requested_fields) - ALL_FIELDS
+            if invalid:
+                raise ValueError(f"Invalid requested_fields: {sorted(invalid)}")
+
+        if key is None and not has_text:
+            raise ValueError("Direct invocation requires 'input_text' in meta")
 
     # ------------------------------------------------------------------
     # File operations
@@ -459,6 +553,7 @@ class AIOrchestrator:
         self,
         text: str,
         correlation: str,
+        requested_fields: frozenset[str] | None = None,
     ) -> dict:
         """Invoke Bedrock metadata generation Lambda."""
         logger.info("%s Invoking Bedrock for metadata generation", correlation)
@@ -466,6 +561,8 @@ class AIOrchestrator:
         payload = {
             "text": text,
         }
+        if requested_fields:
+            payload["requested_fields"] = sorted(requested_fields)
 
         response = self._lambda.invoke(
             FunctionName=BEDROCK_FUNCTION,

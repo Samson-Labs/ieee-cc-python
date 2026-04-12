@@ -92,15 +92,10 @@ _PROMPT_PREAMBLE = (
     "itself — the presentation, webinar, tutorial, paper, or research — as if the "
     "reader will consume the original media.\n\n"
     "Given the extracted text, generate a JSON object with the following fields:\n\n"
-    '1. **abstract** — A two-paragraph summary of the content. Each paragraph '
-    "should be 50–150 words. Separate the two paragraphs with a blank line (\\n\\n). "
-    "The first paragraph should describe the main topic, approach, and scope of the "
-    "presentation or publication. "
-    "The second paragraph should cover key findings, contributions, and implications.\n\n"
 )
 
 _KEYWORDS_WITH_TOOL = (
-    '2. **keywords** — An array of 8–12 keyword strings. Before selecting keywords, '
+    '**keywords** — An array of 8–12 keyword strings. Before selecting keywords, '
     "use the search_ieee_thesaurus tool to find standardized IEEE terms for the "
     "content's main topics (make 2-3 searches covering different topic areas). "
     "When using an IEEE Thesaurus term, copy the exact preferred_term string from the "
@@ -113,35 +108,85 @@ _KEYWORDS_WITH_TOOL = (
 )
 
 _KEYWORDS_NO_TOOL = (
-    '2. **keywords** — An array of 8–12 keyword strings that capture the content\'s '
+    '**keywords** — An array of 8–12 keyword strings that capture the content\'s '
     "core topics, technologies, methodologies, and application domains. Prefer specific "
     "technical terms over generic ones. When a relevant IEEE Thesaurus term exists, "
     "prefer it over a synonym.\n\n"
 )
 
-_PROMPT_SUFFIX = (
-    '3. **learning_level** — One of the following:\n'
-    '   - "Foundational" — introductory material suitable for students or newcomers\n'
-    '   - "Professional" — intermediate material for practicing engineers\n'
-    '   - "Expert" — advanced material requiring deep domain expertise\n\n'
-    '4. **intended_audience** — One of the following:\n'
-    '   - "Non-Engineer" — general public, managers, or policy-makers\n'
-    '   - "Engineering Adjacent Professional" — technical writers, project managers\n'
-    '   - "New Engineer" — early-career engineers, recent graduates\n'
-    '   - "Seasoned Engineering Professional" — experienced engineers, researchers\n\n'
-    '5. **category** — One of the following:\n'
-    '   - "Research Papers and Publications" — original research, conference papers\n'
-    '   - "Professional Development" — tutorials, courses, certification material\n'
-    '   - "Society Outreach" — newsletters, community reports, event summaries\n'
-    '   - "Technical Tutorial" — how-to guides, implementation walkthroughs\n\n'
-    "Return ONLY a valid JSON object with these five fields. Do not include any text "
+ALL_FIELDS = frozenset({"abstract", "keywords", "learning_level", "intended_audience", "category"})
+
+# Per-field instruction blocks (without numbering — assembled dynamically)
+_FIELD_INSTRUCTIONS = {
+    "abstract": (
+        '**abstract** — A two-paragraph summary of the content. Each paragraph '
+        "should be 50–150 words. Separate the two paragraphs with a blank line (\\n\\n). "
+        "The first paragraph should describe the main topic, approach, and scope of the "
+        "presentation or publication. "
+        "The second paragraph should cover key findings, contributions, and implications.\n\n"
+    ),
+    "learning_level": (
+        '**learning_level** — One of the following:\n'
+        '   - "Foundational" — introductory material suitable for students or newcomers\n'
+        '   - "Professional" — intermediate material for practicing engineers\n'
+        '   - "Expert" — advanced material requiring deep domain expertise\n\n'
+    ),
+    "intended_audience": (
+        '**intended_audience** — One of the following:\n'
+        '   - "Non-Engineer" — general public, managers, or policy-makers\n'
+        '   - "Engineering Adjacent Professional" — technical writers, project managers\n'
+        '   - "New Engineer" — early-career engineers, recent graduates\n'
+        '   - "Seasoned Engineering Professional" — experienced engineers, researchers\n\n'
+    ),
+    "category": (
+        '**category** — One of the following:\n'
+        '   - "Research Papers and Publications" — original research, conference papers\n'
+        '   - "Professional Development" — tutorials, courses, certification material\n'
+        '   - "Society Outreach" — newsletters, community reports, event summaries\n'
+        '   - "Technical Tutorial" — how-to guides, implementation walkthroughs\n\n'
+    ),
+}
+
+_PROMPT_RETURN_INSTRUCTION = (
+    "Return ONLY a valid JSON object with these fields. Do not include any text "
     "before or after the JSON. Do not wrap it in markdown code fences."
 )
 
-SYSTEM_PROMPT = _PROMPT_PREAMBLE + _KEYWORDS_WITH_TOOL + _PROMPT_SUFFIX
 
-# System prompt WITHOUT tool reference — used for JSON retry and non-tool path
-SYSTEM_PROMPT_NO_TOOL = _PROMPT_PREAMBLE + _KEYWORDS_NO_TOOL + _PROMPT_SUFFIX
+def _build_system_prompt(
+    requested_fields: frozenset[str],
+    use_tool: bool = True,
+) -> str:
+    """Assemble system prompt with only the requested field instructions.
+
+    Fields are numbered sequentially (1, 2, 3...) regardless of which are
+    included. Each field instruction (from _FIELD_INSTRUCTIONS or keyword
+    constants) is prefixed with its number.
+    """
+    parts = [_PROMPT_PREAMBLE]
+
+    num = 1
+    if "abstract" in requested_fields:
+        parts.append(f"{num}. {_FIELD_INSTRUCTIONS['abstract']}")
+        num += 1
+
+    if "keywords" in requested_fields:
+        kw_block = _KEYWORDS_WITH_TOOL if use_tool else _KEYWORDS_NO_TOOL
+        parts.append(f"{num}. {kw_block}")
+        num += 1
+
+    for field in ["learning_level", "intended_audience", "category"]:
+        if field in requested_fields:
+            parts.append(f"{num}. {_FIELD_INSTRUCTIONS[field]}")
+            num += 1
+
+    parts.append(_PROMPT_RETURN_INSTRUCTION)
+    return "".join(parts)
+
+
+# Default prompts for backward compatibility
+SYSTEM_PROMPT = _build_system_prompt(ALL_FIELDS, use_tool=True)
+SYSTEM_PROMPT_NO_TOOL = _build_system_prompt(ALL_FIELDS, use_tool=False)
 
 JSON_RETRY_SUFFIX = (
     "\n\nIMPORTANT: Your previous response was not valid JSON. "
@@ -150,16 +195,21 @@ JSON_RETRY_SUFFIX = (
 )
 
 
-class InferenceResult(TypedDict):
+class _InferenceMetrics(TypedDict):
+    """Always-present metric fields in inference results."""
+    processing_time_ms: int
+    input_tokens: int
+    output_tokens: int
+    thesaurus_coverage: int
+
+
+class InferenceResult(_InferenceMetrics, total=False):
+    """Inference result — metadata fields are optional when requested_fields is used."""
     abstract: str
     keywords: list[str]
     learning_level: str
     intended_audience: str
     category: str
-    processing_time_ms: int
-    input_tokens: int
-    output_tokens: int
-    thesaurus_coverage: int
 
 
 class BedrockInference:
@@ -185,6 +235,7 @@ class BedrockInference:
         self,
         text: str,
         thesaurus_terms: list[str] | None = None,
+        requested_fields: frozenset[str] | None = None,
     ) -> InferenceResult:
         """Generate structured metadata from extracted document text.
 
@@ -195,9 +246,11 @@ class BedrockInference:
 
         Args:
             text: Extracted document text (will be truncated if too long).
-            thesaurus_terms: Optional IEEE Thesaurus terms to prioritize for keywords.
-                When provided, uses the legacy prompt-injection approach instead
-                of tool use.
+            thesaurus_terms: Optional IEEE Thesaurus terms to prioritize for
+                keywords. When provided, uses the legacy prompt-injection
+                approach instead of tool use.
+            requested_fields: Optional subset of ALL_FIELDS to generate. When
+                None, all 5 fields are generated (backward compatible).
 
         Returns:
             InferenceResult with abstract, keywords, learning_level,
@@ -210,16 +263,22 @@ class BedrockInference:
         """
         start = time.monotonic()
 
+        effective_fields = requested_fields or ALL_FIELDS
         truncated_text = text[:TEXT_TRUNCATION_LIMIT]
-        use_tool = self._thesaurus.term_count > 0 and not thesaurus_terms
+        use_tool = (
+            self._thesaurus.term_count > 0
+            and not thesaurus_terms
+            and "keywords" in effective_fields
+        )
+
+        system_prompt = _build_system_prompt(effective_fields, use_tool=use_tool)
 
         if use_tool:
             raw, input_tokens, output_tokens = self._invoke_with_tools(
-                SYSTEM_PROMPT, truncated_text
+                system_prompt, truncated_text
             )
         else:
-            system_prompt = SYSTEM_PROMPT
-            if thesaurus_terms:
+            if thesaurus_terms and "keywords" in effective_fields:
                 terms_str = ", ".join(thesaurus_terms)
                 system_prompt += (
                     f"\n\nWhen selecting keywords, prioritize terms from this "
@@ -248,7 +307,7 @@ class BedrockInference:
         # Normalize keywords: resolve case, synonyms, and acronyms to exact
         # IEEE Thesaurus preferred terms (e.g., "Deep Learning" → "Deep learning",
         # "AI" → "Artificial intelligence", "Rectenna" → "Rectennas").
-        if self._thesaurus.term_count > 0:
+        if self._thesaurus.term_count > 0 and "keywords" in effective_fields:
             raw_keywords = parsed["keywords"]
             parsed["keywords"] = self._thesaurus.normalize_keywords(raw_keywords)
             changes = [
@@ -278,11 +337,11 @@ class BedrockInference:
                 parsed["keywords"] = thesaurus_kws
 
         # Validate after normalization/filtering so keyword count reflects final state
-        self._validate_result(parsed)
+        self._validate_result(parsed, effective_fields)
 
         # Measure thesaurus coverage
         coverage_count = 0
-        if self._thesaurus.term_count > 0:
+        if self._thesaurus.term_count > 0 and "keywords" in effective_fields:
             coverage_count, matched = self._thesaurus.coverage(parsed["keywords"])
             logger.info(
                 "Thesaurus coverage: %d/%d keywords matched: %s",
@@ -298,12 +357,9 @@ class BedrockInference:
             {"MetricName": "bedrock-output-tokens", "Value": output_tokens, "Unit": "Count"},
         ])
 
+        metadata = {k: parsed[k] for k in effective_fields}
         return InferenceResult(
-            abstract=parsed["abstract"],
-            keywords=parsed["keywords"],
-            learning_level=parsed["learning_level"],
-            intended_audience=parsed["intended_audience"],
-            category=parsed["category"],
+            **metadata,
             processing_time_ms=elapsed_ms,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
@@ -466,14 +522,7 @@ class BedrockInference:
             return None
 
     @staticmethod
-    def _validate_result(result: dict) -> None:
-        """Validate that the parsed result has all required fields with valid values."""
-        required = {"abstract", "keywords", "learning_level", "intended_audience", "category"}
-        missing = required - set(result.keys())
-        if missing:
-            raise ValueError(f"Missing required fields: {', '.join(sorted(missing))}")
-
-        # abstract: string with two paragraphs
+    def _validate_abstract(result: dict) -> None:
         abstract = result["abstract"]
         if not isinstance(abstract, str) or "\n\n" not in abstract:
             raise ValueError(
@@ -492,7 +541,8 @@ class BedrockInference:
                     f"(expected 50–150)"
                 )
 
-        # keywords: array of 8–12 strings
+    @staticmethod
+    def _validate_keywords(result: dict) -> None:
         keywords = result["keywords"]
         if not isinstance(keywords, list):
             raise ValueError("keywords must be an array")
@@ -503,23 +553,45 @@ class BedrockInference:
         if not all(isinstance(k, str) and k.strip() for k in keywords):
             raise ValueError("All keywords must be non-empty strings")
 
-        # learning_level
+    @staticmethod
+    def _validate_learning_level(result: dict) -> None:
         if result["learning_level"] not in VALID_LEARNING_LEVELS:
             raise ValueError(
                 f"Invalid learning_level: {result['learning_level']!r}. "
                 f"Must be one of {sorted(VALID_LEARNING_LEVELS)}"
             )
 
-        # intended_audience
+    @staticmethod
+    def _validate_intended_audience(result: dict) -> None:
         if result["intended_audience"] not in VALID_AUDIENCES:
             raise ValueError(
                 f"Invalid intended_audience: {result['intended_audience']!r}. "
                 f"Must be one of {sorted(VALID_AUDIENCES)}"
             )
 
-        # category
+    @staticmethod
+    def _validate_category(result: dict) -> None:
         if result["category"] not in VALID_CATEGORIES:
             raise ValueError(
                 f"Invalid category: {result['category']!r}. "
                 f"Must be one of {sorted(VALID_CATEGORIES)}"
             )
+
+    _FIELD_VALIDATORS = {
+        "abstract": _validate_abstract.__func__,
+        "keywords": _validate_keywords.__func__,
+        "learning_level": _validate_learning_level.__func__,
+        "intended_audience": _validate_intended_audience.__func__,
+        "category": _validate_category.__func__,
+    }
+
+    @staticmethod
+    def _validate_result(result: dict, requested_fields: frozenset[str] | None = None) -> None:
+        """Validate that the parsed result has all required fields with valid values."""
+        fields_to_check = requested_fields or ALL_FIELDS
+        missing = fields_to_check - set(result.keys())
+        if missing:
+            raise ValueError(f"Missing required fields: {', '.join(sorted(missing))}")
+
+        for field in fields_to_check:
+            BedrockInference._FIELD_VALIDATORS[field](result)
