@@ -71,7 +71,7 @@ class TestManifestValidation:
         del manifest["items"][0]["media_type"]
         s3_mock.get_object.return_value = _s3_manifest_response(manifest)
 
-        with pytest.raises(ValidationError, match="Item 0 missing"):
+        with pytest.raises(ValidationError, match="missing 'media_type'"):
             proc.process_manifest("bucket", "test")
 
     def test_invalid_media_type(self, processor):
@@ -100,6 +100,112 @@ class TestManifestValidation:
             proc.process_manifest("bucket", "bad-json")
 
 
+# --- CC3-860: Backfill validation ---
+
+
+def _text_only_manifest():
+    return {
+        "batch_id": "backfill-001",
+        "callback_url": "https://example.com/webhook",
+        "items": [
+            {
+                "item_id": 200,
+                "request_id": 1,
+                "resource_center": "PES",
+                "input_text": "User-provided abstract text.",
+                "input_text_mode": "as_abstract",
+                "requested_fields": ["keywords", "category"],
+            }
+        ],
+    }
+
+
+class TestBackfillValidation:
+    def test_text_only_item_accepted(self, processor):
+        proc, s3_mock, sqs_mock, _ = processor
+        manifest = _text_only_manifest()
+        s3_mock.get_object.return_value = _s3_manifest_response(manifest)
+        s3_mock.exceptions.NoSuchKey = type("NoSuchKey", (Exception,), {})
+
+        with patch.dict("os.environ", {"BULK_QUEUE_URL": "https://sqs/q"}):
+            result = proc.process_manifest("bucket", "backfill-001")
+
+        assert result["total_items"] == 1
+        assert result["published_count"] == 1
+
+    def test_hybrid_item_accepted(self, processor):
+        proc, s3_mock, sqs_mock, _ = processor
+        manifest = {
+            "batch_id": "hybrid-001",
+            "callback_url": "https://example.com/webhook",
+            "items": [{
+                "item_id": 300,
+                "request_id": 2,
+                "s3_key": "PES/archive/paper.pdf",
+                "media_type": "PDF",
+                "resource_center": "PES",
+                "input_text": "Existing abstract.",
+                "input_text_mode": "as_abstract",
+            }],
+        }
+        s3_mock.get_object.return_value = _s3_manifest_response(manifest)
+        s3_mock.exceptions.NoSuchKey = type("NoSuchKey", (Exception,), {})
+
+        with patch.dict("os.environ", {"BULK_QUEUE_URL": "https://sqs/q"}):
+            result = proc.process_manifest("bucket", "hybrid-001")
+
+        assert result["published_count"] == 1
+
+    def test_neither_text_nor_key_rejected(self, processor):
+        proc, s3_mock, _, _ = processor
+        manifest = _valid_manifest()
+        del manifest["items"][0]["s3_key"]
+        s3_mock.get_object.return_value = _s3_manifest_response(manifest)
+
+        with pytest.raises(ValidationError, match="at least one of"):
+            proc.process_manifest("bucket", "test")
+
+    def test_file_without_media_type_rejected(self, processor):
+        proc, s3_mock, _, _ = processor
+        manifest = _valid_manifest()
+        del manifest["items"][0]["media_type"]
+        s3_mock.get_object.return_value = _s3_manifest_response(manifest)
+
+        with pytest.raises(ValidationError, match="missing 'media_type'"):
+            proc.process_manifest("bucket", "test")
+
+    def test_invalid_input_text_mode_rejected(self, processor):
+        proc, s3_mock, _, _ = processor
+        manifest = _text_only_manifest()
+        manifest["items"][0]["input_text_mode"] = "bad_mode"
+        s3_mock.get_object.return_value = _s3_manifest_response(manifest)
+
+        with pytest.raises(ValidationError, match="input_text_mode"):
+            proc.process_manifest("bucket", "test")
+
+    def test_empty_requested_fields_rejected(self, processor):
+        proc, s3_mock, _, _ = processor
+        manifest = _text_only_manifest()
+        manifest["items"][0]["requested_fields"] = []
+        s3_mock.get_object.return_value = _s3_manifest_response(manifest)
+
+        with pytest.raises(ValidationError, match="non-empty"):
+            proc.process_manifest("bucket", "test")
+
+    def test_backward_compat_existing_manifest(self, processor):
+        """Standard manifests with s3_key + media_type still validate."""
+        proc, s3_mock, sqs_mock, _ = processor
+        manifest = _valid_manifest(3)
+        s3_mock.get_object.return_value = _s3_manifest_response(manifest)
+        s3_mock.exceptions.NoSuchKey = type("NoSuchKey", (Exception,), {})
+
+        with patch.dict("os.environ", {"BULK_QUEUE_URL": "https://sqs/q"}):
+            with patch("src.bulk.bulk_processor.time.sleep"):
+                result = proc.process_manifest("bucket", "bulk-test-001")
+
+        assert result["published_count"] == 3
+
+
 # --- Cost estimation ---
 
 
@@ -120,6 +226,16 @@ class TestCostEstimation:
 
         assert estimate["breakdown"] == {"PDF": 1, "MP4": 1}
         assert estimate["total_usd"] == 0.04  # 0.01 + 0.03
+
+    def test_text_only_cost(self):
+        items = [
+            {"item_id": 1, "request_id": 0, "resource_center": "PES", "input_text": "text"},
+            {"item_id": 2, "request_id": 0, "resource_center": "PES", "input_text": "text"},
+        ]
+        estimate = BulkProcessor._estimate_cost(items)
+
+        assert estimate["breakdown"] == {"text": 2}
+        assert estimate["total_usd"] == 0.01  # 2 * 0.005
 
 
 # --- Publish items ---

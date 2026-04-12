@@ -90,15 +90,20 @@ class BulkWorker:
 
         logger.info("[%s] Processing item %s", batch_id, item_id)
 
-        # Step 1: Copy file to /pending/ so orchestrator can find it.
-        pending_key = self._copy_to_pending(bucket, item)
+        has_file = bool(item.get("s3_key"))
+        input_text = item.get("input_text")
+        has_text = isinstance(input_text, str) and bool(input_text.strip())
 
-        # Step 2: Create .meta.json for orchestrator.
-        self._create_meta_json(bucket, item, callback_url)
-
-        # Step 3: Invoke orchestrator.
+        # Step 1-3: Route based on item type.
         try:
-            self._invoke_orchestrator(bucket, pending_key)
+            if has_text and not has_file:
+                # Text-only: skip file copy + meta, use direct invocation
+                self._invoke_orchestrator_direct(bucket, item, callback_url)
+            else:
+                # File path (with or without input_text)
+                pending_key = self._copy_to_pending(bucket, item)
+                self._create_meta_json(bucket, item, callback_url)
+                self._invoke_orchestrator(bucket, pending_key)
             action = "processed"
         except Exception as exc:
             logger.error("[%s] Orchestrator failed for item %s: %s", batch_id, item_id, exc)
@@ -128,9 +133,10 @@ class BulkWorker:
         ext = EXTENSION_MAP.get(item["media_type"], "pdf")
         pending_key = f"{ou}/pending/{item_id}.{ext}"
 
+        source_bucket = item.get("source_bucket", bucket)
         self._s3.copy_object(
             Bucket=bucket,
-            CopySource={"Bucket": bucket, "Key": s3_key},
+            CopySource={"Bucket": source_bucket, "Key": s3_key},
             Key=pending_key,
         )
         logger.info("Copied %s -> %s", s3_key, pending_key)
@@ -156,6 +162,13 @@ class BulkWorker:
             },
         }
 
+        # Forward CC3-858 fields for hybrid items (input_text + file)
+        if item.get("input_text"):
+            meta["input_text"] = item["input_text"]
+            meta["input_text_mode"] = item.get("input_text_mode", "as_source")
+        if item.get("requested_fields"):
+            meta["requested_fields"] = item["requested_fields"]
+
         meta_key = f"{ou}/metadata/{item_id}.meta.json"
         self._s3.put_object(
             Bucket=bucket,
@@ -167,23 +180,48 @@ class BulkWorker:
         return meta_key
 
     def _invoke_orchestrator(self, bucket: str, key: str) -> dict:
-        """Invoke the orchestrator Lambda synchronously."""
+        """Invoke the orchestrator Lambda with standard S3-key payload."""
         payload = json.dumps({"bucket": bucket, "key": key}).encode()
+        return self._invoke_lambda(payload)
 
+    def _invoke_orchestrator_direct(
+        self, bucket: str, item: dict, callback_url: str
+    ) -> dict:
+        """Invoke orchestrator with direct invocation (text-only, no S3 file)."""
+        meta = {
+            "item_id": str(item["item_id"]),
+            "ou": item["resource_center"],
+            "product_part_number": str(item.get("request_id", item["item_id"])),
+            "ai_enrichment_enabled": True,
+            "callback_url": callback_url,
+            "input_text": item["input_text"],
+            "input_text_mode": item.get("input_text_mode", "as_source"),
+            "content": {"media_type": "text/plain"},
+        }
+        if item.get("requested_fields"):
+            meta["requested_fields"] = item["requested_fields"]
+
+        payload = json.dumps({"bucket": bucket, "meta": meta}).encode()
+        return self._invoke_lambda(payload)
+
+    def _invoke_lambda(self, payload: bytes) -> dict:
+        """Invoke orchestrator Lambda and validate the response."""
         response = self._lambda.invoke(
             FunctionName=ORCHESTRATOR_FUNCTION,
             InvocationType="RequestResponse",
             Payload=payload,
         )
 
+        # Read payload once to avoid consuming the stream twice
+        raw_payload = response["Payload"].read()
+
         if response.get("FunctionError"):
-            raw = response["Payload"].read()
-            error_payload = raw.decode() if isinstance(raw, bytes) else raw
+            error_payload = raw_payload.decode() if isinstance(raw_payload, bytes) else raw_payload
             raise BulkProcessingError(
                 f"Orchestrator returned FunctionError: {error_payload}"
             )
 
-        result = json.loads(response["Payload"].read())
+        result = json.loads(raw_payload)
         status = result.get("statusCode", 0)
         if status != 200:
             raise BulkProcessingError(

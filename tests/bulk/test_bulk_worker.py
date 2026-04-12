@@ -18,15 +18,30 @@ def _make_item(
     s3_key: str = "PES/archive/paper.pdf",
     resource_center: str = "PES",
     request_id: int = 0,
+    input_text: str | None = None,
+    input_text_mode: str | None = None,
+    requested_fields: list[str] | None = None,
+    source_bucket: str | None = None,
 ) -> dict:
-    return {
+    item = {
         "item_id": item_id,
         "request_id": request_id,
-        "s3_key": s3_key,
-        "media_type": media_type,
         "resource_center": resource_center,
         "title": "Test Paper",
     }
+    # Only include media_type for file-backed items (mirrors real payloads)
+    if s3_key is not None:
+        item["media_type"] = media_type
+        item["s3_key"] = s3_key
+    if input_text is not None:
+        item["input_text"] = input_text
+    if input_text_mode is not None:
+        item["input_text_mode"] = input_text_mode
+    if requested_fields is not None:
+        item["requested_fields"] = requested_fields
+    if source_bucket is not None:
+        item["source_bucket"] = source_bucket
+    return item
 
 
 def _make_sqs_record(
@@ -257,6 +272,171 @@ class TestCompletionNotification:
             w._send_completion_notification("test", progress)
 
         sns_mock.publish.assert_not_called()
+
+
+# --- CC3-860: Text-only path ---
+
+
+class TestTextOnlyPath:
+    def test_skips_copy_and_meta(self, worker):
+        w, lambda_mock, s3_mock, _ = worker
+        lambda_mock.invoke.return_value = _orchestrator_success_response()
+        s3_mock.get_object.return_value = _progress_response(completed=0, total=1)
+        item = _make_item(s3_key=None, input_text="User abstract.")
+        record = _make_sqs_record(item=item, total_items=1)
+
+        w.process_item(record)
+
+        # No copy_object (no file to copy)
+        s3_mock.copy_object.assert_not_called()
+        # put_object only for progress, NOT for meta.json
+        put_calls = s3_mock.put_object.call_args_list
+        put_keys = [c[1]["Key"] for c in put_calls]
+        assert not any("meta.json" in k for k in put_keys)
+
+    def test_direct_invocation_format(self, worker):
+        w, lambda_mock, s3_mock, _ = worker
+        lambda_mock.invoke.return_value = _orchestrator_success_response()
+        s3_mock.get_object.return_value = _progress_response(completed=0, total=1)
+        item = _make_item(s3_key=None, input_text="User abstract.")
+        record = _make_sqs_record(item=item, total_items=1)
+
+        w.process_item(record)
+
+        payload = json.loads(lambda_mock.invoke.call_args[1]["Payload"])
+        assert "meta" in payload
+        assert "key" not in payload
+        assert payload["meta"]["input_text"] == "User abstract."
+
+    def test_meta_fields_correct(self, worker):
+        w, lambda_mock, s3_mock, _ = worker
+        lambda_mock.invoke.return_value = _orchestrator_success_response()
+        s3_mock.get_object.return_value = _progress_response(completed=0, total=1)
+        item = _make_item(item_id=42, s3_key=None, input_text="Text.", request_id=7)
+        record = _make_sqs_record(item=item, total_items=1)
+
+        w.process_item(record)
+
+        meta = json.loads(lambda_mock.invoke.call_args[1]["Payload"])["meta"]
+        assert meta["item_id"] == "42"
+        assert meta["ou"] == "PES"
+        assert meta["product_part_number"] == "7"
+        assert meta["ai_enrichment_enabled"] is True
+        assert meta["content"]["media_type"] == "text/plain"
+        assert meta["callback_url"] == "https://example.com/webhook"
+
+    def test_with_requested_fields(self, worker):
+        w, lambda_mock, s3_mock, _ = worker
+        lambda_mock.invoke.return_value = _orchestrator_success_response()
+        s3_mock.get_object.return_value = _progress_response(completed=0, total=1)
+        item = _make_item(
+            s3_key=None, input_text="Text.",
+            requested_fields=["keywords", "category"],
+        )
+        record = _make_sqs_record(item=item, total_items=1)
+
+        w.process_item(record)
+
+        meta = json.loads(lambda_mock.invoke.call_args[1]["Payload"])["meta"]
+        assert meta["requested_fields"] == ["keywords", "category"]
+
+    def test_with_as_abstract_mode(self, worker):
+        w, lambda_mock, s3_mock, _ = worker
+        lambda_mock.invoke.return_value = _orchestrator_success_response()
+        s3_mock.get_object.return_value = _progress_response(completed=0, total=1)
+        item = _make_item(
+            s3_key=None, input_text="Abstract.",
+            input_text_mode="as_abstract",
+        )
+        record = _make_sqs_record(item=item, total_items=1)
+
+        w.process_item(record)
+
+        meta = json.loads(lambda_mock.invoke.call_args[1]["Payload"])["meta"]
+        assert meta["input_text_mode"] == "as_abstract"
+
+    def test_still_updates_progress(self, worker):
+        w, lambda_mock, s3_mock, _ = worker
+        lambda_mock.invoke.return_value = _orchestrator_success_response()
+        s3_mock.get_object.return_value = _progress_response(completed=0, total=1)
+        item = _make_item(s3_key=None, input_text="Text.")
+        record = _make_sqs_record(item=item, total_items=1)
+
+        result = w.process_item(record)
+
+        assert result["action"] == "processed"
+        # Progress file written
+        put_calls = s3_mock.put_object.call_args_list
+        progress_puts = [c for c in put_calls if "progress" in c[1]["Key"]]
+        assert len(progress_puts) == 1
+
+
+# --- CC3-860: Hybrid path ---
+
+
+class TestHybridPath:
+    def test_copies_file_and_adds_text_to_meta(self, worker):
+        w, lambda_mock, s3_mock, _ = worker
+        lambda_mock.invoke.return_value = _orchestrator_success_response()
+        s3_mock.get_object.return_value = _progress_response(completed=0, total=1)
+        item = _make_item(
+            input_text="Existing abstract.",
+            input_text_mode="as_abstract",
+            requested_fields=["keywords", "category"],
+        )
+        record = _make_sqs_record(item=item, total_items=1)
+
+        w.process_item(record)
+
+        # File was copied
+        s3_mock.copy_object.assert_called_once()
+        # Meta.json includes input_text fields
+        meta_put = [
+            c for c in s3_mock.put_object.call_args_list
+            if "meta.json" in c[1]["Key"]
+        ]
+        assert len(meta_put) == 1
+        meta = json.loads(meta_put[0][1]["Body"])
+        assert meta["input_text"] == "Existing abstract."
+        assert meta["input_text_mode"] == "as_abstract"
+        assert meta["requested_fields"] == ["keywords", "category"]
+
+    def test_uses_standard_key_path(self, worker):
+        w, lambda_mock, s3_mock, _ = worker
+        lambda_mock.invoke.return_value = _orchestrator_success_response()
+        s3_mock.get_object.return_value = _progress_response(completed=0, total=1)
+        item = _make_item(input_text="Text.")
+        record = _make_sqs_record(item=item, total_items=1)
+
+        w.process_item(record)
+
+        payload = json.loads(lambda_mock.invoke.call_args[1]["Payload"])
+        assert "key" in payload
+        assert "meta" not in payload
+
+
+# --- CC3-860: Cross-bucket copy ---
+
+
+class TestCrossBucketCopy:
+    def test_uses_source_bucket(self, worker):
+        w, _, s3_mock, _ = worker
+        item = _make_item(source_bucket="other-bucket")
+
+        w._copy_to_pending("pipeline-bucket", item)
+
+        call_kwargs = s3_mock.copy_object.call_args[1]
+        assert call_kwargs["CopySource"]["Bucket"] == "other-bucket"
+        assert call_kwargs["Bucket"] == "pipeline-bucket"
+
+    def test_no_source_bucket_uses_default(self, worker):
+        w, _, s3_mock, _ = worker
+        item = _make_item()
+
+        w._copy_to_pending("pipeline-bucket", item)
+
+        call_kwargs = s3_mock.copy_object.call_args[1]
+        assert call_kwargs["CopySource"]["Bucket"] == "pipeline-bucket"
 
 
 # --- Process item end-to-end ---
