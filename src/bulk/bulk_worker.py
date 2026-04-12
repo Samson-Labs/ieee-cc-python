@@ -91,7 +91,8 @@ class BulkWorker:
         logger.info("[%s] Processing item %s", batch_id, item_id)
 
         has_file = bool(item.get("s3_key"))
-        has_text = bool(item.get("input_text"))
+        input_text = item.get("input_text")
+        has_text = isinstance(input_text, str) and bool(input_text.strip())
 
         # Step 1-3: Route based on item type.
         try:

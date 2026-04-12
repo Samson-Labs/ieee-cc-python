@@ -26,11 +26,12 @@ def _make_item(
     item = {
         "item_id": item_id,
         "request_id": request_id,
-        "media_type": media_type,
         "resource_center": resource_center,
         "title": "Test Paper",
     }
+    # Only include media_type for file-backed items (mirrors real payloads)
     if s3_key is not None:
+        item["media_type"] = media_type
         item["s3_key"] = s3_key
     if input_text is not None:
         item["input_text"] = input_text

@@ -233,7 +233,9 @@ class AIOrchestrator:
                     "The following is a finalized abstract for an IEEE publication. "
                     "Generate metadata based on this abstract:\n\n" + extracted_text
                 )
-            # Only forward requested_fields when explicitly specified
+            # Forward requested_fields to Bedrock when the caller specified a
+            # subset OR when as_abstract mode removed "abstract" from the set —
+            # so Bedrock only generates the fields we actually need.
             bedrock_rf = effective_fields if requested_fields_raw or input_text_mode == "as_abstract" else None
             bedrock_result = self._invoke_bedrock(
                 bedrock_text, correlation, requested_fields=bedrock_rf
@@ -281,7 +283,12 @@ class AIOrchestrator:
             else:
                 signal = "extraction_ready"
 
-            generated_fields = sorted(effective_fields)
+            # Derive generated_fields from actual Bedrock output, not intent —
+            # avoids claiming fields were generated when Bedrock was skipped.
+            actual_fields = set(bedrock_result.keys()) & ALL_FIELDS
+            if input_text_mode == "as_abstract" and input_text:
+                actual_fields.discard("abstract")
+            generated_fields = sorted(actual_fields)
 
             payload = {
                 "request_id": meta.get("request_id") or request_id,
