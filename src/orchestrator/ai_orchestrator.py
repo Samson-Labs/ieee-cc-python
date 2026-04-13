@@ -161,7 +161,7 @@ class AIOrchestrator:
         meta_ou = meta.get("ou", meta["content"].get("resource_center", ou))
         product_part_number = meta.get(
             "product_part_number",
-            meta["content"].get("resource_center", meta_ou) + "_" + meta_item_id,
+            meta["content"].get("resource_center", meta_ou) + "_" + str(meta_item_id),
         )
 
         # Step 2: Route based on ai_enrichment_enabled
