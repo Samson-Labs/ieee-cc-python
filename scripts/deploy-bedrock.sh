@@ -106,6 +106,11 @@ create_lambda_role() {
                     \"arn:aws:bedrock:${AWS_REGION}::foundation-model/*\",
                     \"arn:aws:bedrock:${AWS_REGION}:${AWS_ACCOUNT_ID}:inference-profile/*\"
                 ]
+            },
+            {
+                \"Effect\": \"Allow\",
+                \"Action\": [\"cloudwatch:PutMetricData\"],
+                \"Resource\": \"*\"
             }
         ]
     }"
