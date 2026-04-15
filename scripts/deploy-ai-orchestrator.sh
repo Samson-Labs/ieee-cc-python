@@ -110,7 +110,12 @@ create_lambda_role() {
             {
                 \"Effect\": \"Allow\",
                 \"Action\": [\"cloudwatch:PutMetricData\"],
-                \"Resource\": \"*\"
+                \"Resource\": \"*\",
+                \"Condition\": {
+                    \"StringEquals\": {
+                        \"cloudwatch:namespace\": \"ieee-rc\"
+                    }
+                }
             }
         ]
     }"
