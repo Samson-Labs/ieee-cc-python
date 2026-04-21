@@ -106,6 +106,16 @@ create_lambda_role() {
                     \"arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:ieee-cc-video-transcriber\",
                     \"arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:ieee-cc-bedrock-inference\"
                 ]
+            },
+            {
+                \"Effect\": \"Allow\",
+                \"Action\": [\"cloudwatch:PutMetricData\"],
+                \"Resource\": \"*\",
+                \"Condition\": {
+                    \"StringEquals\": {
+                        \"cloudwatch:namespace\": \"ieee-rc\"
+                    }
+                }
             }
         ]
     }"
