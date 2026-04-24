@@ -356,6 +356,67 @@ class TestVideoFlow:
 
 
 # ---------------------------------------------------------------
+# AI Enabled — PPTX Flow (CC3-881)
+# ---------------------------------------------------------------
+
+class TestPptxFlow:
+    def test_dispatches_to_pptx_extractor(self, orchestrator):
+        orch, s3, lam = orchestrator
+        meta = _make_meta(
+            ai_enabled=True,
+            media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        )
+        meta["content"]["filename"] = "deck.pptx"
+        s3.get_object.return_value = _s3_get_object_response(meta)
+
+        extraction_body = {"text": "slide content", "slide_count": 10, "extraction_method": "text"}
+        bedrock_body = {"abstract": "deck", "keywords": ["slides"], "learning_level": "Foundational", "intended_audience": "New", "category": "Tutorial"}
+
+        lam.invoke.side_effect = [
+            _lambda_invoke_response(200, extraction_body),
+            _lambda_invoke_response(200, bedrock_body),
+        ]
+
+        result = orch.process("bucket", "AESS/pending/deck.pptx")
+
+        assert result["action"] == "enriched"
+        first_call = lam.invoke.call_args_list[0]
+        assert first_call[1]["FunctionName"] == "ieee-rc-pptx-extractor"
+
+    def test_drupal_powerpoint_media_type_normalized(self, orchestrator):
+        """Drupal sends 'PowerPoint' instead of the MIME — verify normalization."""
+        orch, s3, lam = orchestrator
+        meta = _make_meta(ai_enabled=True, media_type="PowerPoint")
+        meta["content"]["filename"] = "deck.pptx"
+        s3.get_object.return_value = _s3_get_object_response(meta)
+
+        lam.invoke.side_effect = [
+            _lambda_invoke_response(200, {"text": "t", "slide_count": 1, "extraction_method": "text"}),
+            _lambda_invoke_response(200, {"abstract": "a", "keywords": [], "learning_level": "Expert"}),
+        ]
+
+        result = orch.process("bucket", "PES/pending/deck.pptx")
+        assert result["action"] == "enriched"
+        assert lam.invoke.call_args_list[0][1]["FunctionName"] == "ieee-rc-pptx-extractor"
+
+    def test_raw_pptx_alias_routes_to_extractor(self, orchestrator):
+        """Shorthand 'pptx' media type also routes correctly."""
+        orch, s3, lam = orchestrator
+        meta = _make_meta(ai_enabled=True, media_type="pptx")
+        meta["content"]["filename"] = "deck.pptx"
+        s3.get_object.return_value = _s3_get_object_response(meta)
+
+        lam.invoke.side_effect = [
+            _lambda_invoke_response(200, {"text": "t", "slide_count": 2, "extraction_method": "text"}),
+            _lambda_invoke_response(200, {"abstract": "a", "keywords": [], "learning_level": "Expert"}),
+        ]
+
+        result = orch.process("bucket", "PES/pending/deck.pptx")
+        assert result["action"] == "enriched"
+        assert lam.invoke.call_args_list[0][1]["FunctionName"] == "ieee-rc-pptx-extractor"
+
+
+# ---------------------------------------------------------------
 # Lambda Dispatch Errors
 # ---------------------------------------------------------------
 

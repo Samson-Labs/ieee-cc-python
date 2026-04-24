@@ -40,16 +40,24 @@ TRANSCRIBE_COST_PER_MINUTE = float(
 # Media type routing
 PDF_MEDIA_TYPES = {"application/pdf"}
 VIDEO_MEDIA_TYPES = {"video/mp4", "video/quicktime", "video/webm"}
+PPTX_MEDIA_TYPES = {
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "application/vnd.ms-powerpoint",
+    "pptx",
+}
 
 # Normalize Drupal-style media types to MIME types.
 MEDIA_TYPE_MAP = {
     "PDF": "application/pdf",
     "Video": "video/mp4",
+    "PowerPoint": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "Presentation": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
 }
 
 # Lambda function names for dispatch (configurable via env vars)
 PDF_EXTRACTOR_FUNCTION = os.environ.get("PDF_EXTRACTOR_FUNCTION", "ieee-cc-pdf-extractor")
 VIDEO_TRANSCRIBER_FUNCTION = os.environ.get("VIDEO_TRANSCRIBER_FUNCTION", "ieee-cc-video-transcriber")
+PPTX_EXTRACTOR_FUNCTION = os.environ.get("PPTX_EXTRACTOR_FUNCTION", "ieee-rc-pptx-extractor")
 BEDROCK_FUNCTION = os.environ.get("BEDROCK_FUNCTION", "ieee-cc-bedrock-inference")
 
 # Webhook secret
@@ -516,6 +524,9 @@ class AIOrchestrator:
         elif media_type in VIDEO_MEDIA_TYPES:
             function_name = VIDEO_TRANSCRIBER_FUNCTION
             logger.info("%s Dispatching to video transcriber", correlation)
+        elif media_type in PPTX_MEDIA_TYPES:
+            function_name = PPTX_EXTRACTOR_FUNCTION
+            logger.info("%s Dispatching to PPTX extractor", correlation)
         else:
             raise ValueError(f"Unsupported media type: {media_type}")
 
