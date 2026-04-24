@@ -81,6 +81,34 @@ class DLQProcessor:
         """Check whether the error is retriable using the message flag."""
         return error.get("is_retriable", False) is True
 
+    @staticmethod
+    def _extract_source_bucket(original_event: dict) -> str | None:
+        """Extract the source S3 bucket from the original pipeline event.
+
+        Supports both orchestrator entry shapes:
+        - S3 trigger: ``{"Records": [{"s3": {"bucket": {"name": ...}}}]}``
+        - Direct invoke: ``{"bucket": "...", ...}``
+
+        Returns the bucket name, or ``None`` if neither shape is present.
+        """
+        if not isinstance(original_event, dict):
+            return None
+
+        records = original_event.get("Records")
+        if isinstance(records, list) and records:
+            try:
+                name = records[0]["s3"]["bucket"]["name"]
+                if isinstance(name, str) and name:
+                    return name
+            except (KeyError, TypeError):
+                pass
+
+        bucket = original_event.get("bucket")
+        if isinstance(bucket, str) and bucket:
+            return bucket
+
+        return None
+
     def _reprocess(self, message: dict, retry_count: int) -> dict:
         """Re-invoke the orchestrator Lambda with the original event."""
         function_name = os.environ.get(
@@ -108,13 +136,26 @@ class DLQProcessor:
         return {"action": "reprocessed"}
 
     def _archive_and_notify(self, message: dict, retry_count: int) -> dict:
-        """Archive the failed message to S3 and publish an SNS alert."""
+        """Archive the failed message to S3 and publish an SNS alert.
+
+        The archive bucket is derived from the original pipeline event so
+        staging failures archive under ``staging-...`` and dev failures
+        archive under ``dev-...``. ``ARCHIVE_BUCKET`` env var is a fallback
+        only — used when the event shape lacks a bucket.
+        """
         error = message.get("error", {})
         correlation_id = error.get("correlation_id", "") or "unknown"
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        bucket = os.environ.get(
-            "ARCHIVE_BUCKET", "dev-ieee-conference-cloud-bulk-uploads"
-        )
+
+        bucket = self._extract_source_bucket(message.get("original_event", {}))
+        if not bucket:
+            bucket = os.environ.get("ARCHIVE_BUCKET")
+        if not bucket:
+            raise KeyError(
+                "Unable to resolve archive bucket: original_event has no "
+                "bucket and ARCHIVE_BUCKET env var is not set"
+            )
+
         key = f"failed/{correlation_id}/{timestamp}.json"
 
         self._s3.put_object(
