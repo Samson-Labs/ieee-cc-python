@@ -182,7 +182,7 @@ class TestInvalidMessage:
 
         # Invalid-message synthetic payload has no original_event, so
         # the env var fallback is required to resolve an archive bucket.
-        with patch.dict("os.environ", {"ARCHIVE_BUCKET": "dev-ieee-conference-cloud-bulk-uploads"}):
+        with patch.dict("os.environ", {"ARCHIVE_BUCKET": "fallback-bucket"}):
             result = proc.process_message(record)
 
         assert result == {"action": "archived"}
@@ -193,7 +193,7 @@ class TestInvalidMessage:
         proc, lambda_mock, s3_mock, _ = processor
         record = {"messageId": "msg-nobody"}
 
-        with patch.dict("os.environ", {"ARCHIVE_BUCKET": "dev-ieee-conference-cloud-bulk-uploads"}):
+        with patch.dict("os.environ", {"ARCHIVE_BUCKET": "fallback-bucket"}):
             result = proc.process_message(record)
 
         assert result == {"action": "archived"}
@@ -318,7 +318,7 @@ class TestEnvAwareArchiveBucket:
         assert s3_mock.put_object.call_args[1]["Bucket"] == "fallback-bucket"
 
     def test_raises_when_no_bucket_anywhere(self, processor):
-        """Prefer failing loud over silently archiving to a wrong bucket.
+        """Prefer failing loudly over silently archiving to a wrong bucket.
 
         The message stays on the DLQ for manual triage instead of being
         misrouted to a hardcoded default.
@@ -328,7 +328,7 @@ class TestEnvAwareArchiveBucket:
         record = _make_sqs_record(message)
 
         with patch.dict("os.environ", {}, clear=True):
-            with pytest.raises(KeyError, match="archive bucket"):
+            with pytest.raises(RuntimeError, match="archive bucket"):
                 proc.process_message(record)
 
         s3_mock.put_object.assert_not_called()

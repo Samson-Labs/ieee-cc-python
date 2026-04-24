@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from datetime import datetime, timezone
+from typing import Any, Mapping
 
 import boto3
 
@@ -82,7 +83,7 @@ class DLQProcessor:
         return error.get("is_retriable", False) is True
 
     @staticmethod
-    def _extract_source_bucket(original_event: dict) -> str | None:
+    def _extract_source_bucket(original_event: Mapping[str, Any] | None) -> str | None:
         """Extract the source S3 bucket from the original pipeline event.
 
         Supports both orchestrator entry shapes:
@@ -151,7 +152,7 @@ class DLQProcessor:
         if not bucket:
             bucket = os.environ.get("ARCHIVE_BUCKET")
         if not bucket:
-            raise KeyError(
+            raise RuntimeError(
                 "Unable to resolve archive bucket: original_event has no "
                 "bucket and ARCHIVE_BUCKET env var is not set"
             )
