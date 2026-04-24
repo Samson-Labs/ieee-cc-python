@@ -10,7 +10,6 @@ set -euo pipefail
 
 AWS_PROFILE="${AWS_PROFILE:-ieee-cc}"
 AWS_REGION="${AWS_REGION:-us-east-1}"
-AWS_ACCOUNT_ID="${AWS_ACCOUNT_ID:-141770997341}"
 
 ECR_REPO_NAME="ieee-rc-pptx-extractor"
 LAMBDA_FUNCTION_NAME="ieee-rc-pptx-extractor"

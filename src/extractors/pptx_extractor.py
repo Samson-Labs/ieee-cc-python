@@ -15,6 +15,7 @@ from typing import TypedDict
 
 import boto3
 from pptx import Presentation
+from pptx.enum.shapes import MSO_SHAPE_TYPE
 from pptx.exc import PackageNotFoundError
 
 logger = logging.getLogger(__name__)
@@ -180,7 +181,7 @@ def _extract_shape_text(shape) -> list[str]:
     fragments: list[str] = []
 
     # Grouped shapes — recurse.
-    if shape.shape_type == 6:  # MSO_SHAPE_TYPE.GROUP
+    if shape.shape_type == MSO_SHAPE_TYPE.GROUP:
         try:
             for inner in shape.shapes:
                 fragments.extend(_extract_shape_text(inner))
