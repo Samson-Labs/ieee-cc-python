@@ -1,5 +1,7 @@
 """Shared pytest fixtures for the ieee-cc-python test suite."""
 
+from __future__ import annotations
+
 import json
 from unittest.mock import MagicMock
 
@@ -49,10 +51,13 @@ def make_dlq_message(
     is_retriable: bool = True,
     correlation_id: str = "req-123",
     retry_count: int = 0,
+    original_event: dict | None = None,
 ) -> dict:
     """Build a DLQ message payload for testing."""
+    if original_event is None:
+        original_event = {"bucket": "test-bucket", "key": "PES/pending/STD-123.pdf"}
     return {
-        "original_event": {"bucket": "test-bucket", "key": "PES/pending/STD-123.pdf"},
+        "original_event": original_event,
         "error": {
             "error_type": error_type,
             "error_message": error_message,

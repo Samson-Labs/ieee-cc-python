@@ -180,7 +180,10 @@ class TestInvalidMessage:
         proc, lambda_mock, s3_mock, _ = processor
         record = {"messageId": "msg-bad", "body": "not json!!!"}
 
-        result = proc.process_message(record)
+        # Invalid-message synthetic payload has no original_event, so
+        # the env var fallback is required to resolve an archive bucket.
+        with patch.dict("os.environ", {"ARCHIVE_BUCKET": "fallback-bucket"}):
+            result = proc.process_message(record)
 
         assert result == {"action": "archived"}
         lambda_mock.invoke.assert_not_called()
@@ -190,7 +193,8 @@ class TestInvalidMessage:
         proc, lambda_mock, s3_mock, _ = processor
         record = {"messageId": "msg-nobody"}
 
-        result = proc.process_message(record)
+        with patch.dict("os.environ", {"ARCHIVE_BUCKET": "fallback-bucket"}):
+            result = proc.process_message(record)
 
         assert result == {"action": "archived"}
         lambda_mock.invoke.assert_not_called()
@@ -209,5 +213,124 @@ class TestIsRetriable:
     def test_false_when_flag_is_string_true(self):
         """Only boolean True is accepted, not truthy strings."""
         assert DLQProcessor._is_retriable({"is_retriable": "true"}) is False
+
+
+class TestExtractSourceBucket:
+    def test_direct_invoke_shape(self):
+        event = {"bucket": "my-bucket", "key": "ou/pending/f.pdf"}
+        assert DLQProcessor._extract_source_bucket(event) == "my-bucket"
+
+    def test_s3_records_shape(self):
+        event = {
+            "Records": [
+                {"s3": {"bucket": {"name": "my-records-bucket"}, "object": {"key": "x"}}}
+            ]
+        }
+        assert DLQProcessor._extract_source_bucket(event) == "my-records-bucket"
+
+    def test_records_shape_preferred_when_both_present(self):
+        event = {
+            "bucket": "direct-bucket",
+            "Records": [{"s3": {"bucket": {"name": "records-bucket"}}}],
+        }
+        assert DLQProcessor._extract_source_bucket(event) == "records-bucket"
+
+    def test_returns_none_for_empty_dict(self):
+        assert DLQProcessor._extract_source_bucket({}) is None
+
+    def test_returns_none_for_non_dict(self):
+        assert DLQProcessor._extract_source_bucket(None) is None
+        assert DLQProcessor._extract_source_bucket("string") is None
+
+    def test_returns_none_when_records_malformed(self):
+        assert DLQProcessor._extract_source_bucket({"Records": []}) is None
+        assert DLQProcessor._extract_source_bucket({"Records": [{}]}) is None
+        assert DLQProcessor._extract_source_bucket({"Records": [{"s3": {}}]}) is None
+
+    def test_returns_none_when_bucket_is_empty_string(self):
+        assert DLQProcessor._extract_source_bucket({"bucket": ""}) is None
+
+
+class TestEnvAwareArchiveBucket:
+    """Regression tests for CC3-880: archive bucket must track source event env."""
+
+    def test_dev_event_archives_to_dev_bucket(self, processor):
+        proc, _, s3_mock, _ = processor
+        message = _make_dlq_message(
+            is_retriable=False,
+            original_event={
+                "bucket": "dev-ieee-conference-cloud-bulk-uploads",
+                "key": "PES/pending/x.pdf",
+            },
+        )
+        record = _make_sqs_record(message)
+
+        proc.process_message(record)
+
+        assert s3_mock.put_object.call_args[1]["Bucket"] == "dev-ieee-conference-cloud-bulk-uploads"
+
+    def test_staging_event_archives_to_staging_bucket(self, processor):
+        proc, _, s3_mock, _ = processor
+        message = _make_dlq_message(
+            is_retriable=False,
+            original_event={
+                "bucket": "staging-ieee-conference-cloud-bulk-uploads",
+                "key": "PES/pending/x.pdf",
+            },
+        )
+        record = _make_sqs_record(message)
+
+        # Env var points to dev bucket; event must override it.
+        with patch.dict("os.environ", {"ARCHIVE_BUCKET": "dev-ieee-conference-cloud-bulk-uploads"}):
+            proc.process_message(record)
+
+        assert s3_mock.put_object.call_args[1]["Bucket"] == "staging-ieee-conference-cloud-bulk-uploads"
+
+    def test_s3_records_event_archives_to_records_bucket(self, processor):
+        proc, _, s3_mock, _ = processor
+        message = _make_dlq_message(
+            is_retriable=False,
+            original_event={
+                "Records": [
+                    {
+                        "s3": {
+                            "bucket": {"name": "staging-ieee-conference-cloud-bulk-uploads"},
+                            "object": {"key": "PES/pending/x.pdf"},
+                        }
+                    }
+                ]
+            },
+        )
+        record = _make_sqs_record(message)
+
+        proc.process_message(record)
+
+        assert s3_mock.put_object.call_args[1]["Bucket"] == "staging-ieee-conference-cloud-bulk-uploads"
+
+    def test_falls_back_to_env_var_when_event_missing_bucket(self, processor):
+        proc, _, s3_mock, _ = processor
+        message = _make_dlq_message(is_retriable=False, original_event={})
+        record = _make_sqs_record(message)
+
+        with patch.dict("os.environ", {"ARCHIVE_BUCKET": "fallback-bucket"}):
+            proc.process_message(record)
+
+        assert s3_mock.put_object.call_args[1]["Bucket"] == "fallback-bucket"
+
+    def test_raises_when_no_bucket_anywhere(self, processor):
+        """Prefer failing loudly over silently archiving to a wrong bucket.
+
+        The message stays on the DLQ for manual triage instead of being
+        misrouted to a hardcoded default.
+        """
+        proc, _, s3_mock, _ = processor
+        message = _make_dlq_message(is_retriable=False, original_event={})
+        record = _make_sqs_record(message)
+
+        with patch.dict("os.environ", {}, clear=True):
+            with pytest.raises(RuntimeError, match="archive bucket"):
+                proc.process_message(record)
+
+        s3_mock.put_object.assert_not_called()
 
 
