@@ -20,7 +20,7 @@ def _default_dimensions() -> list[dict]:
     # Resolved per-call so a Lambda's STAGE/ENVIRONMENT env vars are
     # respected even if set after module import.  ENVIRONMENT wins for
     # explicit override; STAGE is the deploy-script-set fallback.
-    env = os.environ.get("ENVIRONMENT") or os.environ.get("STAGE") or "dev"
+    env = os.environ.get("ENVIRONMENT", os.environ.get("STAGE", "dev"))
     return [
         {"Name": "Environment", "Value": env},
         {"Name": "Project", "Value": "ieee-rc"},

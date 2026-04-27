@@ -34,35 +34,39 @@ pip install -r requirements.txt -r requirements-dev.txt
 ./scripts/invoke.sh <bucket> <key> <ou> <product_part_number>
 ./scripts/teardown.sh
 
-# Image Overlay Generator Lambda
-./scripts/deploy-image-overlay.sh          # first-time full deploy
-./scripts/deploy-image-overlay.sh update   # rebuild + update code only
+# Image Overlay Generator Lambda    (env = dev | staging)
+./scripts/deploy-image-overlay.sh <env>          # first-time full deploy
+./scripts/deploy-image-overlay.sh <env> update   # rebuild + update code only
 ./scripts/invoke-image-overlay.sh <bucket> <key>
 ./scripts/teardown-image-overlay.sh
 
-# Bedrock Metadata Generation Lambda
-./scripts/deploy-bedrock.sh                # first-time full deploy
-./scripts/deploy-bedrock.sh update         # rebuild + update code only
-./scripts/invoke-bedrock.sh <bucket> <key> # S3 metadata reference
-./scripts/invoke-bedrock.sh --text "text"  # direct text invocation
+# Bedrock Metadata Generation Lambda    (env = dev | staging)
+./scripts/deploy-bedrock.sh <env>                # first-time full deploy
+./scripts/deploy-bedrock.sh <env> update         # rebuild + update code only
+./scripts/invoke-bedrock.sh <bucket> <key>       # S3 metadata reference
+./scripts/invoke-bedrock.sh --text "text"        # direct text invocation
 ./scripts/teardown-bedrock.sh
 
-# Video Transcriber Lambda
-./scripts/deploy-video-transcriber.sh          # first-time full deploy
-./scripts/deploy-video-transcriber.sh update   # rebuild + update code only
+# Video Transcriber Lambda    (env = dev | staging)
+./scripts/deploy-video-transcriber.sh <env>          # first-time full deploy
+./scripts/deploy-video-transcriber.sh <env> update   # rebuild + update code only
 ./scripts/invoke-video-transcriber.sh <bucket> <key> <ou> <product_part_number>
 ./scripts/teardown-video-transcriber.sh
 
-# AI Orchestrator Lambda
-./scripts/deploy-ai-orchestrator.sh            # first-time full deploy
-./scripts/deploy-ai-orchestrator.sh update     # rebuild + update code only
+# AI Orchestrator Lambda    (env = dev | staging)
+./scripts/deploy-ai-orchestrator.sh <env>            # first-time full deploy
+./scripts/deploy-ai-orchestrator.sh <env> update     # rebuild + update code only
 ./scripts/invoke-ai-orchestrator.sh <bucket> <key>
 ./scripts/teardown-ai-orchestrator.sh
 
-# DLQ Processor Lambda
-./scripts/deploy-dlq-processor.sh              # first-time full deploy
-./scripts/deploy-dlq-processor.sh update       # rebuild + update code only
-./scripts/invoke-dlq-processor.sh              # test with sample DLQ event
+# PPTX Extractor Lambda    (env = dev | staging)
+./scripts/deploy-pptx-extractor.sh <env>             # first-time full deploy
+./scripts/deploy-pptx-extractor.sh <env> update      # rebuild + update code only
+
+# DLQ Processor Lambda    (env = dev | staging)
+./scripts/deploy-dlq-processor.sh <env>              # first-time full deploy
+./scripts/deploy-dlq-processor.sh <env> update       # rebuild + update code only
+./scripts/invoke-dlq-processor.sh                    # test with sample DLQ event
 ./scripts/teardown-dlq-processor.sh
 
 # Bulk Processor Lambda (manifest dispatcher)

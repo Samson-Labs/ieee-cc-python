@@ -15,10 +15,14 @@
 set -euo pipefail
 
 ENV="${1:-}"
-if [[ -z "${ENV}" || "${ENV}" == "update" ]]; then
-    echo "Usage: $0 <env> [update]   # env = dev | staging" >&2
-    exit 1
-fi
+case "${ENV}" in
+    dev|staging) ;;
+    *)
+        echo "Usage: $0 <env> [update]   # env = dev | staging" >&2
+        echo "       (prod naming is part of CC3-851; not accepted here)" >&2
+        exit 1
+        ;;
+esac
 
 AWS_PROFILE="${AWS_PROFILE:-ieee-cc}"
 AWS_REGION="${AWS_REGION:-us-east-1}"
