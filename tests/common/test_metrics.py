@@ -120,3 +120,54 @@ class TestPublishMetrics:
 
         # Missing MetricName key — should not raise
         publish_metrics(cw, [{"Value": 1}])
+
+
+class TestEnvironmentDimension:
+    """ENVIRONMENT wins; STAGE is the fallback set by deploy scripts."""
+
+    def _env_value(self, cw):
+        dims = cw.put_metric_data.call_args[1]["MetricData"][0]["Dimensions"]
+        return next(d["Value"] for d in dims if d["Name"] == "Environment")
+
+    def test_environment_var_wins(self, monkeypatch):
+        monkeypatch.setenv("ENVIRONMENT", "explicit")
+        monkeypatch.setenv("STAGE", "dev")
+        cw = MagicMock()
+
+        publish_metrics(cw, [{"MetricName": "m", "Value": 1, "Unit": "Count"}])
+
+        assert self._env_value(cw) == "explicit"
+
+    def test_stage_fallback_when_environment_unset(self, monkeypatch):
+        monkeypatch.delenv("ENVIRONMENT", raising=False)
+        monkeypatch.setenv("STAGE", "staging")
+        cw = MagicMock()
+
+        publish_metrics(cw, [{"MetricName": "m", "Value": 1, "Unit": "Count"}])
+
+        assert self._env_value(cw) == "staging"
+
+    def test_defaults_to_dev_when_neither_set(self, monkeypatch):
+        monkeypatch.delenv("ENVIRONMENT", raising=False)
+        monkeypatch.delenv("STAGE", raising=False)
+        cw = MagicMock()
+
+        publish_metrics(cw, [{"MetricName": "m", "Value": 1, "Unit": "Count"}])
+
+        assert self._env_value(cw) == "dev"
+
+    def test_resolved_per_call_not_at_import(self, monkeypatch):
+        # Simulate STAGE being set after metrics module was imported —
+        # the bug we're fixing: original DEFAULT_DIMENSIONS captured value
+        # at import time and ignored later env changes.
+        monkeypatch.delenv("ENVIRONMENT", raising=False)
+        monkeypatch.setenv("STAGE", "staging")
+
+        cw = MagicMock()
+        publish_metrics(cw, [{"MetricName": "m", "Value": 1, "Unit": "Count"}])
+        assert self._env_value(cw) == "staging"
+
+        cw.reset_mock()
+        monkeypatch.setenv("STAGE", "dev")
+        publish_metrics(cw, [{"MetricName": "m", "Value": 1, "Unit": "Count"}])
+        assert self._env_value(cw) == "dev"

@@ -7,19 +7,27 @@
 #   - Docker running locally
 #
 # Usage:
-#   ./scripts/deploy-image-overlay.sh                # first-time setup + deploy
-#   ./scripts/deploy-image-overlay.sh update         # rebuild image + update Lambda code only
+#   ./scripts/deploy-image-overlay.sh <env>            # first-time setup + deploy
+#   ./scripts/deploy-image-overlay.sh <env> update     # rebuild + update Lambda code only
+#
+#   <env> = dev | staging   (prod naming handled separately under CC3-851)
 #
 set -euo pipefail
+
+ENV="${1:-}"
+if [[ -z "${ENV}" || "${ENV}" == "update" ]]; then
+    echo "Usage: $0 <env> [update]   # env = dev | staging" >&2
+    exit 1
+fi
 
 AWS_PROFILE="${AWS_PROFILE:-ieee-cc}"
 AWS_REGION="${AWS_REGION:-us-east-1}"
 AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
 
 ECR_REPO_NAME="ieee-rc-image-generator"
-LAMBDA_FUNCTION_NAME="ieee-rc-image-generator"
-TRIGGER_BUCKET_NAME="dev-ieee-conference-cloud-bulk-uploads"
-LAMBDA_ROLE_NAME="ieee-rc-image-generator-role"
+LAMBDA_FUNCTION_NAME="ieee-rc-image-generator-${ENV}"
+TRIGGER_BUCKET_NAME="${ENV}-ieee-conference-cloud-bulk-uploads"
+LAMBDA_ROLE_NAME="ieee-rc-image-generator-${ENV}-role"
 IMAGE_TAG="latest"
 
 ECR_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO_NAME}"
@@ -157,7 +165,7 @@ create_lambda() {
             --memory-size 1024 \
             --timeout 60 \
             --architectures x86_64 \
-            --environment "Variables={LOG_LEVEL=INFO}"
+            --environment "Variables={LOG_LEVEL=INFO,STAGE=${ENV}}"
 
         aws lambda wait function-active-v2 \
             --function-name "${LAMBDA_FUNCTION_NAME}" \
@@ -225,15 +233,15 @@ configure_s3_trigger() {
 # ---------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------
-if [[ "${1:-}" == "update" ]]; then
-    log "Update mode — rebuilding image and updating Lambda code only."
+if [[ "${2:-}" == "update" ]]; then
+    log "Update mode (${ENV}) — rebuilding image and updating Lambda code only."
     build_and_push
     update_lambda_code
     log "Done."
     exit 0
 fi
 
-log "Full deployment starting..."
+log "Full deployment starting (env=${ENV})..."
 create_ecr_repo
 create_lambda_role
 build_and_push

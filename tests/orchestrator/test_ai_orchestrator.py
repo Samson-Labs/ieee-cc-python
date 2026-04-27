@@ -258,11 +258,11 @@ class TestPDFFlow:
 
         # First call: PDF extractor
         first_call = lam.invoke.call_args_list[0]
-        assert first_call[1]["FunctionName"] == "ieee-cc-pdf-extractor"
+        assert first_call[1]["FunctionName"] == "ieee-cc-pdf-extractor-dev"
 
         # Second call: Bedrock
         second_call = lam.invoke.call_args_list[1]
-        assert second_call[1]["FunctionName"] == "ieee-cc-bedrock-inference"
+        assert second_call[1]["FunctionName"] == "ieee-cc-bedrock-inference-dev"
 
     def test_skips_bedrock_when_no_text(self, orchestrator):
         orch, s3, lam = orchestrator
@@ -301,7 +301,7 @@ class TestVideoFlow:
 
         assert result["action"] == "enriched"
         first_call = lam.invoke.call_args_list[0]
-        assert first_call[1]["FunctionName"] == "ieee-cc-video-transcriber"
+        assert first_call[1]["FunctionName"] == "ieee-cc-video-transcriber-dev"
 
     def test_supports_quicktime_media_type(self, orchestrator):
         orch, s3, lam = orchestrator
@@ -381,7 +381,7 @@ class TestPptxFlow:
 
         assert result["action"] == "enriched"
         first_call = lam.invoke.call_args_list[0]
-        assert first_call[1]["FunctionName"] == "ieee-rc-pptx-extractor"
+        assert first_call[1]["FunctionName"] == "ieee-rc-pptx-extractor-dev"
 
     def test_drupal_powerpoint_media_type_normalized(self, orchestrator):
         """Drupal sends 'PowerPoint' instead of the MIME — verify normalization."""
@@ -397,7 +397,7 @@ class TestPptxFlow:
 
         result = orch.process("bucket", "PES/pending/deck.pptx")
         assert result["action"] == "enriched"
-        assert lam.invoke.call_args_list[0][1]["FunctionName"] == "ieee-rc-pptx-extractor"
+        assert lam.invoke.call_args_list[0][1]["FunctionName"] == "ieee-rc-pptx-extractor-dev"
 
     def test_raw_pptx_alias_routes_to_extractor(self, orchestrator):
         """Shorthand 'pptx' media type also routes correctly."""
@@ -413,7 +413,7 @@ class TestPptxFlow:
 
         result = orch.process("bucket", "PES/pending/deck.pptx")
         assert result["action"] == "enriched"
-        assert lam.invoke.call_args_list[0][1]["FunctionName"] == "ieee-rc-pptx-extractor"
+        assert lam.invoke.call_args_list[0][1]["FunctionName"] == "ieee-rc-pptx-extractor-dev"
 
 
 # ---------------------------------------------------------------
@@ -644,9 +644,9 @@ class TestMetrics:
         metric_data = cw.put_metric_data.call_args[1]["MetricData"]
         assert metric_data[0]["MetricName"] == "submission-processed"
         assert metric_data[0]["Value"] == 1
-        # Check AiToggleEnabled dimension
         dim_map = {d["Name"]: d["Value"] for d in metric_data[0]["Dimensions"]}
         assert dim_map["AiToggleEnabled"] == "false"
+        assert dim_map["ResourceCenter"] == "PES"
 
     def test_submission_processed_ai_enabled(self, orchestrator_with_cw):
         orch, s3, lam, cw = orchestrator_with_cw
@@ -673,6 +673,35 @@ class TestMetrics:
         assert "submission-processed" in names
         dim_map = {d["Name"]: d["Value"] for d in names["submission-processed"]["Dimensions"]}
         assert dim_map["AiToggleEnabled"] == "true"
+        assert dim_map["ResourceCenter"] == "PES"
+        cost_dims = {d["Name"]: d["Value"] for d in names["processing-cost-estimate"]["Dimensions"]}
+        assert cost_dims["ResourceCenter"] == "PES"
+
+    def test_resource_center_uses_meta_ou(self, orchestrator_with_cw):
+        # meta["ou"] is the source of truth for ResourceCenter, not the
+        # S3 key prefix — Drupal can override per-submission.
+        orch, s3, lam, cw = orchestrator_with_cw
+        meta = _make_meta(ai_enabled=True, media_type="application/pdf")
+        meta["ou"] = "AESS"
+        s3.get_object.return_value = _s3_get_object_response(meta)
+
+        extraction_body = {"text": "text", "page_count": 5}
+        bedrock_body = {
+            "abstract": "a", "keywords": [], "input_tokens": 1000,
+            "output_tokens": 500, "learning_level": "Expert",
+        }
+        lam.invoke.side_effect = [
+            _lambda_invoke_response(200, extraction_body),
+            _lambda_invoke_response(200, bedrock_body),
+        ]
+
+        # S3 key still says PES, but meta["ou"] = AESS should win.
+        orch.process("bucket", "PES/pending/STD-12345.pdf")
+
+        metric_data = cw.put_metric_data.call_args[1]["MetricData"]
+        for m in metric_data:
+            dims = {d["Name"]: d["Value"] for d in m["Dimensions"]}
+            assert dims["ResourceCenter"] == "AESS"
 
     def test_cost_estimate_pdf(self, orchestrator_with_cw):
         orch, s3, lam, cw = orchestrator_with_cw

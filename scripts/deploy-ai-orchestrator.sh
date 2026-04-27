@@ -7,20 +7,33 @@
 #   - Docker running locally
 #
 # Usage:
-#   ./scripts/deploy-ai-orchestrator.sh                # first-time setup + deploy
-#   ./scripts/deploy-ai-orchestrator.sh update         # rebuild image + update Lambda code only
+#   ./scripts/deploy-ai-orchestrator.sh <env>            # first-time setup + deploy
+#   ./scripts/deploy-ai-orchestrator.sh <env> update     # rebuild + update Lambda code only
+#
+#   <env> = dev | staging   (prod naming handled separately under CC3-851)
 #
 set -euo pipefail
+
+ENV="${1:-}"
+if [[ -z "${ENV}" || "${ENV}" == "update" ]]; then
+    echo "Usage: $0 <env> [update]   # env = dev | staging" >&2
+    exit 1
+fi
 
 AWS_PROFILE="${AWS_PROFILE:-ieee-cc}"
 AWS_REGION="${AWS_REGION:-us-east-1}"
 AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
 
 ECR_REPO_NAME="ieee-rc-ai-orchestrator"
-LAMBDA_FUNCTION_NAME="ieee-rc-ai-orchestrator"
-S3_BUCKET_NAME="dev-ieee-conference-cloud-bulk-uploads"
-LAMBDA_ROLE_NAME="ieee-rc-ai-orchestrator-role"
+LAMBDA_FUNCTION_NAME="ieee-rc-ai-orchestrator-${ENV}"
+S3_BUCKET_NAME="${ENV}-ieee-conference-cloud-bulk-uploads"
+LAMBDA_ROLE_NAME="ieee-rc-ai-orchestrator-${ENV}-role"
 IMAGE_TAG="latest"
+
+PDF_EXTRACTOR_FN="ieee-cc-pdf-extractor-${ENV}"
+VIDEO_TRANSCRIBER_FN="ieee-cc-video-transcriber-${ENV}"
+PPTX_EXTRACTOR_FN="ieee-rc-pptx-extractor-${ENV}"
+BEDROCK_FN="ieee-cc-bedrock-inference-${ENV}"
 
 ECR_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO_NAME}"
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -102,9 +115,10 @@ create_lambda_role() {
                 \"Effect\": \"Allow\",
                 \"Action\": [\"lambda:InvokeFunction\"],
                 \"Resource\": [
-                    \"arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:ieee-cc-pdf-extractor\",
-                    \"arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:ieee-cc-video-transcriber\",
-                    \"arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:ieee-cc-bedrock-inference\"
+                    \"arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:${PDF_EXTRACTOR_FN}\",
+                    \"arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:${VIDEO_TRANSCRIBER_FN}\",
+                    \"arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:${PPTX_EXTRACTOR_FN}\",
+                    \"arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:${BEDROCK_FN}\"
                 ]
             },
             {
@@ -161,7 +175,7 @@ create_lambda() {
             --memory-size 512 \
             --timeout 900 \
             --architectures x86_64 \
-            --environment "Variables={LOG_LEVEL=INFO,PDF_EXTRACTOR_FUNCTION=ieee-cc-pdf-extractor,VIDEO_TRANSCRIBER_FUNCTION=ieee-cc-video-transcriber,BEDROCK_FUNCTION=ieee-cc-bedrock-inference}"
+            --environment "Variables={LOG_LEVEL=INFO,STAGE=${ENV},PDF_EXTRACTOR_FUNCTION=${PDF_EXTRACTOR_FN},VIDEO_TRANSCRIBER_FUNCTION=${VIDEO_TRANSCRIBER_FN},PPTX_EXTRACTOR_FUNCTION=${PPTX_EXTRACTOR_FN},BEDROCK_FUNCTION=${BEDROCK_FN}}"
 
         aws lambda wait function-active-v2 \
             --function-name "${LAMBDA_FUNCTION_NAME}" \
@@ -185,15 +199,15 @@ update_lambda_code() {
 # ---------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------
-if [[ "${1:-}" == "update" ]]; then
-    log "Update mode — rebuilding image and updating Lambda code only."
+if [[ "${2:-}" == "update" ]]; then
+    log "Update mode (${ENV}) — rebuilding image and updating Lambda code only."
     build_and_push
     update_lambda_code
     log "Done."
     exit 0
 fi
 
-log "Full deployment starting..."
+log "Full deployment starting (env=${ENV})..."
 create_ecr_repo
 create_lambda_role
 build_and_push
