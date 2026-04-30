@@ -34,6 +34,12 @@ S3_BUCKET_NAME="${ENV}-ieee-conference-cloud-bulk-uploads"
 LAMBDA_ROLE_NAME="ieee-rc-ai-orchestrator-${ENV}-role"
 IMAGE_TAG="latest"
 
+# NOTE: PDF_EXTRACTOR_FN points at the env-suffixed name, but the PDF
+# extractor's deploy script (`scripts/deploy.sh`) still creates the
+# unsuffixed legacy name `ieee-cc-pdf-extractor` (Node-14 migration is
+# tracked separately). Until that catches up, override
+# `PDF_EXTRACTOR_FUNCTION` on the orchestrator Lambda manually for the
+# bridge period, or rename the existing PDF Lambda to `-${ENV}` first.
 PDF_EXTRACTOR_FN="ieee-cc-pdf-extractor-${ENV}"
 VIDEO_TRANSCRIBER_FN="ieee-cc-video-transcriber-${ENV}"
 PPTX_EXTRACTOR_FN="ieee-rc-pptx-extractor-${ENV}"

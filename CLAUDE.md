@@ -62,6 +62,8 @@ pip install -r requirements.txt -r requirements-dev.txt
 # PPTX Extractor Lambda    (env = dev | staging)
 ./scripts/deploy-pptx-extractor.sh <env>             # first-time full deploy
 ./scripts/deploy-pptx-extractor.sh <env> update      # rebuild + update code only
+./scripts/invoke-pptx-extractor.sh <bucket> <key>
+./scripts/teardown-pptx-extractor.sh
 
 # DLQ Processor Lambda    (env = dev | staging)
 ./scripts/deploy-dlq-processor.sh <env>              # first-time full deploy

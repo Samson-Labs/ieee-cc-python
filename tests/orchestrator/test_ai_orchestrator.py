@@ -48,7 +48,12 @@ def _lambda_invoke_response(status_code=200, body=None):
 
 
 @pytest.fixture
-def orchestrator():
+def orchestrator(monkeypatch):
+    # FunctionName assertions assume STAGE is unset → orchestrator resolves
+    # downstream Lambda names with the default `-dev` suffix. Strip any
+    # exported STAGE so tests don't break when run in a shell with it set.
+    monkeypatch.delenv("STAGE", raising=False)
+    monkeypatch.delenv("ENVIRONMENT", raising=False)
     s3 = MagicMock()
     lam = MagicMock()
     sns = MagicMock()
@@ -57,7 +62,9 @@ def orchestrator():
 
 
 @pytest.fixture
-def orchestrator_with_cw():
+def orchestrator_with_cw(monkeypatch):
+    monkeypatch.delenv("STAGE", raising=False)
+    monkeypatch.delenv("ENVIRONMENT", raising=False)
     s3 = MagicMock()
     lam = MagicMock()
     sns = MagicMock()
@@ -702,6 +709,34 @@ class TestMetrics:
         for m in metric_data:
             dims = {d["Name"]: d["Value"] for d in m["Dimensions"]}
             assert dims["ResourceCenter"] == "AESS"
+
+    def test_resource_center_defaults_to_unknown_when_blank(self, orchestrator_with_cw):
+        # CC3-858 direct-invocation path can supply meta without `ou`. The
+        # ResourceCenter dim must never be empty — CloudWatch's
+        # PutMetricData rejects empty dimension values, dropping the
+        # entire batch (including processing-cost-estimate, which has no
+        # AiToggleEnabled fallback).
+        orch, _, _, cw = orchestrator_with_cw
+        meta = {
+            "request_id": 99,
+            "item_id": "STD-77777",
+            "product_part_number": "STD-77777",
+            "ai_enrichment_enabled": False,
+            "content": {
+                "media_type": "application/pdf",
+                "filename": "STD-77777.pdf",
+                # no resource_center either
+            },
+        }
+
+        orch.process("bucket", key=None, meta=meta)
+
+        cw.put_metric_data.assert_called_once()
+        metric_data = cw.put_metric_data.call_args[1]["MetricData"]
+        for m in metric_data:
+            dims = {d["Name"]: d["Value"] for d in m["Dimensions"]}
+            assert dims["ResourceCenter"] == "unknown"
+            assert dims["ResourceCenter"] != ""
 
     def test_cost_estimate_pdf(self, orchestrator_with_cw):
         orch, s3, lam, cw = orchestrator_with_cw
