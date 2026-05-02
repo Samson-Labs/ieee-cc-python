@@ -142,7 +142,7 @@ class WizardTransfer:
         try:
             bytes_transferred, etag = self._stream_to_s3(trigger, correlation)
         except _TerminalTransferError as exc:
-            self._send_callback(
+            webhook_delivered = self._send_callback(
                 trigger,
                 correlation,
                 status="error",
@@ -153,7 +153,7 @@ class WizardTransfer:
                 "status": "error",
                 "error_code": exc.error_code,
                 "bytes_transferred": exc.bytes_transferred,
-                "webhook_delivered": True,
+                "webhook_delivered": webhook_delivered,
             }
 
         webhook_delivered = self._send_callback(

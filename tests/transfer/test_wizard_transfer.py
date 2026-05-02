@@ -239,6 +239,17 @@ class TestUrlSource:
         # Failed transfer => trigger NOT deleted
         s3.delete_object.assert_not_called()
 
+    def test_error_path_reports_actual_webhook_delivery_status(self):
+        # On the error path, webhook_delivered must reflect the actual
+        # WebhookSender.send return value — not be hardcoded to True.
+        s3 = _make_s3_with_trigger(VALID_URL_TRIGGER)
+        webhook = _make_webhook_sender(returns=False)
+        http = _make_http_session(_make_response(status=404))
+        wt = _build_transfer(s3=s3, webhook=webhook, http=http)
+        result = wt.process_trigger("b", "transfer-actions/x.json")
+        assert result["status"] == "error"
+        assert result["webhook_delivered"] is False
+
     def test_connect_timeout_returns_url_timeout(self):
         s3 = _make_s3_with_trigger(VALID_URL_TRIGGER)
         webhook = _make_webhook_sender()
