@@ -1,0 +1,84 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ieee.org/schemas/transfer-webhook-v1.json",
+  "title": "Wizard async transfer webhook callback (CC3-898 / CC3-896)",
+  "description": "JSON body POSTed by the ieee-rc-wizard-transfer Lambda to the Drupal callback_url given in the trigger. Signed with X-Webhook-Signature: hex(hmac_sha256(secret, raw_body)). Sent on terminal completion only (success or terminal failure after retries). This file MUST be byte-identical in Samson-Labs/ieee-cc and Samson-Labs/ieee-cc-python.",
+  "type": "object",
+  "required": ["item_id", "request_id", "status"],
+  "properties": {
+    "item_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Echoed from the trigger."
+    },
+    "request_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Echoed from the trigger; correlation ID."
+    },
+    "status": {
+      "enum": ["complete", "error"],
+      "description": "Terminal outcome. There are no intermediate status updates."
+    },
+    "error_code": {
+      "enum": [
+        "drive_token_expired",
+        "url_not_found",
+        "url_timeout",
+        "tls_error",
+        "dest_write_failed",
+        "internal"
+      ],
+      "description": "Required when status=error. Discriminates retriable vs. terminal failure on the Drupal side. drive_token_expired => Drupal can mint a fresh token and resubmit; url_not_found / tls_error => terminal, surface to user; url_timeout / dest_write_failed / internal => Drupal may retry."
+    },
+    "error_message": {
+      "type": "string",
+      "description": "Required when status=error. Human-readable detail for logs and the wizard status page. Do NOT leak secrets, tokens, or signed URLs."
+    },
+    "bytes_transferred": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Required when status=complete. Total bytes streamed into S3 (post-decompression if Content-Encoding was applied)."
+    },
+    "s3_etag": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Required when status=complete. ETag of the final S3 object (multipart ETags are NOT raw MD5 — Drupal must treat as opaque)."
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "status": { "const": "error" } }
+      },
+      "then": {
+        "required": ["error_code", "error_message"]
+      }
+    },
+    {
+      "if": {
+        "properties": { "status": { "const": "complete" } }
+      },
+      "then": {
+        "required": ["bytes_transferred", "s3_etag"]
+      }
+    }
+  ],
+  "additionalProperties": false,
+  "examples": [
+    {
+      "item_id": "item-42",
+      "request_id": "req-abc123",
+      "status": "complete",
+      "bytes_transferred": 5368709120,
+      "s3_etag": "\"3858f62230ac3c915f300c664312c63f-321\""
+    },
+    {
+      "item_id": "item-42",
+      "request_id": "req-abc123",
+      "status": "error",
+      "error_code": "drive_token_expired",
+      "error_message": "Drive returned 401 Unauthorized; access token has expired or been revoked."
+    }
+  ]
+}
