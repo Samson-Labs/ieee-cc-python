@@ -126,13 +126,14 @@ create_lambda_role() {
       "Resource": "arn:aws:s3:::${TRIGGER_BUCKET_NAME}"
     },
     {
-      "Sid": "WriteDestinationMultipart",
+      "Sid": "DestinationReadWrite",
       "Effect": "Allow",
       "Action": [
         "s3:PutObject",
         "s3:PutObjectAcl",
         "s3:AbortMultipartUpload",
-        "s3:ListMultipartUploadParts"
+        "s3:ListMultipartUploadParts",
+        "s3:GetObject"
       ],
       "Resource": "arn:aws:s3:::${TRIGGER_BUCKET_NAME}/*"
     },
