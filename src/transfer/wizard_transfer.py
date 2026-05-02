@@ -4,9 +4,9 @@ Reads a per-item trigger JSON from s3://{bucket}/transfer-actions/*.json,
 streams the source bytes (Google Drive or URL) into S3 via multipart upload,
 and POSTs an HMAC-SHA256 signed callback to Drupal.
 
-Contracts:
-    docs/contracts/transfer-trigger-v1.json   (input)
-    docs/contracts/transfer-webhook-v1.json   (output payload)
+Contracts (byte-identical with Samson-Labs/ieee-cc):
+    docs/contracts/transfer-trigger-v1.json    (Drupal -> Lambda)
+    docs/contracts/transfer-callback-v1.json   (Lambda -> Drupal)
 """
 
 from __future__ import annotations
@@ -55,8 +55,10 @@ REQUIRED_FIELDS = (
 VALID_SOURCE_TYPES = frozenset({"google_drive", "url"})
 VALID_OPERATIONS = frozenset({"transfer_media", "transfer_image"})
 
-# error_code values per docs/contracts/transfer-webhook-v1.json
+# error_code values per docs/contracts/transfer-callback-v1.json
 ERR_DRIVE_TOKEN_EXPIRED = "drive_token_expired"
+ERR_DRIVE_FORBIDDEN = "drive_forbidden"
+ERR_DRIVE_NOT_FOUND = "drive_not_found"
 ERR_URL_NOT_FOUND = "url_not_found"
 ERR_URL_TIMEOUT = "url_timeout"
 ERR_TLS_ERROR = "tls_error"
@@ -354,13 +356,29 @@ class WizardTransfer:
                 ERR_INTERNAL, f"HTTP client error: {type(exc).__name__}: {exc}",
             ) from exc
 
-        if response.status_code == 401 and source_type == "google_drive":
-            response.close()
-            raise _TerminalTransferError(
-                ERR_DRIVE_TOKEN_EXPIRED,
-                "Drive returned 401 Unauthorized; access token has expired or been revoked.",
-            )
-        if response.status_code == 404:
+        if source_type == "google_drive":
+            if response.status_code == 401:
+                response.close()
+                raise _TerminalTransferError(
+                    ERR_DRIVE_TOKEN_EXPIRED,
+                    "Drive returned 401 Unauthorized; access token has expired or been revoked.",
+                )
+            if response.status_code == 403:
+                # Distinct from 401: token is valid but the user lacks
+                # permission on the file (revoked share, restricted-to-domain,
+                # download disabled). Drupal surfaces a different message.
+                response.close()
+                raise _TerminalTransferError(
+                    ERR_DRIVE_FORBIDDEN,
+                    f"Drive returned 403 Forbidden for file {trigger['source_ref']}; the user lacks download permission.",
+                )
+            if response.status_code == 404:
+                response.close()
+                raise _TerminalTransferError(
+                    ERR_DRIVE_NOT_FOUND,
+                    f"Drive returned 404 Not Found for file {trigger['source_ref']}; the file was removed or the id is wrong.",
+                )
+        elif response.status_code == 404:
             response.close()
             raise _TerminalTransferError(
                 ERR_URL_NOT_FOUND,
@@ -438,6 +456,7 @@ class WizardTransfer:
         payload: dict = {
             "item_id": trigger["item_id"],
             "request_id": trigger["request_id"],
+            "operation": trigger["operation"],
             "status": status,
         }
         if status == "error":

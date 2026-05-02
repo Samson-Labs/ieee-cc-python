@@ -12,6 +12,8 @@ from botocore.exceptions import ClientError
 
 from src.transfer.wizard_transfer import (
     ERR_DEST_WRITE_FAILED,
+    ERR_DRIVE_FORBIDDEN,
+    ERR_DRIVE_NOT_FOUND,
     ERR_DRIVE_TOKEN_EXPIRED,
     ERR_INTERNAL,
     ERR_TLS_ERROR,
@@ -33,8 +35,8 @@ VALID_URL_TRIGGER = {
     "source_ref": "https://example.com/file.mp4",
     "dest_bucket": "dest-bkt",
     "dest_key": "ou/pending/file.mp4",
-    "item_id": "item-1",
-    "request_id": "req-1",
+    "item_id": 117,
+    "request_id": 42,
     "operation": "transfer_media",
     "callback_url": "https://drupal.example/api/iplr/webhook/media-transfer",
     "callback_secret_ref": "iplr/webhook-secret",
@@ -44,7 +46,7 @@ VALID_DRIVE_TRIGGER = {
     **VALID_URL_TRIGGER,
     "source_type": "google_drive",
     "source_ref": "1AbC_DRIVE_FILE_ID",
-    "drive_oauth_token_ref": "iplr/drive-tokens/req-1-item-1",
+    "drive_oauth_token_ref": "iplr/drive-tokens/42-117",
 }
 
 
@@ -208,8 +210,9 @@ class TestUrlSource:
         assert send_kwargs["url"] == VALID_URL_TRIGGER["callback_url"]
         payload = send_kwargs["payload"]
         assert payload["status"] == "complete"
-        assert payload["item_id"] == "item-1"
-        assert payload["request_id"] == "req-1"
+        assert payload["item_id"] == 117
+        assert payload["request_id"] == 42
+        assert payload["operation"] == "transfer_media"
         assert payload["bytes_transferred"] == len(body)
         assert payload["s3_etag"] == '"abc123-1"'
         assert "error_code" not in payload
@@ -332,7 +335,7 @@ class TestDriveSource:
         assert result["status"] == "complete"
         # Drive token fetched from Secrets Manager
         secrets.get_secret_value.assert_any_call(
-            SecretId="iplr/drive-tokens/req-1-item-1"
+            SecretId="iplr/drive-tokens/42-117"
         )
         # Drive media URL hit with Bearer header
         call = http.get.call_args
@@ -367,12 +370,28 @@ class TestDriveSource:
         s3.upload_fileobj.assert_not_called()
         s3.delete_object.assert_not_called()
 
-    def test_drive_404_returns_url_not_found(self):
+    def test_drive_403_returns_drive_forbidden(self):
+        # 403 from Drive => token valid but user lacks file permission;
+        # contract distinguishes this from 401 token-expired.
         s3 = _make_s3_with_trigger(VALID_DRIVE_TRIGGER)
-        http = _make_http_session(_make_response(status=404, body=b"missing"))
-        wt = _build_transfer(s3=s3, http=http)
+        webhook = _make_webhook_sender()
+        http = _make_http_session(_make_response(status=403, body=b"forbidden"))
+        wt = _build_transfer(s3=s3, webhook=webhook, http=http)
         result = wt.process_trigger("b", "transfer-actions/x.json")
-        assert result["error_code"] == ERR_URL_NOT_FOUND
+        assert result["error_code"] == ERR_DRIVE_FORBIDDEN
+        assert webhook.send.call_args.kwargs["payload"]["error_code"] == ERR_DRIVE_FORBIDDEN
+        s3.upload_fileobj.assert_not_called()
+
+    def test_drive_404_returns_drive_not_found(self):
+        # 404 from Drive => file deleted or wrong file_id;
+        # contract distinguishes this from URL 404.
+        s3 = _make_s3_with_trigger(VALID_DRIVE_TRIGGER)
+        webhook = _make_webhook_sender()
+        http = _make_http_session(_make_response(status=404, body=b"missing"))
+        wt = _build_transfer(s3=s3, webhook=webhook, http=http)
+        result = wt.process_trigger("b", "transfer-actions/x.json")
+        assert result["error_code"] == ERR_DRIVE_NOT_FOUND
+        assert webhook.send.call_args.kwargs["payload"]["error_code"] == ERR_DRIVE_NOT_FOUND
 
     def test_secrets_manager_failure_returns_drive_token_expired(self):
         s3 = _make_s3_with_trigger(VALID_DRIVE_TRIGGER)
