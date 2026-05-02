@@ -134,7 +134,7 @@ create_lambda_role() {
         "s3:AbortMultipartUpload",
         "s3:ListMultipartUploadParts"
       ],
-      "Resource": "arn:aws:s3:::*/*"
+      "Resource": "arn:aws:s3:::${TRIGGER_BUCKET_NAME}/*"
     },
     {
       "Sid": "ReadDriveTokens",

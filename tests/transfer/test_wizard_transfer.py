@@ -460,3 +460,56 @@ class TestWebhookDeliveryFailure:
         # Trigger still deleted — the transfer itself succeeded; webhook
         # failure is tracked separately via SNS in WebhookSender.
         s3.delete_object.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Connection hygiene — Response must be closed on every exit path
+# ---------------------------------------------------------------------------
+
+
+class TestResponseClosed:
+    def test_response_closed_on_success(self):
+        s3 = _make_s3_with_trigger(VALID_URL_TRIGGER)
+        response = _make_response(status=200, body=b"ok")
+        http = _make_http_session(response)
+        wt = _build_transfer(s3=s3, http=http)
+        wt.process_trigger("b", "transfer-actions/x.json")
+        # Lambda warm invocations reuse urllib3 connection pool; failing to
+        # close on the success path leaks the connection.
+        response.close.assert_called_once()
+
+    def test_response_closed_on_upload_error(self):
+        s3 = _make_s3_with_trigger(VALID_URL_TRIGGER)
+        s3.upload_fileobj.side_effect = ClientError(
+            {"Error": {"Code": "AccessDenied", "Message": "no write"}},
+            "UploadPart",
+        )
+        response = _make_response()
+        http = _make_http_session(response)
+        wt = _build_transfer(s3=s3, http=http)
+        wt.process_trigger("b", "transfer-actions/x.json")
+        response.close.assert_called_once()
+
+    def test_4xx_error_path_uses_bounded_raw_read_not_full_text(self):
+        # Defends against an OOM if a misconfigured source returns a huge
+        # error page: we must read at most 200 bytes for the snippet.
+        big_body = b"X" * (50 * 1024 * 1024)  # 50 MB error page
+        response = _make_response(status=503, body=big_body)
+        # If the production code regresses to response.text, the test
+        # still passes (text is built lazily by MagicMock) — but reading
+        # response.raw should bound the read. Verify by inspecting the
+        # error_message snippet length.
+        s3 = _make_s3_with_trigger(VALID_URL_TRIGGER)
+        webhook = _make_webhook_sender()
+        http = _make_http_session(response)
+        wt = _build_transfer(s3=s3, webhook=webhook, http=http)
+
+        result = wt.process_trigger("b", "transfer-actions/x.json")
+
+        assert result["error_code"] == "internal"
+        payload = webhook.send.call_args.kwargs["payload"]
+        # The snippet appears in the error_message; should be ~200 bytes
+        # of X's, not the full 50 MB.
+        assert "X" in payload["error_message"]
+        assert len(payload["error_message"]) < 1000  # full body would be 50M
+        response.close.assert_called_once()

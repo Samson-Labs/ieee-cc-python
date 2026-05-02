@@ -239,81 +239,87 @@ class WizardTransfer:
         """Stream the source into S3. Returns (bytes_transferred, etag).
 
         Raises _TerminalTransferError with a contract error_code on any
-        fatal failure.
+        fatal failure. Closes the source Response on every exit path so
+        the underlying urllib3 connection is returned to the pool — Lambda
+        warm-invocation reuse depends on this.
         """
-        source = self._open_source(trigger, correlation)
-        counter = _CountingStream(source)
-
-        config = TransferConfig(
-            multipart_threshold=MULTIPART_THRESHOLD,
-            multipart_chunksize=MULTIPART_CHUNKSIZE,
-            max_concurrency=MAX_CONCURRENCY,
-            use_threads=True,
-        )
-
+        response = self._open_source(trigger, correlation)
         try:
-            self._s3.upload_fileobj(
-                Fileobj=counter,
-                Bucket=trigger["dest_bucket"],
-                Key=trigger["dest_key"],
-                Config=config,
-            )
-        except ClientError as exc:
-            code = exc.response.get("Error", {}).get("Code", "Unknown")
-            raise _TerminalTransferError(
-                ERR_DEST_WRITE_FAILED,
-                f"S3 upload failed ({code}): {exc}",
-                bytes_transferred=counter.bytes_read,
-            ) from exc
-        except (requests.exceptions.Timeout, requests.exceptions.ReadTimeout) as exc:
-            raise _TerminalTransferError(
-                ERR_URL_TIMEOUT,
-                f"Source read timed out mid-transfer: {exc}",
-                bytes_transferred=counter.bytes_read,
-            ) from exc
-        except requests.exceptions.SSLError as exc:
-            raise _TerminalTransferError(
-                ERR_TLS_ERROR,
-                f"TLS error mid-transfer: {exc}",
-                bytes_transferred=counter.bytes_read,
-            ) from exc
-        except Exception as exc:  # noqa: BLE001 — last-resort mapper to error_code
-            raise _TerminalTransferError(
-                ERR_INTERNAL,
-                f"Unexpected error during upload: {type(exc).__name__}: {exc}",
-                bytes_transferred=counter.bytes_read,
-            ) from exc
+            counter = _CountingStream(response.raw)
 
-        # Read back the ETag. head_object is cheap and gives us the
-        # multipart ETag (which is NOT a raw MD5 — Drupal treats as opaque).
-        try:
-            head = self._s3.head_object(
-                Bucket=trigger["dest_bucket"], Key=trigger["dest_key"]
+            config = TransferConfig(
+                multipart_threshold=MULTIPART_THRESHOLD,
+                multipart_chunksize=MULTIPART_CHUNKSIZE,
+                max_concurrency=MAX_CONCURRENCY,
+                use_threads=True,
             )
-            etag = head.get("ETag", "")
-        except ClientError as exc:
-            raise _TerminalTransferError(
-                ERR_DEST_WRITE_FAILED,
-                f"head_object after upload failed: {exc}",
-                bytes_transferred=counter.bytes_read,
-            ) from exc
 
-        logger.info(
-            "%s Transfer complete: bytes=%d etag=%s",
-            correlation, counter.bytes_read, etag,
-        )
-        return counter.bytes_read, etag
+            try:
+                self._s3.upload_fileobj(
+                    Fileobj=counter,
+                    Bucket=trigger["dest_bucket"],
+                    Key=trigger["dest_key"],
+                    Config=config,
+                )
+            except ClientError as exc:
+                code = exc.response.get("Error", {}).get("Code", "Unknown")
+                raise _TerminalTransferError(
+                    ERR_DEST_WRITE_FAILED,
+                    f"S3 upload failed ({code}): {exc}",
+                    bytes_transferred=counter.bytes_read,
+                ) from exc
+            except (requests.exceptions.Timeout, requests.exceptions.ReadTimeout) as exc:
+                raise _TerminalTransferError(
+                    ERR_URL_TIMEOUT,
+                    f"Source read timed out mid-transfer: {exc}",
+                    bytes_transferred=counter.bytes_read,
+                ) from exc
+            except requests.exceptions.SSLError as exc:
+                raise _TerminalTransferError(
+                    ERR_TLS_ERROR,
+                    f"TLS error mid-transfer: {exc}",
+                    bytes_transferred=counter.bytes_read,
+                ) from exc
+            except Exception as exc:  # noqa: BLE001 — last-resort mapper to error_code
+                raise _TerminalTransferError(
+                    ERR_INTERNAL,
+                    f"Unexpected error during upload: {type(exc).__name__}: {exc}",
+                    bytes_transferred=counter.bytes_read,
+                ) from exc
+
+            # Read back the ETag. head_object is cheap and gives us the
+            # multipart ETag (which is NOT a raw MD5 — Drupal treats as opaque).
+            try:
+                head = self._s3.head_object(
+                    Bucket=trigger["dest_bucket"], Key=trigger["dest_key"]
+                )
+                etag = head.get("ETag", "")
+            except ClientError as exc:
+                raise _TerminalTransferError(
+                    ERR_DEST_WRITE_FAILED,
+                    f"head_object after upload failed: {exc}",
+                    bytes_transferred=counter.bytes_read,
+                ) from exc
+
+            logger.info(
+                "%s Transfer complete: bytes=%d etag=%s",
+                correlation, counter.bytes_read, etag,
+            )
+            return counter.bytes_read, etag
+        finally:
+            response.close()
 
     def _open_source(
         self, trigger: TransferTrigger, correlation: str
-    ) -> IO[bytes]:
-        """Return a streaming file-like for the configured source.
+    ) -> requests.Response:
+        """Open a streaming GET against the configured source.
 
-        For Drive: fetches the OAuth token from Secrets Manager and opens
-        a Bearer-authenticated GET against the Drive media endpoint.
-        For URL: opens a streaming GET on the source_ref URL.
-        Non-2xx responses raise _TerminalTransferError with the appropriate
-        error_code.
+        Returns the live ``requests.Response``; the caller is responsible
+        for closing it (so the underlying connection is returned to the
+        pool — important for Lambda warm-invocation reuse). For Drive,
+        fetches the OAuth token from Secrets Manager and uses a Bearer
+        header. Non-2xx responses are closed here and re-raised as
+        _TerminalTransferError with the appropriate contract error_code.
         """
         source_type = trigger["source_type"]
 
@@ -361,7 +367,14 @@ class WizardTransfer:
                 f"Source returned 404 Not Found: {url}",
             )
         if response.status_code >= 400:
-            body_snippet = (response.text or "")[:200]
+            # Read directly from the raw socket so a misconfigured source
+            # returning a multi-MB error page can't OOM the Lambda. 200
+            # bytes is plenty for the error_message snippet.
+            try:
+                snippet_bytes = response.raw.read(200)
+            except Exception:  # noqa: BLE001 — best-effort error context
+                snippet_bytes = b""
+            body_snippet = snippet_bytes.decode(errors="replace")
             response.close()
             raise _TerminalTransferError(
                 ERR_INTERNAL,
@@ -371,7 +384,7 @@ class WizardTransfer:
         # Ensure transparent decompression so bytes_transferred reflects
         # decoded content (matches what S3 actually stores).
         response.raw.decode_content = True
-        return response.raw
+        return response
 
     def _fetch_drive_token(self, secret_id: str, correlation: str) -> str:
         try:
