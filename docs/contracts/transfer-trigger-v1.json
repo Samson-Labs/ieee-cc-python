@@ -46,14 +46,14 @@
       "description": "Full destination S3 key including any OU prefix (e.g. ou-bps/pending/{filename}.mp4). Lambda does not transform this."
     },
     "item_id": {
-      "type": "string",
-      "minLength": 1,
-      "description": "Drupal media-item identifier; echoed back in the webhook callback."
+      "type": "integer",
+      "minimum": 1,
+      "description": "Drupal ProductLoadItem entity id; echoed back in the callback."
     },
     "request_id": {
-      "type": "string",
-      "minLength": 1,
-      "description": "Drupal-generated correlation ID. Used in CloudWatch logs and the webhook callback."
+      "type": "integer",
+      "minimum": 1,
+      "description": "Drupal correlation id (a per-dispatch counter); echoed back in the callback. Used in CloudWatch logs."
     },
     "operation": {
       "enum": ["transfer_media", "transfer_image"],
@@ -86,11 +86,11 @@
       "version": 1,
       "source_type": "google_drive",
       "source_ref": "1AbCdEfGhIjKlMnOpQrStUvWxYz0123456",
-      "drive_oauth_token_ref": "iplr/drive-tokens/req-abc123-item-42",
+      "drive_oauth_token_ref": "iplr/drive-tokens/42-117",
       "dest_bucket": "dev-ieee-conference-cloud-bulk-uploads",
       "dest_key": "ou-bps/pending/conference-keynote.mp4",
-      "item_id": "item-42",
-      "request_id": "req-abc123",
+      "item_id": 117,
+      "request_id": 42,
       "operation": "transfer_media",
       "callback_url": "https://cc-ieee.lndo.site/api/iplr/webhook/media-transfer",
       "callback_secret_ref": "iplr/webhook-secret"
@@ -101,8 +101,8 @@
       "source_ref": "https://example.com/uploads/poster.jpg",
       "dest_bucket": "dev-ieee-conference-cloud-bulk-uploads",
       "dest_key": "ou-bps/pending/poster.jpg",
-      "item_id": "item-43",
-      "request_id": "req-abc123",
+      "item_id": 118,
+      "request_id": 42,
       "operation": "transfer_image",
       "callback_url": "https://cc-ieee.lndo.site/api/iplr/webhook/media-transfer",
       "callback_secret_ref": "iplr/webhook-secret"
