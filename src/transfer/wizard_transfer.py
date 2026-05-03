@@ -25,7 +25,13 @@ from src.webhook.sender import WebhookSender
 
 logger = get_json_logger(__name__)
 
-DRIVE_API_URL = "https://www.googleapis.com/drive/v3/files/{file_id}?alt=media"
+# supportsAllDrives=true is required for files that live in a Shared (team)
+# Drive — without it the Drive API returns 404 even when the OAuth token has
+# read access. See CC3-904 / CC3-903.
+DRIVE_API_URL = (
+    "https://www.googleapis.com/drive/v3/files/{file_id}"
+    "?alt=media&supportsAllDrives=true"
+)
 
 # Multipart upload tuning. boto3 streams response.raw through s3 in 64 MB
 # parts with up to 10 parallel uploads — plenty of throughput for 10 GB
