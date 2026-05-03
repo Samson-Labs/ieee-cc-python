@@ -343,6 +343,17 @@ class TestDriveSource:
         assert call.kwargs["headers"]["Authorization"] == "Bearer ya29.special-token"
         assert call.kwargs["stream"] is True
 
+    def test_drive_request_includes_supports_all_drives(self):
+        # CC3-904: Drive API returns 404 for files in Shared (team) Drives
+        # unless supportsAllDrives=true is on the request.
+        s3 = _make_s3_with_trigger(VALID_DRIVE_TRIGGER)
+        http = _make_http_session(_make_response())
+        wt = _build_transfer(s3=s3, http=http)
+        wt.process_trigger("b", "transfer-actions/x.json")
+
+        url = http.get.call_args.args[0]
+        assert "supportsAllDrives=true" in url
+
     def test_drive_token_secret_supports_json_blob(self):
         s3 = _make_s3_with_trigger(VALID_DRIVE_TRIGGER)
         secrets = MagicMock()
