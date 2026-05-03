@@ -951,12 +951,115 @@ class TestCC858Validation:
 
 
 # ---------------------------------------------------------------
+# Webhook secret resolution (CC3-900)
+#
+# Mirrors the policy in src/transfer/wizard_transfer.py: Secrets Manager
+# first, DRUPAL_WEBHOOK_SECRET env-var fallback. These tests exercise
+# _resolve_webhook_secret directly rather than the full process() flow
+# so each policy branch is asserted in isolation.
+# ---------------------------------------------------------------
+
+class TestWebhookSecretResolution:
+    def _build(self, secrets_client):
+        return AIOrchestrator(
+            s3_client=MagicMock(),
+            lambda_client=MagicMock(),
+            sns_client=MagicMock(),
+            secrets_client=secrets_client,
+        )
+
+    def test_uses_secrets_manager_value_when_present(self):
+        secrets = MagicMock()
+        secrets.get_secret_value.return_value = {"SecretString": "secret-from-sm"}
+
+        orch = self._build(secrets)
+        result = orch._resolve_webhook_secret("[corr]")
+
+        assert result == "secret-from-sm"
+        secrets.get_secret_value.assert_called_once_with(
+            SecretId="iplr/webhook-secret"
+        )
+
+    def test_falls_back_to_env_when_resource_not_found(self, monkeypatch):
+        monkeypatch.setenv("DRUPAL_WEBHOOK_SECRET", "env-fallback")
+        secrets = MagicMock()
+        secrets.get_secret_value.side_effect = _client_error(
+            "ResourceNotFoundException", "no such secret"
+        )
+
+        orch = self._build(secrets)
+        assert orch._resolve_webhook_secret("[corr]") == "env-fallback"
+
+    def test_falls_back_to_env_when_access_denied(self, monkeypatch):
+        # IAM not yet propagated, or the role hasn't been redeployed with
+        # secretsmanager:GetSecretValue — pre-CC3-900 prod scenario.
+        monkeypatch.setenv("DRUPAL_WEBHOOK_SECRET", "env-fallback")
+        secrets = MagicMock()
+        secrets.get_secret_value.side_effect = _client_error(
+            "AccessDeniedException", "denied"
+        )
+
+        orch = self._build(secrets)
+        assert orch._resolve_webhook_secret("[corr]") == "env-fallback"
+
+    def test_falls_back_to_env_when_secrets_manager_returns_empty(self, monkeypatch):
+        # Secret exists in SM but its value is empty — treat as miss.
+        monkeypatch.setenv("DRUPAL_WEBHOOK_SECRET", "env-fallback")
+        secrets = MagicMock()
+        secrets.get_secret_value.return_value = {"SecretString": ""}
+
+        orch = self._build(secrets)
+        assert orch._resolve_webhook_secret("[corr]") == "env-fallback"
+
+    def test_returns_empty_when_neither_source_available(self, monkeypatch):
+        monkeypatch.delenv("DRUPAL_WEBHOOK_SECRET", raising=False)
+        secrets = MagicMock()
+        secrets.get_secret_value.side_effect = _client_error(
+            "ResourceNotFoundException", "no such secret"
+        )
+
+        orch = self._build(secrets)
+        # Returns empty rather than raising; webhook will then HMAC-sign
+        # with empty key and Drupal will return 401, which WebhookSender
+        # treats as a permanent failure (the correct outcome).
+        assert orch._resolve_webhook_secret("[corr]") == ""
+
+    def test_honors_webhook_secret_ref_env_override(self, monkeypatch):
+        # Operators must be able to point the orchestrator at a different
+        # SM key (e.g. per-tenant rotation) without code changes.
+        monkeypatch.setenv("WEBHOOK_SECRET_REF", "tenants/acme/webhook-secret")
+        # Force module-constant re-read by reimporting.
+        import importlib
+        import src.orchestrator.ai_orchestrator as orch_module
+        importlib.reload(orch_module)
+
+        secrets = MagicMock()
+        secrets.get_secret_value.return_value = {"SecretString": "tenant-secret"}
+
+        orch = orch_module.AIOrchestrator(
+            s3_client=MagicMock(),
+            lambda_client=MagicMock(),
+            sns_client=MagicMock(),
+            secrets_client=secrets,
+        )
+
+        assert orch._resolve_webhook_secret("[corr]") == "tenant-secret"
+        secrets.get_secret_value.assert_called_once_with(
+            SecretId="tenants/acme/webhook-secret"
+        )
+
+        # Restore module state for subsequent tests.
+        monkeypatch.delenv("WEBHOOK_SECRET_REF")
+        importlib.reload(orch_module)
+
+
+# ---------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------
 
-def _client_error(code, message="Error"):
+def _client_error(code, message="Error", operation="GetObject"):
     from botocore.exceptions import ClientError
     return ClientError(
         {"Error": {"Code": code, "Message": message}},
-        "GetObject",
+        operation,
     )
