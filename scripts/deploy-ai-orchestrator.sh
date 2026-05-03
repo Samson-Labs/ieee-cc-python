@@ -191,7 +191,13 @@ update_lambda_code() {
 # Main
 # ---------------------------------------------------------------
 if [[ "${1:-}" == "update" ]]; then
-    log "Update mode — rebuilding image and updating Lambda code only."
+    log "Update mode — refreshing IAM, rebuilding image, and updating Lambda code."
+    # IAM is refreshed every run because create_lambda_role is idempotent
+    # (put-role-policy replaces) and the inline policy may have grown
+    # between deploys. Without this, code that needs new permissions
+    # (e.g. CC3-900's secretsmanager:GetSecretValue) deploys fine but
+    # logs AccessDeniedException on every invocation in stage/live.
+    create_lambda_role
     build_and_push
     update_lambda_code
     log "Done."
