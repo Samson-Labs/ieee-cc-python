@@ -116,6 +116,11 @@ create_lambda_role() {
                         \"cloudwatch:namespace\": \"ieee-rc\"
                     }
                 }
+            },
+            {
+                \"Effect\": \"Allow\",
+                \"Action\": [\"secretsmanager:GetSecretValue\"],
+                \"Resource\": \"arn:aws:secretsmanager:${AWS_REGION}:${AWS_ACCOUNT_ID}:secret:iplr/webhook-secret*\"
             }
         ]
     }"
