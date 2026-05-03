@@ -352,7 +352,10 @@ class TestDriveSource:
         wt.process_trigger("b", "transfer-actions/x.json")
 
         url = http.get.call_args.args[0]
-        assert "supportsAllDrives=true" in url
+        assert url == (
+            "https://www.googleapis.com/drive/v3/files/1AbC_DRIVE_FILE_ID"
+            "?alt=media&supportsAllDrives=true"
+        )
 
     def test_drive_token_secret_supports_json_blob(self):
         s3 = _make_s3_with_trigger(VALID_DRIVE_TRIGGER)
