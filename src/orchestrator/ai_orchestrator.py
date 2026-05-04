@@ -54,11 +54,14 @@ MEDIA_TYPE_MAP = {
     "Presentation": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
 }
 
-# Lambda function names for dispatch (configurable via env vars)
-PDF_EXTRACTOR_FUNCTION = os.environ.get("PDF_EXTRACTOR_FUNCTION", "ieee-cc-pdf-extractor")
-VIDEO_TRANSCRIBER_FUNCTION = os.environ.get("VIDEO_TRANSCRIBER_FUNCTION", "ieee-cc-video-transcriber")
-PPTX_EXTRACTOR_FUNCTION = os.environ.get("PPTX_EXTRACTOR_FUNCTION", "ieee-rc-pptx-extractor")
-BEDROCK_FUNCTION = os.environ.get("BEDROCK_FUNCTION", "ieee-cc-bedrock-inference")
+# Lambda function names for dispatch (configurable via env vars).
+# Fallbacks suffix the deploy stage so a misconfigured orchestrator never
+# silently dispatches into a different env's Lambda.
+_STAGE = os.environ.get("STAGE", "dev")
+PDF_EXTRACTOR_FUNCTION = os.environ.get("PDF_EXTRACTOR_FUNCTION", f"ieee-cc-pdf-extractor-{_STAGE}")
+VIDEO_TRANSCRIBER_FUNCTION = os.environ.get("VIDEO_TRANSCRIBER_FUNCTION", f"ieee-cc-video-transcriber-{_STAGE}")
+PPTX_EXTRACTOR_FUNCTION = os.environ.get("PPTX_EXTRACTOR_FUNCTION", f"ieee-rc-pptx-extractor-{_STAGE}")
+BEDROCK_FUNCTION = os.environ.get("BEDROCK_FUNCTION", f"ieee-cc-bedrock-inference-{_STAGE}")
 
 # Webhook secret resolution.  Mirrors src/transfer/wizard_transfer.py:
 # Secrets Manager first, DRUPAL_WEBHOOK_SECRET env var fallback.  The
@@ -227,6 +230,7 @@ class AIOrchestrator:
                     "Unit": "Count",
                     "Dimensions": [
                         {"Name": "AiToggleEnabled", "Value": "false"},
+                        {"Name": "ResourceCenter", "Value": meta_ou or "unknown"},
                     ],
                 },
             ])
@@ -368,7 +372,7 @@ class AIOrchestrator:
 
         # Step 7: Publish cost estimate and submission metric
         self._publish_enrichment_metrics(
-            extraction_result, bedrock_result, media_type
+            extraction_result, bedrock_result, media_type, meta_ou
         )
 
         return OrchestratorResult(
@@ -516,6 +520,7 @@ class AIOrchestrator:
         extraction_result: dict,
         bedrock_result: dict,
         media_type: str,
+        ou: str,
     ) -> None:
         """Compute and publish cost estimate and submission-processed metrics."""
         input_tokens = bedrock_result.get("input_tokens", 0)
@@ -530,11 +535,15 @@ class AIOrchestrator:
             duration_seconds = extraction_result.get("duration_seconds", 0)
             cost += (duration_seconds / 60) * TRANSCRIBE_COST_PER_MINUTE
 
+        resource_center = ou or "unknown"
         publish_metrics(self._cloudwatch, [
             {
                 "MetricName": "processing-cost-estimate",
                 "Value": round(cost, 6),
                 "Unit": "None",
+                "Dimensions": [
+                    {"Name": "ResourceCenter", "Value": resource_center},
+                ],
             },
             {
                 "MetricName": "submission-processed",
@@ -542,6 +551,7 @@ class AIOrchestrator:
                 "Unit": "Count",
                 "Dimensions": [
                     {"Name": "AiToggleEnabled", "Value": "true"},
+                    {"Name": "ResourceCenter", "Value": resource_center},
                 ],
             },
         ])

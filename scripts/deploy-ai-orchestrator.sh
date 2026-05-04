@@ -7,20 +7,43 @@
 #   - Docker running locally
 #
 # Usage:
-#   ./scripts/deploy-ai-orchestrator.sh                # first-time setup + deploy
-#   ./scripts/deploy-ai-orchestrator.sh update         # rebuild image + update Lambda code only
+#   ./scripts/deploy-ai-orchestrator.sh <env>            # first-time setup + deploy
+#   ./scripts/deploy-ai-orchestrator.sh <env> update     # rebuild + update Lambda code only
+#
+#   <env> = dev | staging   (prod naming handled separately under CC3-851)
 #
 set -euo pipefail
+
+ENV="${1:-}"
+case "${ENV}" in
+    dev|staging) ;;
+    *)
+        echo "Usage: $0 <env> [update]   # env = dev | staging" >&2
+        echo "       (prod naming is part of CC3-851; not accepted here)" >&2
+        exit 1
+        ;;
+esac
 
 AWS_PROFILE="${AWS_PROFILE:-ieee-cc}"
 AWS_REGION="${AWS_REGION:-us-east-1}"
 AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
 
 ECR_REPO_NAME="ieee-rc-ai-orchestrator"
-LAMBDA_FUNCTION_NAME="ieee-rc-ai-orchestrator"
-S3_BUCKET_NAME="dev-ieee-conference-cloud-bulk-uploads"
-LAMBDA_ROLE_NAME="ieee-rc-ai-orchestrator-role"
+LAMBDA_FUNCTION_NAME="ieee-rc-ai-orchestrator-${ENV}"
+S3_BUCKET_NAME="${ENV}-ieee-conference-cloud-bulk-uploads"
+LAMBDA_ROLE_NAME="ieee-rc-ai-orchestrator-${ENV}-role"
 IMAGE_TAG="latest"
+
+# NOTE: PDF_EXTRACTOR_FN points at the env-suffixed name, but the PDF
+# extractor's deploy script (`scripts/deploy.sh`) still creates the
+# unsuffixed legacy name `ieee-cc-pdf-extractor` (Node-14 migration is
+# tracked separately). Until that catches up, override
+# `PDF_EXTRACTOR_FUNCTION` on the orchestrator Lambda manually for the
+# bridge period, or rename the existing PDF Lambda to `-${ENV}` first.
+PDF_EXTRACTOR_FN="ieee-cc-pdf-extractor-${ENV}"
+VIDEO_TRANSCRIBER_FN="ieee-cc-video-transcriber-${ENV}"
+PPTX_EXTRACTOR_FN="ieee-rc-pptx-extractor-${ENV}"
+BEDROCK_FN="ieee-cc-bedrock-inference-${ENV}"
 
 ECR_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO_NAME}"
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -102,9 +125,10 @@ create_lambda_role() {
                 \"Effect\": \"Allow\",
                 \"Action\": [\"lambda:InvokeFunction\"],
                 \"Resource\": [
-                    \"arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:ieee-cc-pdf-extractor\",
-                    \"arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:ieee-cc-video-transcriber\",
-                    \"arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:ieee-cc-bedrock-inference\"
+                    \"arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:${PDF_EXTRACTOR_FN}\",
+                    \"arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:${VIDEO_TRANSCRIBER_FN}\",
+                    \"arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:${PPTX_EXTRACTOR_FN}\",
+                    \"arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:${BEDROCK_FN}\"
                 ]
             },
             {
@@ -166,7 +190,7 @@ create_lambda() {
             --memory-size 512 \
             --timeout 900 \
             --architectures x86_64 \
-            --environment "Variables={LOG_LEVEL=INFO,PDF_EXTRACTOR_FUNCTION=ieee-cc-pdf-extractor,VIDEO_TRANSCRIBER_FUNCTION=ieee-cc-video-transcriber,BEDROCK_FUNCTION=ieee-cc-bedrock-inference}"
+            --environment "Variables={LOG_LEVEL=INFO,STAGE=${ENV},PDF_EXTRACTOR_FUNCTION=${PDF_EXTRACTOR_FN},VIDEO_TRANSCRIBER_FUNCTION=${VIDEO_TRANSCRIBER_FN},PPTX_EXTRACTOR_FUNCTION=${PPTX_EXTRACTOR_FN},BEDROCK_FUNCTION=${BEDROCK_FN}}"
 
         aws lambda wait function-active-v2 \
             --function-name "${LAMBDA_FUNCTION_NAME}" \
@@ -190,8 +214,8 @@ update_lambda_code() {
 # ---------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------
-if [[ "${1:-}" == "update" ]]; then
-    log "Update mode — refreshing IAM, rebuilding image, and updating Lambda code."
+if [[ "${2:-}" == "update" ]]; then
+    log "Update mode (${ENV}) — refreshing IAM, rebuilding image, and updating Lambda code."
     # IAM is refreshed every run because create_lambda_role is idempotent
     # (put-role-policy replaces) and the inline policy may have grown
     # between deploys. Without this, code that needs new permissions
@@ -204,7 +228,7 @@ if [[ "${1:-}" == "update" ]]; then
     exit 0
 fi
 
-log "Full deployment starting..."
+log "Full deployment starting (env=${ENV})..."
 create_ecr_repo
 create_lambda_role
 build_and_push
@@ -214,5 +238,20 @@ log ""
 log "  ECR:     ${ECR_URI}:${IMAGE_TAG}"
 log "  Lambda:  ${LAMBDA_FUNCTION_NAME} (512 MB, 15 min timeout)"
 log ""
+
+# Probe the env-suffixed PDF extractor and warn if it doesn't exist yet.
+# The legacy `scripts/deploy.sh` still creates an unsuffixed
+# `ieee-cc-pdf-extractor`; orchestrator deploys here will reference
+# `${PDF_EXTRACTOR_FN}` and fail with ResourceNotFoundException at first
+# PDF dispatch unless the bridge is handled.
+if ! aws lambda get-function --function-name "${PDF_EXTRACTOR_FN}" \
+        --region "${AWS_REGION}" >/dev/null 2>&1; then
+    log "WARNING: Lambda '${PDF_EXTRACTOR_FN}' does not exist yet."
+    log "         Orchestrator will fail at PDF dispatch with ResourceNotFoundException."
+    log "         Bridge until the PDF extractor migrates: either rename the legacy"
+    log "         'ieee-cc-pdf-extractor' to '${PDF_EXTRACTOR_FN}', or override"
+    log "         PDF_EXTRACTOR_FUNCTION on '${LAMBDA_FUNCTION_NAME}' to the legacy name."
+fi
+
 log "  Invoke:"
 log "    ./scripts/invoke-ai-orchestrator.sh <bucket> <key>"

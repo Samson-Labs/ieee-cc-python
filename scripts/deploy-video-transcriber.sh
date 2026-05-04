@@ -7,19 +7,31 @@
 #   - Docker running locally
 #
 # Usage:
-#   ./scripts/deploy-video-transcriber.sh                # first-time setup + deploy
-#   ./scripts/deploy-video-transcriber.sh update         # rebuild image + update Lambda code only
+#   ./scripts/deploy-video-transcriber.sh <env>            # first-time setup + deploy
+#   ./scripts/deploy-video-transcriber.sh <env> update     # rebuild + update Lambda code only
+#
+#   <env> = dev | staging   (prod naming handled separately under CC3-851)
 #
 set -euo pipefail
+
+ENV="${1:-}"
+case "${ENV}" in
+    dev|staging) ;;
+    *)
+        echo "Usage: $0 <env> [update]   # env = dev | staging" >&2
+        echo "       (prod naming is part of CC3-851; not accepted here)" >&2
+        exit 1
+        ;;
+esac
 
 AWS_PROFILE="${AWS_PROFILE:-ieee-cc}"
 AWS_REGION="${AWS_REGION:-us-east-1}"
 AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
 
 ECR_REPO_NAME="ieee-cc-video-transcriber"
-LAMBDA_FUNCTION_NAME="ieee-cc-video-transcriber"
-S3_BUCKET_NAME="dev-ieee-conference-cloud-bulk-uploads"
-LAMBDA_ROLE_NAME="ieee-cc-video-transcriber-role"
+LAMBDA_FUNCTION_NAME="ieee-cc-video-transcriber-${ENV}"
+S3_BUCKET_NAME="${ENV}-ieee-conference-cloud-bulk-uploads"
+LAMBDA_ROLE_NAME="ieee-cc-video-transcriber-${ENV}-role"
 IMAGE_TAG="latest"
 
 ECR_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO_NAME}"
@@ -168,7 +180,7 @@ create_lambda() {
             --memory-size 512 \
             --timeout 900 \
             --architectures x86_64 \
-            --environment "Variables={LOG_LEVEL=INFO,CLEANUP_MODEL_ID=us.anthropic.claude-3-5-haiku-20241022-v1:0}"
+            --environment "Variables={LOG_LEVEL=INFO,STAGE=${ENV},CLEANUP_MODEL_ID=us.anthropic.claude-3-5-haiku-20241022-v1:0}"
 
         aws lambda wait function-active-v2 \
             --function-name "${LAMBDA_FUNCTION_NAME}" \
@@ -192,15 +204,15 @@ update_lambda_code() {
 # ---------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------
-if [[ "${1:-}" == "update" ]]; then
-    log "Update mode — rebuilding image and updating Lambda code only."
+if [[ "${2:-}" == "update" ]]; then
+    log "Update mode (${ENV}) — rebuilding image and updating Lambda code only."
     build_and_push
     update_lambda_code
     log "Done."
     exit 0
 fi
 
-log "Full deployment starting..."
+log "Full deployment starting (env=${ENV})..."
 create_ecr_repo
 create_lambda_role
 build_and_push
