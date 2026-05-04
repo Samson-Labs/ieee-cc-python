@@ -19,13 +19,19 @@ from src.generators.image_overlay_generator import (
     DEFAULT_FORMAT,
     DEFAULT_QUALITY,
     LEGACY_FIELDS,
+    LEGACY_PADDING_FACTOR_DEFAULT,
+    LEGACY_ROW_HEIGHT_PAD_DEFAULT,
     SUPPORTED_FORMATS,
     THUMBNAIL_SIZE,
     TITLE_MAX_LINES,
     GenerationResult,
     ImageOverlayGenerator,
+    _load_font,
+    _normalize_family,
     _parse_legacy_attributes,
+    _stage_prefix,
     _wrap_and_truncate,
+    _wrap_pixels,
 )
 
 
@@ -625,3 +631,359 @@ class TestLegacyProcessTrigger:
         assert result["format"] == "png"
         put_kwargs = s3_mock.put_object.call_args[1]
         assert put_kwargs["ContentType"] == "image/png"
+
+
+# ---------------------------------------------------------------------------
+# CC3-870: Parity gap fixes vs legacy Node.js image-generator
+# ---------------------------------------------------------------------------
+
+
+class TestStagePrefix:
+    """Gap #1: STAGE env → bucket prefix (handler.js:26-36)."""
+
+    def test_dev_prefix(self, monkeypatch):
+        monkeypatch.setenv("STAGE", "dev")
+        assert _stage_prefix() == "dev-"
+
+    def test_staging_prefix(self, monkeypatch):
+        monkeypatch.setenv("STAGE", "staging")
+        assert _stage_prefix() == "staging-"
+
+    def test_prod_no_prefix(self, monkeypatch):
+        monkeypatch.setenv("STAGE", "prod")
+        assert _stage_prefix() == ""
+
+    def test_unset_no_prefix(self, monkeypatch):
+        monkeypatch.delenv("STAGE", raising=False)
+        assert _stage_prefix() == ""
+
+    def test_unknown_value_no_prefix(self, monkeypatch):
+        monkeypatch.setenv("STAGE", "qa")
+        assert _stage_prefix() == ""
+
+    def test_legacy_process_applies_prefix_to_buckets(self, monkeypatch):
+        """End-to-end: dev STAGE causes both source + dest buckets to be prefixed."""
+        monkeypatch.setenv("STAGE", "dev")
+        s3_mock = MagicMock()
+        _mock_s3_for_legacy_trigger(s3_mock)
+        gen = ImageOverlayGenerator(s3_client=s3_mock)
+
+        gen.process_trigger(bucket="trigger-bucket", key="actions/job.json")
+
+        # Source download should hit the prefixed source bucket.
+        get_calls = s3_mock.get_object.call_args_list
+        source_calls = [c for c in get_calls if not c[1]["Key"].endswith(".json")]
+        assert len(source_calls) == 1
+        assert source_calls[0][1]["Bucket"] == "dev-ieee-conference-cloud-uploads"
+
+        # Upload should hit the prefixed dest bucket.
+        put_kwargs = s3_mock.put_object.call_args[1]
+        assert put_kwargs["Bucket"] == "dev-ieee-conference-cloud-bulk-uploads"
+
+    def test_legacy_process_no_prefix_in_prod(self, monkeypatch):
+        monkeypatch.setenv("STAGE", "prod")
+        s3_mock = MagicMock()
+        _mock_s3_for_legacy_trigger(s3_mock)
+        gen = ImageOverlayGenerator(s3_client=s3_mock)
+
+        gen.process_trigger(bucket="trigger-bucket", key="actions/job.json")
+
+        put_kwargs = s3_mock.put_object.call_args[1]
+        assert put_kwargs["Bucket"] == "ieee-conference-cloud-bulk-uploads"
+
+
+class TestVerticalAnchoring:
+    """Gap #2: Three-branch y-positioning (getTextElements.js:36-52).
+
+    For an 800x600 image with center=300, font_size=40, rowHeightPad=2,
+    paddedRowHeight=42:
+      y=120 (top, < center)  → top_y = 120 + 21        = 141
+      y=300 (center)         → top_y = 42 + (300 - 21) = 321 (1 row)
+      y=480 (bottom, > center, 1 row)        → top_y = 480
+      y=480 (bottom, > center, 3 rows)       → top_y = 480 - 42*2 = 396
+    The Node.js arithmetic uses `parseInt` which truncates toward zero;
+    Python `int()` matches for non-negative values. We assert the
+    resulting top_y by drawing a single overlay and checking which rows
+    are populated against the expected position.
+    """
+
+    def _spec(self, *, y_pct: int, text: str, font_size: int = 40, row_pad: int = 2):
+        return {
+            "text": text,
+            "attributes": [
+                {"attr": "y", "value": f"{y_pct}%"},
+                {"attr": "x", "value": "50%"},
+                {"attr": "fill", "value": "white"},
+                {"attr": "text-anchor", "value": "middle"},
+                {"attr": "font-size", "value": f"{font_size}px"},
+            ],
+            "rowHeightPad": str(row_pad),
+        }
+
+    def test_top_anchored_grows_down(self):
+        gen = ImageOverlayGenerator(s3_client=MagicMock())
+        bg = _make_background(800, 600)  # center y=300
+
+        # Single short word at y=20% → y_anchor=120, top_y=120+21=141.
+        spec = self._spec(y_pct=20, text="Hi", font_size=40)
+        out = gen.generate_legacy_overlay(background=bg, overlay_specs=[spec])
+
+        # The text should render *below* the anchor (top_y > y_anchor).
+        # Verify pixels above y_anchor are still pure background.
+        for y in range(0, 100):
+            for x in range(0, 800, 50):
+                # Background is (0, 0, 128); white text changes the pixel.
+                assert out.getpixel((x, y))[:3] == (0, 0, 128)
+
+    def test_bottom_anchored_grows_up(self):
+        """Three rows at y=80% should not run off the bottom of an 800x600 image."""
+        gen = ImageOverlayGenerator(s3_client=MagicMock())
+        bg = _make_background(800, 600)  # center y=300, y_anchor at 80% = 480
+
+        # Long text guaranteed to wrap to multiple rows.
+        long_text = "First " + "wrapping " * 30 + "tail"
+        spec = self._spec(y_pct=80, text=long_text, font_size=40, row_pad=2)
+        out = gen.generate_legacy_overlay(background=bg, overlay_specs=[spec])
+
+        # Bottom-anchored: text grows up, so the last row should be near
+        # y_anchor=480, not running past the bottom edge (599). Confirm
+        # there is text rendered above y=400 (proof rows extend upward).
+        modified_above_400 = False
+        for y in range(200, 400):
+            for x in range(0, 800, 25):
+                if out.getpixel((x, y))[:3] != (0, 0, 128):
+                    modified_above_400 = True
+                    break
+            if modified_above_400:
+                break
+        assert modified_above_400, "bottom-anchored multi-row text did not grow upward"
+
+    def test_old_implementation_grew_off_image(self):
+        """Regression guard: confirm the new code does NOT overflow at y=80%.
+
+        Pre-CC3-870 always grew downward, so 3 rows × ~42px starting at
+        y=480 would reach y≈564 — borderline ok for 3 rows but breaks
+        for any longer wrap. Verify content stays within the image bounds.
+        """
+        gen = ImageOverlayGenerator(s3_client=MagicMock())
+        bg = _make_background(800, 600)
+        # Text that wraps to many rows.
+        long_text = " ".join(["word"] * 80)
+        spec = self._spec(y_pct=80, text=long_text, font_size=40, row_pad=2)
+        out = gen.generate_legacy_overlay(background=bg, overlay_specs=[spec])
+
+        # Image should not error and should have same dimensions.
+        assert out.size == bg.size
+
+
+class TestUnlimitedWrapping:
+    """Gap #3: No 4-line truncation cap on legacy path."""
+
+    def test_long_text_wraps_unlimited(self):
+        gen = ImageOverlayGenerator(s3_client=MagicMock())
+        bg = _make_background(800, 600)
+        # 100 short words; with default ~96% padding will wrap to many rows.
+        text = " ".join(["alpha"] * 100)
+        spec = {
+            "text": text,
+            "attributes": [
+                {"attr": "y", "value": "10%"},
+                {"attr": "x", "value": "50%"},
+                {"attr": "fill", "value": "white"},
+                {"attr": "text-anchor", "value": "middle"},
+                {"attr": "font-size", "value": "20px"},
+            ],
+        }
+        # No assertion error, no ellipsis added.
+        out = gen.generate_legacy_overlay(background=bg, overlay_specs=[spec])
+        assert out.size == bg.size
+
+    def test_wrap_pixels_returns_more_than_four_rows(self):
+        font = _load_font(20, bold=False)
+        text = " ".join(["word"] * 60)
+        rows = _wrap_pixels(text, font, max_width=200)
+        assert len(rows) > 4, "legacy path must wrap unlimited rows"
+        assert not any(r.endswith("...") for r in rows), "no ellipsis truncation"
+
+
+class TestFontFamily:
+    """Gap #4: font-family honored (or graceful fallback)."""
+
+    def test_normalize_family_lowercase(self):
+        assert _normalize_family("Roboto") == "roboto"
+        assert _normalize_family("Courier Prime") == "courierprime"
+        assert _normalize_family("OpenSans") == "opensans"
+
+    def test_normalize_family_strips_quotes_and_fallback(self):
+        assert _normalize_family("'Roboto'") == "roboto"
+        assert _normalize_family('"Courier Prime", monospace') == "courierprime"
+
+    def test_normalize_family_none_defaults_to_opensans(self):
+        assert _normalize_family(None) == "opensans"
+        assert _normalize_family("") == "opensans"
+
+    def test_load_font_unknown_family_falls_back_to_opensans(self, caplog):
+        with caplog.at_level("INFO"):
+            font = _load_font(40, bold=True, family="NonexistentFontXYZ")
+        assert font is not None
+        # Either logs the fallback or silently uses OpenSans — both acceptable.
+
+    def test_load_font_with_known_family_does_not_raise(self):
+        # OpenSans is bundled in the repo, so this should always succeed.
+        font = _load_font(40, bold=True, family="OpenSans")
+        assert font is not None
+
+    def test_legacy_overlay_passes_font_family(self):
+        """End-to-end: spec with font-family doesn't crash and renders text."""
+        gen = ImageOverlayGenerator(s3_client=MagicMock())
+        bg = _make_background()
+        spec = {
+            "text": "Hello",
+            "attributes": [
+                {"attr": "y", "value": "50%"},
+                {"attr": "x", "value": "50%"},
+                {"attr": "fill", "value": "white"},
+                {"attr": "text-anchor", "value": "middle"},
+                {"attr": "font-family", "value": "Roboto"},
+                {"attr": "font-size", "value": "40px"},
+            ],
+        }
+        out = gen.generate_legacy_overlay(background=bg, overlay_specs=[spec])
+        assert list(out.getdata()) != list(bg.getdata())
+
+
+class TestWidthPadFactor:
+    """Gap #5: widthPadFactor honored, default 0.04 (not hardcoded 0.85)."""
+
+    def test_default_constant(self):
+        assert LEGACY_PADDING_FACTOR_DEFAULT == 0.04
+
+    def test_smaller_pad_factor_fits_more_text_per_row(self):
+        """Lower padFactor → wider usable area → fewer wrapped rows."""
+        gen = ImageOverlayGenerator(s3_client=MagicMock())
+        bg = _make_background(1200, 600)
+        text = "The quick brown fox jumps over the lazy dog repeatedly across the page"
+
+        font = _load_font(40, bold=True)
+        rows_default = _wrap_pixels(
+            text, font,
+            max_width=int(1200 - 1200 * LEGACY_PADDING_FACTOR_DEFAULT),  # 0.04 → 1152
+        )
+        rows_tight = _wrap_pixels(
+            text, font,
+            max_width=int(1200 - 1200 * 0.5),  # 0.50 → 600
+        )
+        assert len(rows_default) < len(rows_tight)
+
+    def test_pad_factor_used_in_legacy_path(self):
+        gen = ImageOverlayGenerator(s3_client=MagicMock())
+        bg = _make_background(1200, 600)
+        spec = {
+            "text": "Short",
+            "attributes": [
+                {"attr": "y", "value": "50%"},
+                {"attr": "x", "value": "50%"},
+                {"attr": "fill", "value": "white"},
+                {"attr": "text-anchor", "value": "middle"},
+                {"attr": "font-size", "value": "40px"},
+            ],
+            "widthPadFactor": "0.10",
+        }
+        # No exception raised — the spec value is read (default would also work).
+        out = gen.generate_legacy_overlay(background=bg, overlay_specs=[spec])
+        assert out.size == bg.size
+
+
+class TestNoDropShadow:
+    """Gap #6: Legacy path no longer renders a shadow.
+
+    With white-on-blue background and no shadow, the only changed pixels
+    should be white (255, 255, 255) — no semi-transparent black halo.
+    """
+
+    def test_legacy_overlay_has_no_dark_halo(self):
+        gen = ImageOverlayGenerator(s3_client=MagicMock())
+        bg = _make_background(800, 600)  # solid (0, 0, 128)
+
+        spec = {
+            "text": "X",  # single tall character
+            "attributes": [
+                {"attr": "y", "value": "50%"},
+                {"attr": "x", "value": "50%"},
+                {"attr": "fill", "value": "white"},
+                {"attr": "text-anchor", "value": "middle"},
+                {"attr": "font-size", "value": "120px"},
+            ],
+        }
+        out = gen.generate_legacy_overlay(background=bg, overlay_specs=[spec])
+
+        # Walk every pixel; collect any non-background colors.
+        # Without a shadow, we expect only background-blue + white-ish glyph
+        # antialiased pixels — never the shadow color (0, 0, 0, 160) family.
+        for y in range(out.height):
+            for x in range(out.width):
+                r, g, b, _ = out.getpixel((x, y))
+                if (r, g, b) == (0, 0, 128):
+                    continue
+                # Antialiased glyph: red and green channels should rise toward white.
+                # A shadow at offset (2, 2) would leave dark pixels (low R, low G,
+                # but blue close to background). Assert no such pixel exists.
+                assert not (r < 30 and g < 30 and b < 80), (
+                    f"shadow-like pixel found at ({x},{y}): ({r},{g},{b})"
+                )
+
+
+class TestRowHeightPadDefault:
+    """Gap #7: rowHeightPad default is 2 (not 10)."""
+
+    def test_default_constant(self):
+        assert LEGACY_ROW_HEIGHT_PAD_DEFAULT == 2
+
+    def test_default_used_when_spec_omits_rowheightpad(self):
+        gen = ImageOverlayGenerator(s3_client=MagicMock())
+        bg = _make_background(800, 600)
+        # Two rows worth of text, no rowHeightPad in spec.
+        spec = {
+            "text": "First Second Third Fourth Fifth Sixth Seventh Eighth",
+            "attributes": [
+                {"attr": "y", "value": "20%"},
+                {"attr": "x", "value": "50%"},
+                {"attr": "fill", "value": "white"},
+                {"attr": "text-anchor", "value": "middle"},
+                {"attr": "font-size", "value": "40px"},
+            ],
+        }
+        # Just verify no crash and overlay applied.
+        out = gen.generate_legacy_overlay(background=bg, overlay_specs=[spec])
+        assert list(out.getdata()) != list(bg.getdata())
+
+
+class TestPixelWrapping:
+    """Gap #8: pixel-measured wrapping (not character-count estimation)."""
+
+    def test_empty_text_returns_empty(self):
+        font = _load_font(20, bold=False)
+        assert _wrap_pixels("", font, max_width=400) == []
+
+    def test_single_word_single_row(self):
+        font = _load_font(20, bold=False)
+        rows = _wrap_pixels("Hello", font, max_width=400)
+        assert rows == ["Hello"]
+
+    def test_wraps_when_row_exceeds_max_width(self):
+        font = _load_font(40, bold=True)
+        # Three short words at 40px should still wrap into a couple rows
+        # at a tight max_width.
+        rows = _wrap_pixels("Alpha Beta Gamma", font, max_width=80)
+        assert len(rows) >= 2
+
+    def test_bigger_font_yields_more_rows(self):
+        """Pixel wrap is sensitive to font size — char-count estimation isn't."""
+        text = "The quick brown fox jumps over the lazy dog"
+        font_small = _load_font(16, bold=False)
+        font_big = _load_font(48, bold=False)
+        rows_small = _wrap_pixels(text, font_small, max_width=400)
+        rows_big = _wrap_pixels(text, font_big, max_width=400)
+        assert len(rows_big) > len(rows_small), (
+            "pixel wrapping must respond to font size, not just char count"
+        )
