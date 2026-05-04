@@ -26,9 +26,12 @@ from src.generators.image_overlay_generator import (
     TITLE_MAX_LINES,
     GenerationResult,
     ImageOverlayGenerator,
+    _compute_top_y,
     _load_font,
     _normalize_family,
     _parse_legacy_attributes,
+    _safe_float,
+    _safe_int,
     _stage_prefix,
     _wrap_and_truncate,
     _wrap_pixels,
@@ -639,7 +642,11 @@ class TestLegacyProcessTrigger:
 
 
 class TestStagePrefix:
-    """Gap #1: STAGE env → bucket prefix (handler.js:26-36)."""
+    """Gap #1: STAGE env → bucket prefix (handler.js:26-36).
+
+    R1 hardening: strip+lowercase normalize, raise on unknown values
+    rather than fall through to no-prefix (would route dev jobs to prod).
+    """
 
     def test_dev_prefix(self, monkeypatch):
         monkeypatch.setenv("STAGE", "dev")
@@ -657,15 +664,35 @@ class TestStagePrefix:
         monkeypatch.delenv("STAGE", raising=False)
         assert _stage_prefix() == ""
 
-    def test_unknown_value_no_prefix(self, monkeypatch):
-        monkeypatch.setenv("STAGE", "qa")
+    @pytest.mark.parametrize("value", ["DEV", "Dev", "Dev ", "  dev\n", "DEV  "])
+    def test_dev_normalized(self, monkeypatch, value):
+        """R1: case + whitespace variants of dev resolve to dev- (no prod leak)."""
+        monkeypatch.setenv("STAGE", value)
+        assert _stage_prefix() == "dev-"
+
+    @pytest.mark.parametrize("value", ["STAGING", "Staging\n", "  staging  "])
+    def test_staging_normalized(self, monkeypatch, value):
+        monkeypatch.setenv("STAGE", value)
+        assert _stage_prefix() == "staging-"
+
+    @pytest.mark.parametrize("value", ["PROD", "  prod  ", "Prod\n"])
+    def test_prod_normalized(self, monkeypatch, value):
+        monkeypatch.setenv("STAGE", value)
         assert _stage_prefix() == ""
+
+    @pytest.mark.parametrize("value", ["qa", "test", "production", "develop"])
+    def test_unknown_value_raises(self, monkeypatch, value):
+        """R1: unknown STAGE values raise rather than silently fall through."""
+        monkeypatch.setenv("STAGE", value)
+        with pytest.raises(ValueError, match="Unrecognized STAGE"):
+            _stage_prefix()
 
     def test_legacy_process_applies_prefix_to_buckets(self, monkeypatch):
         """End-to-end: dev STAGE causes both source + dest buckets to be prefixed."""
         monkeypatch.setenv("STAGE", "dev")
         s3_mock = MagicMock()
-        _mock_s3_for_legacy_trigger(s3_mock)
+        payload = _make_legacy_payload()
+        _mock_s3_for_legacy_trigger(s3_mock, payload)
         gen = ImageOverlayGenerator(s3_client=s3_mock)
 
         gen.process_trigger(bucket="trigger-bucket", key="actions/job.json")
@@ -674,22 +701,23 @@ class TestStagePrefix:
         get_calls = s3_mock.get_object.call_args_list
         source_calls = [c for c in get_calls if not c[1]["Key"].endswith(".json")]
         assert len(source_calls) == 1
-        assert source_calls[0][1]["Bucket"] == "dev-ieee-conference-cloud-uploads"
+        assert source_calls[0][1]["Bucket"] == f"dev-{payload['sourceBucket']}"
 
         # Upload should hit the prefixed dest bucket.
         put_kwargs = s3_mock.put_object.call_args[1]
-        assert put_kwargs["Bucket"] == "dev-ieee-conference-cloud-bulk-uploads"
+        assert put_kwargs["Bucket"] == f"dev-{payload['destBucket']}"
 
     def test_legacy_process_no_prefix_in_prod(self, monkeypatch):
         monkeypatch.setenv("STAGE", "prod")
         s3_mock = MagicMock()
-        _mock_s3_for_legacy_trigger(s3_mock)
+        payload = _make_legacy_payload()
+        _mock_s3_for_legacy_trigger(s3_mock, payload)
         gen = ImageOverlayGenerator(s3_client=s3_mock)
 
         gen.process_trigger(bucket="trigger-bucket", key="actions/job.json")
 
         put_kwargs = s3_mock.put_object.call_args[1]
-        assert put_kwargs["Bucket"] == "ieee-conference-cloud-bulk-uploads"
+        assert put_kwargs["Bucket"] == payload["destBucket"]
 
 
 class TestVerticalAnchoring:
@@ -902,6 +930,16 @@ class TestNoDropShadow:
     """
 
     def test_legacy_overlay_has_no_dark_halo(self):
+        """Earlier `b < 80` excluded shadow pixels and made the test useless.
+
+        The right discriminator: shadow pixels REDUCE B from the (0,0,128) bg
+        (alpha-blending black down toward 0), while glyph antialias pixels
+        RAISE B toward white (255). So:
+          shadow:           low R, low G, B < 128
+          glyph antialias:  low/high R+G with B ≥ 128
+        Asserting (R<30 AND G<30 AND B<128) catches a returning shadow without
+        false-positiving on edge antialiasing.
+        """
         gen = ImageOverlayGenerator(s3_client=MagicMock())
         bg = _make_background(800, 600)  # solid (0, 0, 128)
 
@@ -917,18 +955,12 @@ class TestNoDropShadow:
         }
         out = gen.generate_legacy_overlay(background=bg, overlay_specs=[spec])
 
-        # Walk every pixel; collect any non-background colors.
-        # Without a shadow, we expect only background-blue + white-ish glyph
-        # antialiased pixels — never the shadow color (0, 0, 0, 160) family.
         for y in range(out.height):
             for x in range(out.width):
                 r, g, b, _ = out.getpixel((x, y))
                 if (r, g, b) == (0, 0, 128):
                     continue
-                # Antialiased glyph: red and green channels should rise toward white.
-                # A shadow at offset (2, 2) would leave dark pixels (low R, low G,
-                # but blue close to background). Assert no such pixel exists.
-                assert not (r < 30 and g < 30 and b < 80), (
+                assert not (r < 30 and g < 30 and b < 128), (
                     f"shadow-like pixel found at ({x},{y}): ({r},{g},{b})"
                 )
 
@@ -987,3 +1019,188 @@ class TestPixelWrapping:
         assert len(rows_big) > len(rows_small), (
             "pixel wrapping must respond to font size, not just char count"
         )
+
+
+# ---------------------------------------------------------------------------
+# CC3-870 Round 1 review fixes
+# ---------------------------------------------------------------------------
+
+
+class TestComputeTopY:
+    """R1 #3: Anchoring math regression vs Node getTextElements.js:36-52.
+
+    Node source (image-generator/getTextElements.js, lines 36-52):
+
+        const center = height / 2;
+        let topPixelValue = 0;
+        if (pixelInt < center) {
+            topPixelValue = pixelInt + ( paddedRowHeight / 2 );
+        } else if (pixelInt === center) {
+            topPixelValue =
+                paddedRowHeight +
+                parseInt(pixelInt - ( (paddedRowHeight * rowCount) / 2) );
+        } else if (pixelInt > center) {
+            topPixelValue = parseInt(
+                pixelInt - ( paddedRowHeight * (rowCount - 1) ),
+            );
+        }
+
+    The half-row discontinuity crossing center from below is Node's actual
+    behavior, not a port artifact. These cases pin the parity.
+    """
+
+    @pytest.mark.parametrize("y_anchor,padded,row_count,expected", [
+        # 800x600 image (center=300), padded=42 (font_size=40 + row_pad=2)
+        # y < center: top_y = y + padded // 2
+        (0, 42, 1, 0 + 21),       # y=0   → 21
+        (100, 42, 1, 100 + 21),   # y=100 → 121
+        (299, 42, 1, 299 + 21),   # y=center-1 → 320
+        (200, 42, 3, 200 + 21),   # y<center, 3 rows → still 221 (rows grow down)
+
+        # y == center (the edge case Alex flagged)
+        # Node: top_y = padded + int(y - (padded * rowCount) / 2)
+        (300, 42, 1, 42 + 300 - 21),   # → 321
+        (300, 42, 3, 42 + 300 - 63),   # → 279 (centered around y for 3-row block)
+        (300, 42, 5, 42 + 300 - 105),  # → 237
+
+        # y > center: top_y = y - padded * (rowCount - 1)
+        (301, 42, 1, 301),         # 1 row → top_y=y exactly
+        (301, 42, 3, 301 - 84),    # → 217 (3 rows grow upward)
+        (480, 42, 5, 480 - 168),   # → 312 (bottom-anchored, 5 rows)
+    ])
+    def test_matches_node_for_all_branches(self, y_anchor, padded, row_count, expected):
+        """Pin Node-equivalent top_y values across all three branches."""
+        assert _compute_top_y(y_anchor, image_height=600, padded_row_height=padded,
+                              row_count=row_count) == expected
+
+    def test_documented_discontinuity_at_center(self):
+        """Crossing center from below, top_y jumps by ~half a row.
+
+        For a single line at padded=42:
+          y=299 → top_y=320 (top-branch: 299 + 21)
+          y=300 → top_y=321 (==-branch:  42 + 300 - 21)
+          y=301 → top_y=301 (>-branch:   301 - 0)
+
+        The 320 → 301 transition is a 19-pixel jump. This is preserved
+        verbatim from Node and would only be wrong if Node itself were wrong
+        — since the parent ticket's goal is byte-for-byte parity, we keep it.
+        """
+        assert _compute_top_y(299, 600, 42, 1) == 320
+        assert _compute_top_y(300, 600, 42, 1) == 321
+        assert _compute_top_y(301, 600, 42, 1) == 301
+
+
+class TestSafeParsing:
+    """R1 #2: Defensive parsing for legacy spec values.
+
+    Drupal payloads can carry empty/null/CSS-suffixed values that crash
+    the entire trigger if passed straight to int()/float().
+    """
+
+    @pytest.mark.parametrize("value,expected", [
+        (None, 5),
+        ("", 5),
+        ("10", 10),
+        (10, 10),
+        ("abc", 5),    # malformed → default
+        ("4%", 5),     # CSS-style with units → default
+        ([], 5),       # wrong type → default
+    ])
+    def test_safe_int(self, value, expected):
+        assert _safe_int(value, default=5, field="x") == expected
+
+    @pytest.mark.parametrize("value,expected", [
+        (None, 0.04),
+        ("", 0.04),
+        ("0.10", 0.10),
+        (0.10, 0.10),
+        ("not-a-number", 0.04),
+        ("10%", 0.04),
+        ({}, 0.04),
+    ])
+    def test_safe_float(self, value, expected):
+        assert _safe_float(value, default=0.04, field="x") == expected
+
+    def test_legacy_overlay_survives_malformed_widthpadfactor(self, caplog):
+        """Whole-job survival when Drupal sends widthPadFactor='4%'."""
+        gen = ImageOverlayGenerator(s3_client=MagicMock())
+        bg = _make_background(800, 600)
+        spec = {
+            "text": "Hello world",
+            "attributes": [
+                {"attr": "y", "value": "20%"},
+                {"attr": "x", "value": "50%"},
+                {"attr": "fill", "value": "white"},
+                {"attr": "text-anchor", "value": "middle"},
+                {"attr": "font-size", "value": "40px"},
+            ],
+            "widthPadFactor": "4%",   # malformed; would break float()
+            "rowHeightPad": "",       # malformed; would break int()
+        }
+        with caplog.at_level("WARNING"):
+            out = gen.generate_legacy_overlay(background=bg, overlay_specs=[spec])
+        # Job completed; warnings were logged; defaults were applied.
+        assert out.size == bg.size
+
+
+class TestTextAnchorEnd:
+    """R1 smaller: text-anchor='end' branch + unknown-anchor warning."""
+
+    def test_end_anchor_right_aligns_text(self):
+        gen = ImageOverlayGenerator(s3_client=MagicMock())
+        bg = _make_background(800, 600)
+        spec = {
+            "text": "ENDX",
+            "attributes": [
+                {"attr": "y", "value": "20%"},
+                {"attr": "x", "value": "100%"},
+                {"attr": "fill", "value": "white"},
+                {"attr": "text-anchor", "value": "end"},
+                {"attr": "font-size", "value": "60px"},
+            ],
+        }
+        out = gen.generate_legacy_overlay(background=bg, overlay_specs=[spec])
+
+        # End-anchored text at x=100% should occupy pixels in the right portion
+        # (last 20% of width), not the center or left.
+        right_band_modified = False
+        for y in range(0, 200):
+            for x in range(640, 800):
+                if out.getpixel((x, y))[:3] != (0, 0, 128):
+                    right_band_modified = True
+                    break
+            if right_band_modified:
+                break
+        assert right_band_modified, "end-anchored text did not render in the right band"
+
+    def test_unknown_anchor_falls_back_with_warning(self, caplog):
+        gen = ImageOverlayGenerator(s3_client=MagicMock())
+        bg = _make_background()
+        spec = {
+            "text": "Hi",
+            "attributes": [
+                {"attr": "y", "value": "20%"},
+                {"attr": "x", "value": "50%"},
+                {"attr": "fill", "value": "white"},
+                {"attr": "text-anchor", "value": "bogus-value"},
+                {"attr": "font-size", "value": "40px"},
+            ],
+        }
+        with caplog.at_level("WARNING"):
+            out = gen.generate_legacy_overlay(background=bg, overlay_specs=[spec])
+        # No crash; warning logged with the offending value.
+        assert "bogus-value" in caplog.text or "Unknown text-anchor" in caplog.text
+        assert out.size == bg.size
+
+
+class TestNormalizeFamilyEdgeCases:
+    """R1 nit: _normalize_family handles whitespace-only inputs."""
+
+    def test_whitespace_only_defaults_to_opensans(self):
+        assert _normalize_family("   ") == "opensans"
+        assert _normalize_family("\t\n") == "opensans"
+
+    def test_already_handled_inputs_unchanged(self):
+        # Sanity — make sure the explicit .strip() doesn't break the existing path.
+        assert _normalize_family("Roboto") == "roboto"
+        assert _normalize_family("'Courier Prime', monospace") == "courierprime"

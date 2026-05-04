@@ -349,8 +349,12 @@ class ImageOverlayGenerator:
                 continue
 
             attrs = _parse_legacy_attributes(spec.get("attributes", []))
-            row_height_pad = int(spec.get("rowHeightPad", LEGACY_ROW_HEIGHT_PAD_DEFAULT))
-            pad_factor = float(spec.get("widthPadFactor", LEGACY_PADDING_FACTOR_DEFAULT))
+            row_height_pad = _safe_int(
+                spec.get("rowHeightPad"), LEGACY_ROW_HEIGHT_PAD_DEFAULT, "rowHeightPad"
+            )
+            pad_factor = _safe_float(
+                spec.get("widthPadFactor"), LEGACY_PADDING_FACTOR_DEFAULT, "widthPadFactor"
+            )
 
             font_size = attrs.get("font_size", 40)
             is_bold = attrs.get("font_weight", "").lower() in ("bold", "700", "800", "900")
@@ -365,29 +369,22 @@ class ImageOverlayGenerator:
             if not lines:
                 continue
 
-            # Anchoring (getTextElements.js:36-52). The supplied y is the
-            # anchor point; whether the block grows down, centers, or grows
-            # up depends on which half of the image y lies in.
+            # Anchoring (getTextElements.js:36-52). Faithfully ports the
+            # Node.js three-branch math, including the ~half-row discontinuity
+            # crossing center from below — that is Node's behavior.
             x_pct = attrs.get("x_pct")
             y_pct = attrs.get("y_pct")
             text_anchor = attrs.get("text_anchor", "middle")
+            if text_anchor not in ("middle", "start", "end"):
+                logger.warning(
+                    "Unknown text-anchor %r — falling back to 'middle'", text_anchor,
+                )
+                text_anchor = "middle"
 
             y_anchor = int(h * y_pct / 100) if y_pct is not None else int(h * 0.2)
             padded_row_height = font_size + row_height_pad
             row_count = len(lines)
-            center = h / 2
-
-            if y_anchor < center:
-                # Top-anchored: text grows down from y.
-                top_y = y_anchor + padded_row_height // 2
-            elif y_anchor == center:
-                # Vertically centered: shift up by half the block height.
-                top_y = padded_row_height + int(
-                    y_anchor - (padded_row_height * row_count) / 2
-                )
-            else:
-                # Bottom-anchored: text grows up from y.
-                top_y = y_anchor - padded_row_height * (row_count - 1)
+            top_y = _compute_top_y(y_anchor, h, padded_row_height, row_count)
 
             for i, line in enumerate(lines):
                 bbox = draw.textbbox((0, 0), line, font=font)
@@ -397,8 +394,11 @@ class ImageOverlayGenerator:
                     x_pos = (w - text_w) // 2
                 elif text_anchor == "start":
                     x_pos = int(w * x_pct / 100) if x_pct is not None else 0
-                else:
-                    x_pos = (w - text_w) // 2
+                else:  # "end" — right-anchored at x_pct (or right edge)
+                    if x_pct is not None:
+                        x_pos = int(w * x_pct / 100) - text_w
+                    else:
+                        x_pos = w - text_w
 
                 y_pos = top_y + i * padded_row_height
                 draw.text((x_pos, y_pos), line, fill=fill_color, font=font)
@@ -501,33 +501,101 @@ def _wrap_pixels(
     """
     if not text:
         return []
-    words = text.split(" ")
     rows: list[str] = []
-    current: list[str] = []
-    for word in words:
-        candidate = " ".join(current + [word])
+    current_row = ""
+    for word in text.split(" "):
+        candidate = f"{current_row} {word}" if current_row else word
         bbox = font.getbbox(candidate)
-        candidate_width = bbox[2] - bbox[0]
-        if current and candidate_width >= max_width:
-            rows.append(" ".join(current))
-            current = [word]
+        if current_row and (bbox[2] - bbox[0]) >= max_width:
+            rows.append(current_row)
+            current_row = word
         else:
-            current.append(word)
-    if current:
-        rows.append(" ".join(current))
+            current_row = candidate
+    if current_row:
+        rows.append(current_row)
     return rows
+
+
+def _compute_top_y(
+    y_anchor: int, image_height: int, padded_row_height: int, row_count: int
+) -> int:
+    """Port of getTextElements.js:36-52 — branches on whether the anchor
+    is above, at, or below the image center.
+
+    Returns the y-coordinate of the FIRST row's top.
+
+    The math is preserved as-is from Node.js, including a ~half-row
+    discontinuity when the anchor crosses center from below — that is
+    Node's behavior, not a port artifact. See the regression test cases
+    in TestComputeTopY for the exact Node-equivalent expected values.
+    """
+    center = image_height / 2
+    if y_anchor < center:
+        return y_anchor + padded_row_height // 2
+    if y_anchor == center:
+        return padded_row_height + int(
+            y_anchor - (padded_row_height * row_count) / 2
+        )
+    return y_anchor - padded_row_height * (row_count - 1)
+
+
+# Recognized STAGE values. Anything outside these sets — including casing
+# variants of dev/staging that didn't survive normalization — raises so a
+# misconfigured Lambda fails loud rather than silently routing to prod.
+_STAGE_PREFIXED = ("dev", "staging")
+_STAGE_NO_PREFIX = ("", "prod")
 
 
 def _stage_prefix() -> str:
     """Return the bucket-name prefix for the current stage.
 
-    `dev` → `dev-`, `staging` → `staging-`, anything else (including unset
-    and `prod`) returns empty string. Mirrors the Node.js handler.js switch.
+    `dev` → `dev-`, `staging` → `staging-`, `prod` or unset → `""`. The
+    STAGE value is normalized with `.strip().lower()` so accidental casing
+    or whitespace (`"DEV"`, `"staging\\n"`) is tolerated. Any other value
+    raises ValueError to prevent silent routing to prod buckets.
+    Mirrors Node.js handler.js:26-36 with hardened normalization.
     """
-    stage = os.environ.get("STAGE", "")
-    if stage in ("dev", "staging"):
+    stage = os.environ.get("STAGE", "").strip().lower()
+    if stage in _STAGE_PREFIXED:
         return f"{stage}-"
-    return ""
+    if stage in _STAGE_NO_PREFIX:
+        return ""
+    raise ValueError(
+        f"Unrecognized STAGE={stage!r}; expected one of "
+        f"{_STAGE_PREFIXED + _STAGE_NO_PREFIX}"
+    )
+
+
+def _safe_int(value, default: int, field: str) -> int:
+    """Parse `value` to int or return `default`, logging on failure.
+
+    Drupal-supplied values can be empty/None/CSS-suffixed (e.g. ``"4%"``)
+    and would crash the entire trigger if passed straight to ``int()``.
+    """
+    if value is None or value == "":
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        logger.warning(
+            "Could not parse %s=%r as int; falling back to default %r",
+            field, value, default,
+        )
+        return default
+
+
+def _safe_float(value, default: float, field: str) -> float:
+    """Parse `value` to float or return `default`, logging on failure."""
+    if value is None or value == "":
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        logger.warning(
+            "Could not parse %s=%r as float; falling back to default %r",
+            field, value, default,
+        )
+        return default
 
 
 def _parse_legacy_attributes(attributes: list[dict]) -> dict:
@@ -562,8 +630,13 @@ def _parse_legacy_attributes(attributes: list[dict]) -> dict:
 
 
 def _normalize_family(family: str | None) -> str:
-    """Map a CSS-style font-family to a canonical key (lowercased, no spaces)."""
-    if not family:
+    """Map a CSS-style font-family to a canonical key (lowercased, no spaces).
+
+    Whitespace-only and empty inputs default to opensans. Quote stripping
+    handles ``"'Roboto'"`` / ``'"Courier Prime", monospace'`` shapes seen
+    in the legacy Drupal CSS attribute strings.
+    """
+    if not family or not family.strip():
         return "opensans"
     key = family.split(",")[0].strip().strip("'\"").lower().replace(" ", "")
     return key or "opensans"
@@ -572,6 +645,11 @@ def _normalize_family(family: str | None) -> str:
 # Family → (bold path candidates, regular path candidates).
 # Each list is searched in order; first hit wins. Bundled fonts live under
 # /usr/share/fonts/truetype/<name>/ inside the Lambda image (see Dockerfile).
+# Cross-family fallbacks (e.g. Roboto's regular list ending in OpenSans-SemiBold)
+# are belt-and-braces in case the family-specific .ttf is missing from the
+# container — the bundled file at the head of the list is what runs in prod.
+# If even those fall through, _load_font ultimately returns Pillow's default
+# bitmap font.
 _FONT_FAMILY_PATHS: dict[str, tuple[list[str], list[str]]] = {
     "opensans": (
         [
