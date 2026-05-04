@@ -140,6 +140,11 @@ create_lambda_role() {
                         \"cloudwatch:namespace\": \"ieee-rc\"
                     }
                 }
+            },
+            {
+                \"Effect\": \"Allow\",
+                \"Action\": [\"secretsmanager:GetSecretValue\"],
+                \"Resource\": \"arn:aws:secretsmanager:${AWS_REGION}:${AWS_ACCOUNT_ID}:secret:iplr/webhook-secret*\"
             }
         ]
     }"
@@ -210,7 +215,13 @@ update_lambda_code() {
 # Main
 # ---------------------------------------------------------------
 if [[ "${2:-}" == "update" ]]; then
-    log "Update mode (${ENV}) — rebuilding image and updating Lambda code only."
+    log "Update mode (${ENV}) — refreshing IAM, rebuilding image, and updating Lambda code."
+    # IAM is refreshed every run because create_lambda_role is idempotent
+    # (put-role-policy replaces) and the inline policy may have grown
+    # between deploys. Without this, code that needs new permissions
+    # (e.g. CC3-900's secretsmanager:GetSecretValue) deploys fine but
+    # logs AccessDeniedException on every invocation in stage/live.
+    create_lambda_role
     build_and_push
     update_lambda_code
     log "Done."

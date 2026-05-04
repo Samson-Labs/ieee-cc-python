@@ -1,0 +1,94 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Samson-Labs/ieee-cc/blob/master/docs/contracts/transfer-callback-v1.json",
+  "title": "IPLR Transfer Callback v1",
+  "description": "Wire format for the webhook Lambda POSTs to Drupal at /api/iplr/webhook/media-transfer once a transfer reaches a terminal state. Body is signed with HMAC-SHA256 (hex-encoded) using the secret resolved from callback_secret_ref in the trigger; signature lives in X-Webhook-Signature. Drupal updates the corresponding ProductLoadItem on receipt.",
+  "type": "object",
+  "required": ["item_id", "request_id", "status"],
+  "additionalProperties": false,
+  "properties": {
+    "item_id": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Echoed from the trigger. Drupal loads ProductLoadItem by this id."
+    },
+    "request_id": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Echoed from the trigger. Drupal verifies the item belongs to this request before updating."
+    },
+    "operation": {
+      "type": "string",
+      "enum": ["transfer_media", "transfer_image"],
+      "description": "Echoed from the trigger so Drupal updates the right field set (media_* vs image_*)."
+    },
+    "status": {
+      "type": "string",
+      "enum": ["complete", "error"],
+      "description": "Terminal state only. Lambda must not POST 'pending' or 'in_progress' callbacks; intermediate states are tracked Drupal-side via the cron janitor."
+    },
+    "error_code": {
+      "type": "string",
+      "enum": [
+        "drive_token_expired",
+        "drive_forbidden",
+        "drive_not_found",
+        "url_not_found",
+        "url_timeout",
+        "tls_error",
+        "dest_write_failed",
+        "internal"
+      ],
+      "description": "Required when status=error. Machine-readable failure mode. Drupal surfaces a user-facing message keyed off this; 'internal' is the catch-all and should be rare."
+    },
+    "error_message": {
+      "type": "string",
+      "description": "Free-text detail. Logged to watchdog and stored on the item's media_metadata.transfer_error. Not user-facing."
+    },
+    "bytes_transferred": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Required on status=complete. Stored on the item's media_metadata for audit."
+    },
+    "s3_etag": {
+      "type": "string",
+      "description": "Required on status=complete. The dest object's ETag from the multipart-upload completion. Stored for audit."
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "status": { "const": "complete" } } },
+      "then": { "required": ["bytes_transferred", "s3_etag"] }
+    },
+    {
+      "if": { "properties": { "status": { "const": "error" } } },
+      "then": { "required": ["error_code", "error_message"] }
+    }
+  ],
+  "examples": [
+    {
+      "item_id": 117,
+      "request_id": 42,
+      "operation": "transfer_media",
+      "status": "complete",
+      "bytes_transferred": 4823490112,
+      "s3_etag": "\"5d41402abc4b2a76b9719d911017c592-287\""
+    },
+    {
+      "item_id": 118,
+      "request_id": 42,
+      "operation": "transfer_media",
+      "status": "error",
+      "error_code": "url_not_found",
+      "error_message": "GET https://files.example.org/keynote.mp4 returned 404"
+    },
+    {
+      "item_id": 119,
+      "request_id": 43,
+      "operation": "transfer_image",
+      "status": "error",
+      "error_code": "drive_token_expired",
+      "error_message": "Drive API returned 401 invalid_grant; access token had expired before transfer started"
+    }
+  ]
+}

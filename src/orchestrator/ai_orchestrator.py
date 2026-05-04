@@ -63,8 +63,11 @@ VIDEO_TRANSCRIBER_FUNCTION = os.environ.get("VIDEO_TRANSCRIBER_FUNCTION", f"ieee
 PPTX_EXTRACTOR_FUNCTION = os.environ.get("PPTX_EXTRACTOR_FUNCTION", f"ieee-rc-pptx-extractor-{_STAGE}")
 BEDROCK_FUNCTION = os.environ.get("BEDROCK_FUNCTION", f"ieee-cc-bedrock-inference-{_STAGE}")
 
-# Webhook secret
-DRUPAL_WEBHOOK_SECRET = os.environ.get("DRUPAL_WEBHOOK_SECRET", "")
+# Webhook secret resolution.  Mirrors src/transfer/wizard_transfer.py:
+# Secrets Manager first, DRUPAL_WEBHOOK_SECRET env var fallback.  The
+# WEBHOOK_SECRET_REF env var lets ops override the SM key without code
+# changes (e.g. per-tenant rotation in a future deployment).
+WEBHOOK_SECRET_REF = os.environ.get("WEBHOOK_SECRET_REF", "iplr/webhook-secret")
 
 # Retry settings for S3 reads
 S3_READ_MAX_RETRIES = 3
@@ -105,11 +108,49 @@ class AIOrchestrator:
         lambda_client=None,
         sns_client=None,
         cloudwatch_client=None,
+        secrets_client=None,
     ):
         self._s3 = s3_client or boto3.client("s3")
         self._lambda = lambda_client or boto3.client("lambda")
         self._webhook_sender = WebhookSender(sns_client=sns_client)
         self._cloudwatch = cloudwatch_client
+        self._secrets = secrets_client or boto3.client("secretsmanager")
+
+    def _resolve_webhook_secret(self, correlation: str) -> str:
+        """Resolve the HMAC signing secret used to sign Drupal webhooks.
+
+        Tries AWS Secrets Manager first (key from ``WEBHOOK_SECRET_REF``,
+        default ``iplr/webhook-secret``); falls back to the
+        ``DRUPAL_WEBHOOK_SECRET`` env var if SM is unavailable.  Mirrors
+        the resolution policy in ``src/transfer/wizard_transfer.py`` so
+        both Lambdas behave identically during rotations.
+
+        A SM miss logs at INFO; only the all-empty case logs ERROR (which
+        is a real misconfig — the resulting empty secret will produce an
+        HMAC mismatch and Drupal will return 401, which WebhookSender
+        treats as a permanent failure).
+        """
+        try:
+            resp = self._secrets.get_secret_value(SecretId=WEBHOOK_SECRET_REF)
+            secret = resp.get("SecretString", "")
+            if secret:
+                return secret
+        except ClientError as exc:
+            logger.info(
+                "%s WEBHOOK_SECRET_REF %s not in Secrets Manager (%s); falling back to env",
+                correlation,
+                WEBHOOK_SECRET_REF,
+                exc.response.get("Error", {}).get("Code", "Unknown"),
+            )
+
+        env_secret = os.environ.get("DRUPAL_WEBHOOK_SECRET", "")
+        if not env_secret:
+            logger.error(
+                "%s No webhook secret available "
+                "(Secrets Manager fetch failed and DRUPAL_WEBHOOK_SECRET unset)",
+                correlation,
+            )
+        return env_secret
 
     def process(
         self,
@@ -317,8 +358,9 @@ class AIOrchestrator:
                 "generated_fields": generated_fields,
                 "vtt_s3_key": vtt_key if vtt_key else None,
             }
+            webhook_secret = self._resolve_webhook_secret(correlation)
             webhook_sent = self._webhook_sender.send(
-                callback_url, DRUPAL_WEBHOOK_SECRET, payload, correlation,
+                callback_url, webhook_secret, payload, correlation,
             )
 
         # Step 6: Move file from /pending/ to /processed/
