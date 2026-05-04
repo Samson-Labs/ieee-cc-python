@@ -84,6 +84,13 @@ pip install -r requirements.txt -r requirements-dev.txt
 ./scripts/teardown-bulk-worker.sh
 ```
 
+> **Note (CC3-886 transition):** `deploy-*.sh` scripts marked `(env = dev | staging)` create
+> env-suffixed Lambdas/roles (e.g. `ieee-rc-ai-orchestrator-dev`). The corresponding
+> `invoke-*.sh` and `teardown-*.sh` scripts have **not** been updated and still target the
+> legacy unsuffixed names. Until they are updated (separate ticket), prefer
+> `aws lambda invoke --function-name <env-suffixed-name>` for direct invokes against the new
+> Lambdas, and use the AWS Console / CLI for teardown of env-suffixed resources.
+
 ## Architecture
 
 - **`src/extractors/`** — Reusable extraction modules (one per file type). Each extractor class takes an S3 client, downloads the file, extracts content, writes metadata JSON back to S3, and returns a structured result dict. Contains its own `Dockerfile`. Includes `VideoTranscriber` which uses AWS Transcribe for video-to-text with speaker diarization and optional Claude Haiku transcript cleanup.

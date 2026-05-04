@@ -227,5 +227,20 @@ log ""
 log "  ECR:     ${ECR_URI}:${IMAGE_TAG}"
 log "  Lambda:  ${LAMBDA_FUNCTION_NAME} (512 MB, 15 min timeout)"
 log ""
+
+# Probe the env-suffixed PDF extractor and warn if it doesn't exist yet.
+# The legacy `scripts/deploy.sh` still creates an unsuffixed
+# `ieee-cc-pdf-extractor`; orchestrator deploys here will reference
+# `${PDF_EXTRACTOR_FN}` and fail with ResourceNotFoundException at first
+# PDF dispatch unless the bridge is handled.
+if ! aws lambda get-function --function-name "${PDF_EXTRACTOR_FN}" \
+        --region "${AWS_REGION}" >/dev/null 2>&1; then
+    log "WARNING: Lambda '${PDF_EXTRACTOR_FN}' does not exist yet."
+    log "         Orchestrator will fail at PDF dispatch with ResourceNotFoundException."
+    log "         Bridge until the PDF extractor migrates: either rename the legacy"
+    log "         'ieee-cc-pdf-extractor' to '${PDF_EXTRACTOR_FN}', or override"
+    log "         PDF_EXTRACTOR_FUNCTION on '${LAMBDA_FUNCTION_NAME}' to the legacy name."
+fi
+
 log "  Invoke:"
 log "    ./scripts/invoke-ai-orchestrator.sh <bucket> <key>"
