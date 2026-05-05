@@ -36,7 +36,9 @@ S3_BUCKET_NAME="${ENV}-ieee-conference-cloud-bulk-uploads"
 LAMBDA_ROLE_NAME="ieee-rc-dlq-processor-${ENV}-role"
 SQS_QUEUE_NAME="ieee-rc-processing-dlq-${ENV}"
 ORCHESTRATOR_FUNCTION_NAME="ieee-rc-ai-orchestrator-${ENV}"
-SNS_TOPIC_NAME="ieee-rc-processing-failures-${ENV}"
+# Must match the topic provisioned by setup-s3-triggers.sh
+SNS_TOPIC_NAME="ieee-rc-processing-alerts-${ENV}"
+SNS_TOPIC_ARN="arn:aws:sns:${AWS_REGION}:${AWS_ACCOUNT_ID}:${SNS_TOPIC_NAME}"
 IMAGE_TAG="latest"
 
 ECR_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO_NAME}"
@@ -169,7 +171,7 @@ create_lambda() {
             --memory-size 256 \
             --timeout 60 \
             --architectures x86_64 \
-            --environment "Variables={LOG_LEVEL=INFO,STAGE=${ENV},ORCHESTRATOR_FUNCTION_NAME=${ORCHESTRATOR_FUNCTION_NAME},ARCHIVE_BUCKET=${S3_BUCKET_NAME}}"
+            --environment "Variables={LOG_LEVEL=INFO,STAGE=${ENV},ORCHESTRATOR_FUNCTION_NAME=${ORCHESTRATOR_FUNCTION_NAME},ARCHIVE_BUCKET=${S3_BUCKET_NAME},FAILURES_SNS_TOPIC_ARN=${SNS_TOPIC_ARN}}"
 
         aws lambda wait function-active-v2 \
             --function-name "${LAMBDA_FUNCTION_NAME}" \
@@ -193,6 +195,17 @@ update_lambda_code() {
 # ---------------------------------------------------------------
 # 4. Create SQS event source mapping (idempotent)
 # ---------------------------------------------------------------
+verify_sqs_queue_exists() {
+    if ! aws sqs get-queue-url \
+        --queue-name "${SQS_QUEUE_NAME}" \
+        --region "${AWS_REGION}" >/dev/null 2>&1; then
+        echo "ERROR: SQS queue '${SQS_QUEUE_NAME}' does not exist." >&2
+        echo "  Run: ./scripts/setup-s3-triggers.sh ${ENV}" >&2
+        exit 1
+    fi
+    log "SQS queue verified: ${SQS_QUEUE_NAME}"
+}
+
 create_event_source_mapping() {
     log "Creating SQS event source mapping..."
     SQS_ARN="arn:aws:sqs:${AWS_REGION}:${AWS_ACCOUNT_ID}:${SQS_QUEUE_NAME}"
@@ -233,6 +246,7 @@ create_ecr_repo
 create_lambda_role
 build_and_push
 create_lambda
+verify_sqs_queue_exists
 create_event_source_mapping
 log "Deployment complete."
 log ""

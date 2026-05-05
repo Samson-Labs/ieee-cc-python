@@ -13,7 +13,7 @@
 #   4. SNS topics: ieee-rc-webhook-failures-{env}
 #                  ieee-rc-processing-alerts-{env}
 #   5. Lambda async invoke config (2 retries, DLQ on failure)
-#   6. CloudWatch alarms (error rate, DLQ depth, Bedrock throttle)
+#   6. CloudWatch alarms (Lambda errors >= 5, DLQ depth > 0, Bedrock throttles >= 10)
 #   7. Resource tags: Project=ieee-rc, Environment={env}
 #
 # Naming convention (matches account pattern confCloudAuth / confCloudAuth-staging):
@@ -190,7 +190,8 @@ log "[3/7] Granting EventBridge Lambda invoke permissions..."
 
 add_permission_idempotent() {
     local FN="$1" SID="$2" SOURCE_ARN="$3"
-    aws lambda add-permission \
+    local ERR
+    if ERR=$(aws lambda add-permission \
         --function-name "${FN}" \
         --statement-id "${SID}" \
         --action lambda:InvokeFunction \
@@ -199,9 +200,14 @@ add_permission_idempotent() {
         --source-account "${ACCOUNT}" \
         --region "${AWS_REGION}" \
         --profile "${AWS_PROFILE}" \
-        --output text > /dev/null 2>&1 \
-        && echo "  added: ${SID} on ${FN}" \
-        || echo "  exists: ${SID} on ${FN} (skipped)"
+        --output text 2>&1); then
+        echo "  added: ${SID} on ${FN}"
+    elif echo "${ERR}" | grep -q "ResourceConflictException\|already exists"; then
+        echo "  exists: ${SID} on ${FN} (skipped)"
+    else
+        echo "ERROR: Failed to add permission ${SID} on ${FN}: ${ERR}" >&2
+        exit 1
+    fi
 }
 
 add_permission_idempotent "${ORCHESTRATOR_FN}" \
@@ -297,7 +303,7 @@ log "[7/7] Creating/updating CloudWatch alarms..."
 
 ALERTS_ARN="arn:aws:sns:${AWS_REGION}:${ACCOUNT}:${SNS_ALERTS}"
 
-# Lambda error rate > 5% over 5 min
+# Lambda errors >= 5 in 5 min
 aws cloudwatch put-metric-alarm \
     --alarm-name "ieee-rc-lambda-error-rate${SUFFIX}" \
     --alarm-description "Lambda errors >= 5 in 5 min (${ENV})" \
@@ -331,7 +337,7 @@ aws cloudwatch put-metric-alarm \
     --profile "${AWS_PROFILE}"
 echo "  upserted: ieee-rc-dlq-messages${SUFFIX}"
 
-# Bedrock throttling > 10% over 10 min
+# Bedrock throttles >= 10 in 10 min
 aws cloudwatch put-metric-alarm \
     --alarm-name "ieee-rc-bedrock-throttling${SUFFIX}" \
     --alarm-description "Bedrock throttles >= 10 in 10 min (${ENV})" \
@@ -342,7 +348,7 @@ aws cloudwatch put-metric-alarm \
     --evaluation-periods 1 \
     --threshold 10 \
     --comparison-operator GreaterThanOrEqualToThreshold \
-    --dimensions "Name=ModelId,Value=anthropic.claude-sonnet-4-6" \
+    --dimensions "Name=ModelId,Value=us.anthropic.claude-sonnet-4-5-20250929-v1:0" \
     --alarm-actions "${ALERTS_ARN}" \
     --region "${AWS_REGION}" \
     --profile "${AWS_PROFILE}"
@@ -380,6 +386,18 @@ aws events tag-resource \
     --region "${AWS_REGION}" \
     --profile "${AWS_PROFILE}"
 
+# Tag CloudWatch alarms
+for ALARM in \
+    "ieee-rc-lambda-error-rate${SUFFIX}" \
+    "ieee-rc-dlq-messages${SUFFIX}" \
+    "ieee-rc-bedrock-throttling${SUFFIX}"; do
+    aws cloudwatch tag-resource \
+        --resource-arn "arn:aws:cloudwatch:${AWS_REGION}:${ACCOUNT}:alarm:${ALARM}" \
+        --tags "Key=Project,Value=ieee-rc" "Key=Environment,Value=${ENV}" \
+        --region "${AWS_REGION}" \
+        --profile "${AWS_PROFILE}"
+done
+
 echo "  tagged all resources"
 
 # ---------------------------------------------------------------
@@ -393,7 +411,7 @@ aws events list-rules \
     --name-prefix "ieee-rc" \
     --region "${AWS_REGION}" \
     --profile "${AWS_PROFILE}" \
-    --query "Rules[?contains(Name, '${SUFFIX}') || Name=='ieee-rc-s3-pending-trigger' || Name=='ieee-rc-image-generator-trigger'].{Name:Name,State:State}" \
+    --query "Rules[?Name=='${PENDING_RULE}' || Name=='${IMAGE_RULE}'].{Name:Name,State:State}" \
     --output table 2>/dev/null
 
 echo "  SQS DLQ:"
