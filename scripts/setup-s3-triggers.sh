@@ -167,7 +167,7 @@ IMAGE_PATTERN=$(cat <<EOF
   "detail-type": ["Object Created"],
   "detail": {
     "bucket": {"name": ["${BUCKET}"]},
-    "object": {"key": [{"prefix": "actions/"}, {"suffix": ".json"}]}
+    "object": {"key": [{"wildcard": "actions/*.json"}]}
   }
 }
 EOF
@@ -295,11 +295,7 @@ done
 # ---------------------------------------------------------------
 log "[7/7] Creating/updating CloudWatch alarms..."
 
-ALERTS_ARN=$(aws sns list-topics \
-    --region "${AWS_REGION}" \
-    --profile "${AWS_PROFILE}" \
-    --query "Topics[?ends_with(TopicArn, ':${SNS_ALERTS}')].TopicArn" \
-    --output text)
+ALERTS_ARN="arn:aws:sns:${AWS_REGION}:${ACCOUNT}:${SNS_ALERTS}"
 
 # Lambda error rate > 5% over 5 min
 aws cloudwatch put-metric-alarm \
@@ -311,7 +307,7 @@ aws cloudwatch put-metric-alarm \
     --period 300 \
     --evaluation-periods 1 \
     --threshold 5 \
-    --comparison-operator GreaterThanThreshold \
+    --comparison-operator GreaterThanOrEqualToThreshold \
     --dimensions "Name=FunctionName,Value=${ORCHESTRATOR_FN}" \
     --alarm-actions "${ALERTS_ARN}" \
     --region "${AWS_REGION}" \
@@ -345,7 +341,8 @@ aws cloudwatch put-metric-alarm \
     --period 600 \
     --evaluation-periods 1 \
     --threshold 10 \
-    --comparison-operator GreaterThanThreshold \
+    --comparison-operator GreaterThanOrEqualToThreshold \
+    --dimensions "Name=ModelId,Value=anthropic.claude-sonnet-4-6" \
     --alarm-actions "${ALERTS_ARN}" \
     --region "${AWS_REGION}" \
     --profile "${AWS_PROFILE}"
@@ -363,11 +360,7 @@ aws sqs tag-queue \
     --profile "${AWS_PROFILE}"
 
 for TOPIC_NAME in "${SNS_WEBHOOK}" "${SNS_ALERTS}"; do
-    T_ARN=$(aws sns list-topics \
-        --region "${AWS_REGION}" \
-        --profile "${AWS_PROFILE}" \
-        --query "Topics[?ends_with(TopicArn, ':${TOPIC_NAME}')].TopicArn" \
-        --output text)
+    T_ARN="arn:aws:sns:${AWS_REGION}:${ACCOUNT}:${TOPIC_NAME}"
     aws sns tag-resource \
         --resource-arn "${T_ARN}" \
         --tags "Key=Project,Value=ieee-rc" "Key=Environment,Value=${ENV}" \
