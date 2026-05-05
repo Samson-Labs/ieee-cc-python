@@ -1,0 +1,101 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ieee.org/schemas/image-overlay-trigger-v1.json",
+  "title": "Image Overlay Trigger v1 (legacy Drupal schema + CC3-906 webhook fields)",
+  "description": "Per-job trigger JSON written by Drupal to s3://{trigger-bucket}/actions/{job_id}.json. Read by the ieee-rc-image-generator Lambda, which composites text overlays onto the source image and writes the output to dest_bucket/dest_name. After CC3-906, when callback_url + callback_secret_ref are present, the Lambda also POSTs an HMAC-signed image-overlay-callback-v1 payload to Drupal so it can flip image_transfer_status without polling. The webhook fields are optional for backward compatibility — pre-CC3-906 triggers without them work unchanged. This file MUST be byte-identical in Samson-Labs/ieee-cc and Samson-Labs/ieee-cc-python.",
+  "type": "object",
+  "required": ["sourceBucket", "sourceName", "destBucket", "destName", "overlay"],
+  "properties": {
+    "sourceBucket": {
+      "type": "string",
+      "minLength": 1,
+      "description": "S3 bucket holding the background image. STAGE-prefixed at runtime (dev-/staging-) — the trigger writes the unprefixed name."
+    },
+    "sourceName": {
+      "type": "string",
+      "minLength": 1,
+      "description": "S3 key of the background image within sourceBucket."
+    },
+    "destBucket": {
+      "type": "string",
+      "minLength": 1,
+      "description": "S3 bucket the composited output is uploaded to. Also STAGE-prefixed at runtime."
+    },
+    "destName": {
+      "type": "string",
+      "minLength": 1,
+      "description": "S3 key for the output image. Format inferred from extension (.jpg / .png)."
+    },
+    "overlay": {
+      "type": "array",
+      "minItems": 1,
+      "description": "List of text overlay specs. Each spec carries a string `text`, a CSS-style `attributes` array (font-family, font-size, x/y as %, fill, text-anchor, font-weight), and optional `rowHeightPad` / `widthPadFactor`. See generate_legacy_overlay() for the full attribute set.",
+      "items": { "type": "object" }
+    },
+    "request_id": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "CC3-906. Echoed back in the callback so Drupal can verify ownership before updating an item. Optional — when absent, no callback is attempted."
+    },
+    "item_id": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "CC3-906. Echoed back in the callback. Drupal loads ProductLoadItem by this id."
+    },
+    "callback_url": {
+      "type": "string",
+      "format": "uri",
+      "description": "CC3-906. Drupal endpoint receiving the completion webhook. Absence disables the callback (backward-compat with pre-CC3-906 triggers)."
+    },
+    "callback_secret_ref": {
+      "type": "string",
+      "minLength": 1,
+      "description": "CC3-906. Secrets Manager key holding the HMAC-SHA256 secret for the callback. Lambda falls back to the DRUPAL_WEBHOOK_SECRET env var if SM lookup fails. Same resolution policy as the wizard transfer pipeline (CC3-896)."
+    }
+  },
+  "examples": [
+    {
+      "sourceBucket": "ieee-conference-cloud-uploads",
+      "sourceName": "video-image-backgrounds/conferences/sps.jpg",
+      "destBucket": "ieee-conference-cloud-bulk-uploads",
+      "destName": "SPS/SPSCONF2026.jpg",
+      "overlay": [
+        {
+          "text": "Advanced Power Systems Engineering",
+          "attributes": [
+            {"attr": "y", "value": "22%"},
+            {"attr": "x", "value": "50%"},
+            {"attr": "fill", "value": "white"},
+            {"attr": "text-anchor", "value": "middle"},
+            {"attr": "font-family", "value": "OpenSans"},
+            {"attr": "font-weight", "value": "Bold"},
+            {"attr": "font-size", "value": "64px"}
+          ],
+          "rowHeightPad": "30"
+        }
+      ],
+      "request_id": 42,
+      "item_id": 117,
+      "callback_url": "https://cc-ieee.lndo.site/api/iplr/webhook/transfer-status",
+      "callback_secret_ref": "iplr/webhook-secret"
+    },
+    {
+      "sourceBucket": "ieee-conference-cloud-uploads",
+      "sourceName": "video-image-backgrounds/conferences/sps.jpg",
+      "destBucket": "ieee-conference-cloud-bulk-uploads",
+      "destName": "SPS/SPSCONF2026.jpg",
+      "overlay": [
+        {
+          "text": "Title",
+          "attributes": [
+            {"attr": "y", "value": "50%"},
+            {"attr": "x", "value": "50%"},
+            {"attr": "fill", "value": "white"},
+            {"attr": "text-anchor", "value": "middle"},
+            {"attr": "font-size", "value": "60px"}
+          ]
+        }
+      ]
+    }
+  ]
+}

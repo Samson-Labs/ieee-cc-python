@@ -96,9 +96,11 @@ create_lambda_role() {
         }]
     }'
 
-    # S3 policy: read from any source bucket (backgrounds), write to any dest
-    # bucket, read+delete trigger JSONs from the trigger bucket
-    S3_POLICY="{
+    # S3 + Secrets Manager + SNS policy:
+    # - S3: read backgrounds, write outputs, manage trigger JSONs
+    # - Secrets Manager: fetch the Drupal callback secret (CC3-906)
+    # - SNS: publish webhook delivery failures to the dead-letter topic
+    INLINE_POLICY="{
         \"Version\": \"2012-10-17\",
         \"Statement\": [
             {
@@ -120,6 +122,16 @@ create_lambda_role() {
                 \"Effect\": \"Allow\",
                 \"Action\": [\"s3:ListBucket\"],
                 \"Resource\": \"arn:aws:s3:::${TRIGGER_BUCKET_NAME}\"
+            },
+            {
+                \"Effect\": \"Allow\",
+                \"Action\": [\"secretsmanager:GetSecretValue\"],
+                \"Resource\": \"arn:aws:secretsmanager:${AWS_REGION}:${AWS_ACCOUNT_ID}:secret:iplr/webhook-secret*\"
+            },
+            {
+                \"Effect\": \"Allow\",
+                \"Action\": [\"sns:Publish\"],
+                \"Resource\": \"arn:aws:sns:${AWS_REGION}:${AWS_ACCOUNT_ID}:ieee-rc-webhook-failures*\"
             }
         ]
     }"
@@ -135,11 +147,11 @@ create_lambda_role() {
         --role-name "${LAMBDA_ROLE_NAME}" \
         --policy-arn "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole" 2>/dev/null || true
 
-    # Put inline S3 policy
+    # Put inline policy (idempotent — overwrites previous version)
     aws iam put-role-policy \
         --role-name "${LAMBDA_ROLE_NAME}" \
-        --policy-name "S3Access" \
-        --policy-document "${S3_POLICY}"
+        --policy-name "ImageOverlayAccess" \
+        --policy-document "${INLINE_POLICY}"
 
     ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/${LAMBDA_ROLE_NAME}"
 }

@@ -1204,3 +1204,319 @@ class TestNormalizeFamilyEdgeCases:
         # Sanity — make sure the explicit .strip() doesn't break the existing path.
         assert _normalize_family("Roboto") == "roboto"
         assert _normalize_family("'Courier Prime', monospace") == "courierprime"
+
+
+# ---------------------------------------------------------------------------
+# CC3-906: Drupal completion callback
+# ---------------------------------------------------------------------------
+
+
+def _make_legacy_payload_with_callback(**overrides) -> dict:
+    """Legacy trigger payload + CC3-906 webhook fields."""
+    payload = _make_legacy_payload()
+    payload.update({
+        "request_id": 42,
+        "item_id": 117,
+        "callback_url": "https://drupal.example.test/api/iplr/webhook/transfer-status",
+        "callback_secret_ref": "iplr/webhook-secret",
+        "product_part_number": "SPSCONF2026",
+    })
+    payload.update(overrides)
+    return payload
+
+
+def _mock_secrets_returning(secret: str):
+    """Build a Secrets Manager mock that returns the given secret string."""
+    sm = MagicMock()
+    sm.get_secret_value.return_value = {"SecretString": secret}
+    return sm
+
+
+def _mock_secrets_raising(error_code: str = "ResourceNotFoundException"):
+    """Build a Secrets Manager mock that raises ClientError on get_secret_value."""
+    sm = MagicMock()
+    sm.get_secret_value.side_effect = ClientError(
+        {"Error": {"Code": error_code, "Message": "not found"}},
+        "GetSecretValue",
+    )
+    return sm
+
+
+def _mock_webhook_sender_returning(success: bool = True):
+    """Build a WebhookSender mock that returns the given delivery result."""
+    sender = MagicMock()
+    sender.send.return_value = success
+    return sender
+
+
+class TestCallbackBackwardCompat:
+    """A trigger without CC3-906 webhook fields should never POST a callback."""
+
+    def test_legacy_trigger_without_callback_fields_skips_webhook(self):
+        s3_mock = MagicMock()
+        s3_mock.put_object.return_value = {"ETag": "\"abc\""}
+        _mock_s3_for_legacy_trigger(s3_mock)  # base payload has no webhook fields
+        sender = _mock_webhook_sender_returning()
+
+        gen = ImageOverlayGenerator(
+            s3_client=s3_mock,
+            secrets_client=MagicMock(),
+            webhook_sender=sender,
+        )
+        result = gen.process_trigger(bucket="trigger-bucket", key="actions/job.json")
+
+        sender.send.assert_not_called()
+        assert result["callback_sent"] is False
+
+    def test_partial_callback_fields_skips_webhook(self):
+        """Missing any one of url/secret_ref/request_id/item_id → skip."""
+        s3_mock = MagicMock()
+        s3_mock.put_object.return_value = {"ETag": "\"abc\""}
+        # Has callback_url + secret_ref but no request_id/item_id
+        partial = _make_legacy_payload()
+        partial["callback_url"] = "https://x.test/cb"
+        partial["callback_secret_ref"] = "iplr/webhook-secret"
+        _mock_s3_for_legacy_trigger(s3_mock, partial)
+        sender = _mock_webhook_sender_returning()
+
+        gen = ImageOverlayGenerator(
+            s3_client=s3_mock,
+            secrets_client=_mock_secrets_returning("dummy"),
+            webhook_sender=sender,
+        )
+        gen.process_trigger(bucket="trigger-bucket", key="actions/job.json")
+
+        sender.send.assert_not_called()
+
+
+class TestCallbackSuccessPath:
+    """Triggers WITH webhook fields POST a complete callback after success."""
+
+    def test_legacy_trigger_posts_complete_callback(self):
+        s3_mock = MagicMock()
+        s3_mock.put_object.return_value = {"ETag": "\"5d41402abc4b2a76b9719d911017c592\""}
+        _mock_s3_for_legacy_trigger(s3_mock, _make_legacy_payload_with_callback())
+        sender = _mock_webhook_sender_returning()
+
+        gen = ImageOverlayGenerator(
+            s3_client=s3_mock,
+            secrets_client=_mock_secrets_returning("super-secret"),
+            webhook_sender=sender,
+        )
+        gen.process_trigger(bucket="trigger-bucket", key="actions/job.json")
+
+        sender.send.assert_called_once()
+        call_kwargs = sender.send.call_args[1]
+        assert call_kwargs["url"] == "https://drupal.example.test/api/iplr/webhook/transfer-status"
+        assert call_kwargs["secret"] == "super-secret"
+        payload = call_kwargs["payload"]
+        assert payload["operation"] == "generate_image"
+        assert payload["status"] == "complete"
+        assert payload["item_id"] == 117
+        assert payload["request_id"] == 42
+        assert payload["product_part_number"] == "SPSCONF2026"
+        assert payload["dest_bucket"] == "ieee-conference-cloud-bulk-uploads"
+        assert payload["dest_key"] == "SPS/SPSTEST001.jpg"
+        assert payload["s3_etag"] == "\"5d41402abc4b2a76b9719d911017c592\""
+        assert payload["bytes"] > 0
+        assert payload["width"] == 800
+        assert payload["height"] == 600
+
+    def test_correlation_tag_uses_request_and_item_ids(self):
+        s3_mock = MagicMock()
+        s3_mock.put_object.return_value = {"ETag": "\"abc\""}
+        _mock_s3_for_legacy_trigger(s3_mock, _make_legacy_payload_with_callback())
+        sender = _mock_webhook_sender_returning()
+
+        gen = ImageOverlayGenerator(
+            s3_client=s3_mock,
+            secrets_client=_mock_secrets_returning("s"),
+            webhook_sender=sender,
+        )
+        gen.process_trigger(bucket="trigger-bucket", key="actions/job.json")
+
+        assert sender.send.call_args[1]["correlation"] == "[42:117]"
+
+    def test_callback_sent_false_propagates_when_drupal_returns_4xx(self):
+        s3_mock = MagicMock()
+        s3_mock.put_object.return_value = {"ETag": "\"abc\""}
+        _mock_s3_for_legacy_trigger(s3_mock, _make_legacy_payload_with_callback())
+        sender = _mock_webhook_sender_returning(success=False)
+
+        gen = ImageOverlayGenerator(
+            s3_client=s3_mock,
+            secrets_client=_mock_secrets_returning("s"),
+            webhook_sender=sender,
+        )
+        # Webhook failure must NOT make the Lambda fail — the image is in S3.
+        result = gen.process_trigger(bucket="trigger-bucket", key="actions/job.json")
+        assert result["callback_sent"] is False
+        # But generation still succeeded — output_key is populated.
+        assert result["output_key"]
+
+
+class TestCallbackErrorPath:
+    """On failure, an error callback is posted, then the original raises."""
+
+    def test_source_not_found_posts_error_with_correct_code(self):
+        s3_mock = MagicMock()
+        # Trigger JSON read OK, but background image returns NoSuchKey.
+        trigger = _make_legacy_payload_with_callback()
+        trigger_bytes = json.dumps(trigger).encode()
+
+        def get_object_side_effect(Bucket, Key):
+            if Key.endswith(".json"):
+                return {"Body": BytesIO(trigger_bytes)}
+            raise ClientError(
+                {"Error": {"Code": "NoSuchKey", "Message": "missing"}},
+                "GetObject",
+            )
+
+        s3_mock.get_object.side_effect = get_object_side_effect
+        sender = _mock_webhook_sender_returning()
+
+        gen = ImageOverlayGenerator(
+            s3_client=s3_mock,
+            secrets_client=_mock_secrets_returning("s"),
+            webhook_sender=sender,
+        )
+
+        with pytest.raises(ClientError):
+            gen.process_trigger(bucket="trigger-bucket", key="actions/job.json")
+
+        sender.send.assert_called_once()
+        payload = sender.send.call_args[1]["payload"]
+        assert payload["status"] == "error"
+        assert payload["error_code"] == "source_not_found"
+        assert "NoSuchKey" in payload["error_message"] or "missing" in payload["error_message"]
+        assert payload["item_id"] == 117
+
+    def test_validation_error_posts_validation_code(self):
+        s3_mock = MagicMock()
+        # Start from full payload, then corrupt it (overlay must be a list)
+        bad = _make_legacy_payload_with_callback()
+        bad["overlay"] = "not-a-list"
+        _mock_s3_for_legacy_trigger(s3_mock, bad)
+        sender = _mock_webhook_sender_returning()
+
+        gen = ImageOverlayGenerator(
+            s3_client=s3_mock,
+            secrets_client=_mock_secrets_returning("s"),
+            webhook_sender=sender,
+        )
+
+        with pytest.raises(ValueError):
+            gen.process_trigger(bucket="trigger-bucket", key="actions/job.json")
+
+        payload = sender.send.call_args[1]["payload"]
+        assert payload["status"] == "error"
+        assert payload["error_code"] == "validation_error"
+
+    def test_dest_write_failed_posts_error(self):
+        s3_mock = MagicMock()
+        _mock_s3_for_legacy_trigger(s3_mock, _make_legacy_payload_with_callback())
+        s3_mock.put_object.side_effect = ClientError(
+            {"Error": {"Code": "AccessDenied", "Message": "denied"}},
+            "PutObject",
+        )
+        sender = _mock_webhook_sender_returning()
+
+        gen = ImageOverlayGenerator(
+            s3_client=s3_mock,
+            secrets_client=_mock_secrets_returning("s"),
+            webhook_sender=sender,
+        )
+
+        with pytest.raises(ClientError):
+            gen.process_trigger(bucket="trigger-bucket", key="actions/job.json")
+
+        payload = sender.send.call_args[1]["payload"]
+        assert payload["status"] == "error"
+        assert payload["error_code"] == "dest_write_failed"
+
+    def test_trigger_read_failure_does_not_attempt_callback(self):
+        """If the trigger JSON itself can't be read, we have no callback fields
+        to use — the failure must propagate without attempting a webhook."""
+        s3_mock = MagicMock()
+        s3_mock.get_object.side_effect = ClientError(
+            {"Error": {"Code": "NoSuchKey", "Message": "missing"}},
+            "GetObject",
+        )
+        sender = _mock_webhook_sender_returning()
+
+        gen = ImageOverlayGenerator(
+            s3_client=s3_mock,
+            secrets_client=_mock_secrets_returning("s"),
+            webhook_sender=sender,
+        )
+
+        with pytest.raises(ClientError):
+            gen.process_trigger(bucket="trigger-bucket", key="actions/missing.json")
+
+        sender.send.assert_not_called()
+
+
+class TestSecretResolution:
+    """Mirror src/orchestrator/ai_orchestrator.py + src/transfer/wizard_transfer.py."""
+
+    def test_secrets_manager_hit(self):
+        gen = ImageOverlayGenerator(
+            s3_client=MagicMock(),
+            secrets_client=_mock_secrets_returning("from-sm"),
+        )
+        assert gen._resolve_callback_secret("iplr/webhook-secret", "[corr]") == "from-sm"
+
+    def test_secrets_manager_miss_falls_back_to_env(self, monkeypatch):
+        monkeypatch.setenv("DRUPAL_WEBHOOK_SECRET", "from-env")
+        gen = ImageOverlayGenerator(
+            s3_client=MagicMock(),
+            secrets_client=_mock_secrets_raising("ResourceNotFoundException"),
+        )
+        assert gen._resolve_callback_secret("iplr/webhook-secret", "[corr]") == "from-env"
+
+    def test_both_missing_returns_empty_with_error_log(self, monkeypatch, caplog):
+        monkeypatch.delenv("DRUPAL_WEBHOOK_SECRET", raising=False)
+        gen = ImageOverlayGenerator(
+            s3_client=MagicMock(),
+            secrets_client=_mock_secrets_raising(),
+        )
+        with caplog.at_level("ERROR"):
+            secret = gen._resolve_callback_secret("iplr/webhook-secret", "[corr]")
+        assert secret == ""
+        assert "No webhook secret available" in caplog.text
+
+    def test_access_denied_falls_back_to_env(self, monkeypatch):
+        """AccessDenied is a deployment misconfiguration, not a missing secret —
+        but the fallback path is still safer than crashing."""
+        monkeypatch.setenv("DRUPAL_WEBHOOK_SECRET", "from-env")
+        gen = ImageOverlayGenerator(
+            s3_client=MagicMock(),
+            secrets_client=_mock_secrets_raising("AccessDeniedException"),
+        )
+        assert gen._resolve_callback_secret("iplr/webhook-secret", "[corr]") == "from-env"
+
+
+class TestETagCapture:
+    """The complete callback payload requires the dest object's S3 ETag."""
+
+    def test_etag_captured_in_result(self):
+        s3_mock = MagicMock()
+        s3_mock.put_object.return_value = {"ETag": "\"deadbeef\""}
+        _mock_s3_for_legacy_trigger(s3_mock)
+
+        gen = ImageOverlayGenerator(s3_client=s3_mock)
+        result = gen.process_trigger(bucket="b", key="actions/job.json")
+
+        assert result["s3_etag"] == "\"deadbeef\""
+        assert result["bytes"] > 0
+        assert result["dest_bucket"] == "ieee-conference-cloud-bulk-uploads"
+
+    def test_missing_etag_in_putobject_response_returns_empty(self):
+        s3_mock = MagicMock()
+        s3_mock.put_object.return_value = {}  # no ETag
+        _mock_s3_for_legacy_trigger(s3_mock)
+
+        gen = ImageOverlayGenerator(s3_client=s3_mock)
+        result = gen.process_trigger(bucket="b", key="actions/job.json")
+
+        assert result["s3_etag"] == ""
