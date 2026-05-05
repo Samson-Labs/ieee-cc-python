@@ -9,7 +9,7 @@
 #   2. EventBridge rules + Lambda targets + permissions
 #        - ieee-rc-s3-pending-trigger-{env}   -> ieee-rc-ai-orchestrator-{env}
 #        - ieee-rc-image-generator-trigger-{env} -> ieee-rc-image-generator-{env}
-#   3. SQS DLQ:  ieee-rc-processing-dlq-{env}
+#   3. SQS DLQ:  ieee-rc-processing-dlq-{env}  (prod: ieee-rc-processing-dlq)
 #   4. SNS topics: ieee-rc-webhook-failures-{env}
 #                  ieee-rc-processing-alerts-{env}
 #   5. Lambda async invoke config (2 retries, DLQ on failure)
@@ -71,6 +71,10 @@ IMAGE_RULE="ieee-rc-image-generator-trigger${SUFFIX}"
 DLQ_NAME="ieee-rc-processing-dlq${SUFFIX}"
 SNS_WEBHOOK="ieee-rc-webhook-failures${SUFFIX}"
 SNS_ALERTS="ieee-rc-processing-alerts${SUFFIX}"
+
+# Default matches DEFAULT_MODEL_ID in src/ai/bedrock_inference.py; override via env var
+# if a non-default model is deployed (e.g. BEDROCK_MODEL_ID=... ./scripts/setup-s3-triggers.sh dev)
+BEDROCK_MODEL_ID="${BEDROCK_MODEL_ID:-us.anthropic.claude-sonnet-4-5-20250929-v1:0}"
 
 ORCHESTRATOR_ARN="arn:aws:lambda:${AWS_REGION}:${ACCOUNT}:function:${ORCHESTRATOR_FN}"
 IMAGE_GEN_ARN="arn:aws:lambda:${AWS_REGION}:${ACCOUNT}:function:${IMAGE_GEN_FN}"
@@ -296,6 +300,12 @@ for FN in "${ORCHESTRATOR_FN}" "${IMAGE_GEN_FN}"; do
     echo "  configured: ${FN} (retries=2, dlq=${DLQ_NAME})"
 done
 
+# NOTE: Each Lambda's execution role must have sqs:SendMessage on ${DLQ_ARN}
+# for OnFailure delivery to succeed. Verify with:
+#   aws iam simulate-principal-policy --policy-source-arn <role-arn> \
+#     --action-names sqs:SendMessage --resource-arns ${DLQ_ARN}
+log "  NOTE: ensure execution roles have sqs:SendMessage on ${DLQ_ARN}"
+
 # ---------------------------------------------------------------
 # 7. CloudWatch alarms
 # ---------------------------------------------------------------
@@ -305,7 +315,7 @@ ALERTS_ARN="arn:aws:sns:${AWS_REGION}:${ACCOUNT}:${SNS_ALERTS}"
 
 # Lambda errors >= 5 in 5 min
 aws cloudwatch put-metric-alarm \
-    --alarm-name "ieee-rc-lambda-error-rate${SUFFIX}" \
+    --alarm-name "ieee-rc-lambda-errors${SUFFIX}" \
     --alarm-description "Lambda errors >= 5 in 5 min (${ENV})" \
     --metric-name Errors \
     --namespace AWS/Lambda \
@@ -319,7 +329,7 @@ aws cloudwatch put-metric-alarm \
     --tags "Key=Project,Value=ieee-rc" "Key=Environment,Value=${ENV}" \
     --region "${AWS_REGION}" \
     --profile "${AWS_PROFILE}"
-echo "  upserted: ieee-rc-lambda-error-rate${SUFFIX}"
+echo "  upserted: ieee-rc-lambda-errors${SUFFIX}"
 
 # DLQ message count > 0
 aws cloudwatch put-metric-alarm \
@@ -327,7 +337,7 @@ aws cloudwatch put-metric-alarm \
     --alarm-description "DLQ has messages (${ENV})" \
     --metric-name ApproximateNumberOfMessagesVisible \
     --namespace AWS/SQS \
-    --statistic Sum \
+    --statistic Maximum \
     --period 60 \
     --evaluation-periods 1 \
     --threshold 0 \
@@ -350,7 +360,7 @@ aws cloudwatch put-metric-alarm \
     --evaluation-periods 1 \
     --threshold 10 \
     --comparison-operator GreaterThanOrEqualToThreshold \
-    --dimensions "Name=ModelId,Value=us.anthropic.claude-sonnet-4-5-20250929-v1:0" \
+    --dimensions "Name=ModelId,Value=${BEDROCK_MODEL_ID}" \
     --alarm-actions "${ALERTS_ARN}" \
     --tags "Key=Project,Value=ieee-rc" "Key=Environment,Value=${ENV}" \
     --region "${AWS_REGION}" \

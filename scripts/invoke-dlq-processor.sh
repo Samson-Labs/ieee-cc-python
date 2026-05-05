@@ -3,13 +3,23 @@
 # Invoke the DLQ Processor Lambda with a sample SQS event.
 #
 # Usage:
-#   ./scripts/invoke-dlq-processor.sh
+#   ./scripts/invoke-dlq-processor.sh <env>   # env = dev | staging | prod
 #
 set -euo pipefail
 
+ENV="${1:-}"
+case "${ENV}" in
+    dev|staging|prod) ;;
+    *)
+        echo "Usage: $0 <env>   # env = dev | staging | prod" >&2
+        exit 1
+        ;;
+esac
+
 AWS_PROFILE="${AWS_PROFILE:-ieee-cc}"
 AWS_REGION="${AWS_REGION:-us-east-1}"
-LAMBDA_FUNCTION_NAME="ieee-rc-dlq-processor"
+SUFFIX=$([[ "${ENV}" == "prod" ]] && echo "" || echo "-${ENV}")
+LAMBDA_FUNCTION_NAME="ieee-rc-dlq-processor${SUFFIX}"
 
 export AWS_PROFILE AWS_REGION
 
