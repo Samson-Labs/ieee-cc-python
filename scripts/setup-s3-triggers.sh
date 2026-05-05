@@ -316,6 +316,7 @@ aws cloudwatch put-metric-alarm \
     --comparison-operator GreaterThanOrEqualToThreshold \
     --dimensions "Name=FunctionName,Value=${ORCHESTRATOR_FN}" \
     --alarm-actions "${ALERTS_ARN}" \
+    --tags "Key=Project,Value=ieee-rc" "Key=Environment,Value=${ENV}" \
     --region "${AWS_REGION}" \
     --profile "${AWS_PROFILE}"
 echo "  upserted: ieee-rc-lambda-error-rate${SUFFIX}"
@@ -333,6 +334,7 @@ aws cloudwatch put-metric-alarm \
     --comparison-operator GreaterThanThreshold \
     --dimensions "Name=QueueName,Value=${DLQ_NAME}" \
     --alarm-actions "${ALERTS_ARN}" \
+    --tags "Key=Project,Value=ieee-rc" "Key=Environment,Value=${ENV}" \
     --region "${AWS_REGION}" \
     --profile "${AWS_PROFILE}"
 echo "  upserted: ieee-rc-dlq-messages${SUFFIX}"
@@ -350,6 +352,7 @@ aws cloudwatch put-metric-alarm \
     --comparison-operator GreaterThanOrEqualToThreshold \
     --dimensions "Name=ModelId,Value=us.anthropic.claude-sonnet-4-5-20250929-v1:0" \
     --alarm-actions "${ALERTS_ARN}" \
+    --tags "Key=Project,Value=ieee-rc" "Key=Environment,Value=${ENV}" \
     --region "${AWS_REGION}" \
     --profile "${AWS_PROFILE}"
 echo "  upserted: ieee-rc-bedrock-throttling${SUFFIX}"
