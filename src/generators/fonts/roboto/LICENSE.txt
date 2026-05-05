@@ -1,0 +1,12 @@
+Roboto fonts: Copyright 2011 Google Inc. All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+
+The full Apache License 2.0 text is available at:
+http://www.apache.org/licenses/LICENSE-2.0
+
+A copy of the same Apache 2.0 license text is also bundled at
+src/generators/fonts/opensans/LICENSE.txt in this repository.
+
+Source: https://github.com/googlefonts/roboto

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import textwrap
 from io import BytesIO
 from typing import TypedDict
@@ -29,6 +30,10 @@ AUTHOR_GAP_RATIO = 0.04  # gap between title and author as fraction of height
 LINE_SPACING_RATIO = 0.012  # line spacing as fraction of height
 SHADOW_OFFSET = 2  # pixels offset for text shadow
 SHADOW_COLOR = (0, 0, 0, 160)  # semi-transparent black
+
+# Legacy parity defaults — match Node.js image-generator's getTextRows/getTextElements.
+LEGACY_PADDING_FACTOR_DEFAULT = 0.04  # widthPadFactor default; max width = w - (w * 0.04)
+LEGACY_ROW_HEIGHT_PAD_DEFAULT = 2  # rowHeightPad default in Node.js getTextElements.js
 
 # Thumbnail dimensions
 THUMBNAIL_SIZE = (400, 300)
@@ -195,9 +200,13 @@ class ImageOverlayGenerator:
         self._validate_legacy_payload(payload)
         logger.info("Detected legacy Drupal trigger schema")
 
-        source_bucket = payload["sourceBucket"]
+        # Stage prefix: dev/staging buckets are isolated from prod by a
+        # `dev-` / `staging-` prefix on the bucket name; prod has no prefix.
+        # Mirrors Node.js handler.js:26-36.
+        prefix = _stage_prefix()
+        source_bucket = f"{prefix}{payload['sourceBucket']}"
         source_name = payload["sourceName"]
-        dest_bucket = payload["destBucket"]
+        dest_bucket = f"{prefix}{payload['destBucket']}"
         dest_name = payload["destName"]
         overlay_specs = payload["overlay"]
 
@@ -315,7 +324,13 @@ class ImageOverlayGenerator:
         Each spec contains:
             text: The text to render
             attributes: List of {attr, value} CSS-style attribute dicts
-            rowHeightPad: Padding between wrapped lines
+            rowHeightPad: Padding between wrapped lines (default: 2)
+            widthPadFactor: Horizontal padding as fraction of width (default: 0.04)
+
+        Mirrors the Node.js implementation in `image-generator/`:
+        - Pixel-based word wrapping (getTextRows.js)
+        - Vertical anchoring branched on (y < / == / >) image center (getTextElements.js)
+        - No drop shadow, no line cap
 
         Args:
             background: PIL Image to draw on (will be copied).
@@ -334,26 +349,44 @@ class ImageOverlayGenerator:
                 continue
 
             attrs = _parse_legacy_attributes(spec.get("attributes", []))
-            row_height_pad = int(spec.get("rowHeightPad", 10))
+            row_height_pad = _safe_int(
+                spec.get("rowHeightPad"), LEGACY_ROW_HEIGHT_PAD_DEFAULT, "rowHeightPad"
+            )
+            pad_factor = _safe_float(
+                spec.get("widthPadFactor"), LEGACY_PADDING_FACTOR_DEFAULT, "widthPadFactor"
+            )
 
             font_size = attrs.get("font_size", 40)
             is_bold = attrs.get("font_weight", "").lower() in ("bold", "700", "800", "900")
-            font = _load_font(font_size, bold=is_bold)
+            font_family = attrs.get("font_family")
+            font = _load_font(font_size, bold=is_bold, family=font_family)
             fill_color = attrs.get("fill", "white")
 
-            # Calculate position from percentage or pixel values
+            # Pixel-based wrapping mirrors getTextRows.js: max usable width is
+            # `w - (w * padFactor)`. No max-line cap — Node.js wraps unlimited.
+            max_pixel_width = int(w - (w * pad_factor))
+            lines = _wrap_pixels(text, font, max_pixel_width)
+            if not lines:
+                continue
+
+            # Anchoring (getTextElements.js:36-52). Faithfully ports the
+            # Node.js three-branch math, including the ~half-row discontinuity
+            # crossing center from below — that is Node's behavior.
             x_pct = attrs.get("x_pct")
             y_pct = attrs.get("y_pct")
             text_anchor = attrs.get("text_anchor", "middle")
+            if text_anchor not in ("middle", "start", "end"):
+                logger.warning(
+                    "Unknown text-anchor %r — falling back to 'middle'", text_anchor,
+                )
+                text_anchor = "middle"
 
-            y_pos = int(h * y_pct / 100) if y_pct is not None else int(h * 0.2)
+            y_anchor = int(h * y_pct / 100) if y_pct is not None else int(h * 0.2)
+            padded_row_height = font_size + row_height_pad
+            row_count = len(lines)
+            top_y = _compute_top_y(y_anchor, h, padded_row_height, row_count)
 
-            # Word-wrap text based on image width and font
-            avg_char_width = font_size * 0.55
-            wrap_width = max(15, int((w * 0.85) / avg_char_width))
-            lines = _wrap_and_truncate(text, wrap_width, TITLE_MAX_LINES)
-
-            for line in lines:
+            for i, line in enumerate(lines):
                 bbox = draw.textbbox((0, 0), line, font=font)
                 text_w = bbox[2] - bbox[0]
 
@@ -361,16 +394,14 @@ class ImageOverlayGenerator:
                     x_pos = (w - text_w) // 2
                 elif text_anchor == "start":
                     x_pos = int(w * x_pct / 100) if x_pct is not None else 0
-                else:
-                    x_pos = (w - text_w) // 2
+                else:  # "end" — right-anchored at x_pct (or right edge)
+                    if x_pct is not None:
+                        x_pos = int(w * x_pct / 100) - text_w
+                    else:
+                        x_pos = w - text_w
 
-                # Drop shadow
-                draw.text(
-                    (x_pos + SHADOW_OFFSET, y_pos + SHADOW_OFFSET),
-                    line, fill=SHADOW_COLOR, font=font,
-                )
+                y_pos = top_y + i * padded_row_height
                 draw.text((x_pos, y_pos), line, fill=fill_color, font=font)
-                y_pos += font_size + row_height_pad
 
         return img
 
@@ -457,6 +488,116 @@ def _wrap_and_truncate(text: str, width: int, max_lines: int) -> list[str]:
     return lines
 
 
+def _wrap_pixels(
+    text: str,
+    font: ImageFont.FreeTypeFont | ImageFont.ImageFont,
+    max_width: int,
+) -> list[str]:
+    """Word-wrap text by measured pixel width — mirrors Node.js getTextRows.
+
+    Adds words to a row until the row's rendered width meets or exceeds
+    `max_width`, at which point the offending word is pushed to the next row.
+    No line cap; long text wraps unlimited.
+    """
+    if not text:
+        return []
+    rows: list[str] = []
+    current_row = ""
+    for word in text.split(" "):
+        candidate = f"{current_row} {word}" if current_row else word
+        bbox = font.getbbox(candidate)
+        if current_row and (bbox[2] - bbox[0]) >= max_width:
+            rows.append(current_row)
+            current_row = word
+        else:
+            current_row = candidate
+    if current_row:
+        rows.append(current_row)
+    return rows
+
+
+def _compute_top_y(
+    y_anchor: int, image_height: int, padded_row_height: int, row_count: int
+) -> int:
+    """Port of getTextElements.js:36-52 — branches on whether the anchor
+    is above, at, or below the image center.
+
+    Returns the y-coordinate of the FIRST row's top.
+
+    The math is preserved as-is from Node.js, including a ~half-row
+    discontinuity when the anchor crosses center from below — that is
+    Node's behavior, not a port artifact. See the regression test cases
+    in TestComputeTopY for the exact Node-equivalent expected values.
+    """
+    center = image_height / 2
+    if y_anchor < center:
+        return y_anchor + padded_row_height // 2
+    if y_anchor == center:
+        return padded_row_height + int(
+            y_anchor - (padded_row_height * row_count) / 2
+        )
+    return y_anchor - padded_row_height * (row_count - 1)
+
+
+# Recognized STAGE values. Anything outside these sets — including casing
+# variants of dev/staging that didn't survive normalization — raises so a
+# misconfigured Lambda fails loud rather than silently routing to prod.
+_STAGE_PREFIXED = ("dev", "staging")
+_STAGE_NO_PREFIX = ("", "prod")
+
+
+def _stage_prefix() -> str:
+    """Return the bucket-name prefix for the current stage.
+
+    `dev` → `dev-`, `staging` → `staging-`, `prod` or unset → `""`. The
+    STAGE value is normalized with `.strip().lower()` so accidental casing
+    or whitespace (`"DEV"`, `"staging\\n"`) is tolerated. Any other value
+    raises ValueError to prevent silent routing to prod buckets.
+    Mirrors Node.js handler.js:26-36 with hardened normalization.
+    """
+    stage = os.environ.get("STAGE", "").strip().lower()
+    if stage in _STAGE_PREFIXED:
+        return f"{stage}-"
+    if stage in _STAGE_NO_PREFIX:
+        return ""
+    raise ValueError(
+        f"Unrecognized STAGE={stage!r}; expected one of "
+        f"{_STAGE_PREFIXED + _STAGE_NO_PREFIX}"
+    )
+
+
+def _safe_int(value, default: int, field: str) -> int:
+    """Parse `value` to int or return `default`, logging on failure.
+
+    Drupal-supplied values can be empty/None/CSS-suffixed (e.g. ``"4%"``)
+    and would crash the entire trigger if passed straight to ``int()``.
+    """
+    if value is None or value == "":
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        logger.warning(
+            "Could not parse %s=%r as int; falling back to default %r",
+            field, value, default,
+        )
+        return default
+
+
+def _safe_float(value, default: float, field: str) -> float:
+    """Parse `value` to float or return `default`, logging on failure."""
+    if value is None or value == "":
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        logger.warning(
+            "Could not parse %s=%r as float; falling back to default %r",
+            field, value, default,
+        )
+        return default
+
+
 def _parse_legacy_attributes(attributes: list[dict]) -> dict:
     """Parse legacy CSS-style attributes into a normalized dict.
 
@@ -488,27 +629,89 @@ def _parse_legacy_attributes(attributes: list[dict]) -> dict:
     return result
 
 
+def _normalize_family(family: str | None) -> str:
+    """Map a CSS-style font-family to a canonical key (lowercased, no spaces).
+
+    Whitespace-only and empty inputs default to opensans. Quote stripping
+    handles ``"'Roboto'"`` / ``'"Courier Prime", monospace'`` shapes seen
+    in the legacy Drupal CSS attribute strings.
+    """
+    if not family or not family.strip():
+        return "opensans"
+    key = family.split(",")[0].strip().strip("'\"").lower().replace(" ", "")
+    return key or "opensans"
+
+
+# Family → (bold path candidates, regular path candidates).
+# Each list is searched in order; first hit wins. Bundled fonts live under
+# /usr/share/fonts/truetype/<name>/ inside the Lambda image (see Dockerfile).
+# Cross-family fallbacks (e.g. Roboto's regular list ending in OpenSans-SemiBold)
+# are belt-and-braces in case the family-specific .ttf is missing from the
+# container — the bundled file at the head of the list is what runs in prod.
+# If even those fall through, _load_font ultimately returns Pillow's default
+# bitmap font.
+_FONT_FAMILY_PATHS: dict[str, tuple[list[str], list[str]]] = {
+    "opensans": (
+        [
+            "/usr/share/fonts/truetype/opensans/OpenSans-Bold.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+            "/System/Library/Fonts/Helvetica.ttc",
+        ],
+        [
+            "/usr/share/fonts/truetype/opensans/OpenSans-SemiBold.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+            "/System/Library/Fonts/Helvetica.ttc",
+        ],
+    ),
+    "roboto": (
+        [
+            "/usr/share/fonts/truetype/roboto/Roboto-Bold.ttf",
+            "/usr/share/fonts/truetype/opensans/OpenSans-Bold.ttf",  # fallback
+        ],
+        [
+            "/usr/share/fonts/truetype/roboto/Roboto-Regular.ttf",
+            "/usr/share/fonts/truetype/opensans/OpenSans-SemiBold.ttf",  # fallback
+        ],
+    ),
+    "courierprime": (
+        [
+            "/usr/share/fonts/truetype/courierprime/CourierPrime-Bold.ttf",
+            "/usr/share/fonts/truetype/opensans/OpenSans-Bold.ttf",  # fallback
+        ],
+        [
+            "/usr/share/fonts/truetype/courierprime/CourierPrime-Regular.ttf",
+            "/usr/share/fonts/truetype/opensans/OpenSans-SemiBold.ttf",  # fallback
+        ],
+    ),
+}
+
+
 def _load_font(
-    size: int, *, bold: bool = True
+    size: int, *, bold: bool = True, family: str | None = None
 ) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
-    """Load a TrueType font, falling back to Pillow's default."""
-    bold_paths = [
-        "/usr/share/fonts/truetype/opensans/OpenSans-Bold.ttf",  # Bundled
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
-        "/System/Library/Fonts/Helvetica.ttc",  # macOS
-    ]
-    regular_paths = [
-        "/usr/share/fonts/truetype/opensans/OpenSans-SemiBold.ttf",  # Bundled
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-        "/System/Library/Fonts/Helvetica.ttc",  # macOS
-    ]
+    """Load a TrueType font for the requested family, falling back gracefully.
+
+    Family lookup is case-insensitive ("Roboto", "roboto", "ROBOTO" all work).
+    Unknown families fall back to OpenSans. Within a family, candidates are
+    tried in order; if none load (e.g. font missing from container), the
+    next family fallback is used, then Pillow's default bitmap font.
+    """
+    key = _normalize_family(family)
+    if key not in _FONT_FAMILY_PATHS:
+        logger.info("Unknown font-family %r, falling back to OpenSans", family)
+        key = "opensans"
+
+    bold_paths, regular_paths = _FONT_FAMILY_PATHS[key]
     font_paths = bold_paths if bold else regular_paths
     for path in font_paths:
         try:
             return ImageFont.truetype(path, size)
         except (OSError, IOError):
             continue
-    logger.warning("No TrueType font found, using Pillow default bitmap font")
+    logger.warning(
+        "No TrueType font found for family=%r bold=%s, using Pillow default",
+        family, bold,
+    )
     return ImageFont.load_default()
