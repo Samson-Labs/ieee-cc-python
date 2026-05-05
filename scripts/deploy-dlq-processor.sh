@@ -34,11 +34,9 @@ ECR_REPO_NAME="ieee-rc-dlq-processor"
 LAMBDA_FUNCTION_NAME="ieee-rc-dlq-processor-${ENV}"
 S3_BUCKET_NAME="${ENV}-ieee-conference-cloud-bulk-uploads"
 LAMBDA_ROLE_NAME="ieee-rc-dlq-processor-${ENV}-role"
-# DLQ + SNS topic remain shared (unsuffixed) — out of scope for CC3-886, and
-# create_event_source_mapping requires the queue to already exist.
-SQS_QUEUE_NAME="ieee-rc-processing-dlq"
+SQS_QUEUE_NAME="ieee-rc-processing-dlq-${ENV}"
 ORCHESTRATOR_FUNCTION_NAME="ieee-rc-ai-orchestrator-${ENV}"
-SNS_TOPIC_NAME="ieee-rc-processing-failures"
+SNS_TOPIC_NAME="ieee-rc-processing-failures-${ENV}"
 IMAGE_TAG="latest"
 
 ECR_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO_NAME}"
