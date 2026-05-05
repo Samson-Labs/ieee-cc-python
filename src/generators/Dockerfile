@@ -6,6 +6,12 @@ RUN pip install --no-cache-dir -r ${LAMBDA_TASK_ROOT}/requirements.txt
 # Bundle text overlay fonts. Each family lives in its own directory under
 # /usr/share/fonts/truetype/, matching the standard Linux distro layout
 # expected by image_overlay_generator._FONT_FAMILY_PATHS.
+#
+# NOTE: The current ~1.2 MB of bundled .ttf files is fine for this scale.
+# If more font families are added in the future, prefer fetching them at
+# build time from a CDN (e.g. Google Fonts or a pinned upstream commit on
+# the family's official repo) rather than committing the binaries — that
+# keeps the repo lean and audit-able for license attribution.
 COPY src/generators/fonts/opensans/      /usr/share/fonts/truetype/opensans/
 COPY src/generators/fonts/roboto/        /usr/share/fonts/truetype/roboto/
 COPY src/generators/fonts/courierprime/  /usr/share/fonts/truetype/courierprime/
