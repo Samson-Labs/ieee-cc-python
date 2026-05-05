@@ -190,6 +190,16 @@ update_lambda_code() {
     aws lambda wait function-updated-v2 \
         --function-name "${LAMBDA_FUNCTION_NAME}" \
         --region "${AWS_REGION}"
+
+    # Ensure environment variables are always up-to-date (idempotent on every deploy)
+    aws lambda update-function-configuration \
+        --function-name "${LAMBDA_FUNCTION_NAME}" \
+        --region "${AWS_REGION}" \
+        --environment "Variables={LOG_LEVEL=INFO,STAGE=${ENV},ORCHESTRATOR_FUNCTION_NAME=${ORCHESTRATOR_FUNCTION_NAME},ARCHIVE_BUCKET=${S3_BUCKET_NAME},FAILURES_SNS_TOPIC_ARN=${SNS_TOPIC_ARN}}"
+
+    aws lambda wait function-updated-v2 \
+        --function-name "${LAMBDA_FUNCTION_NAME}" \
+        --region "${AWS_REGION}"
 }
 
 # ---------------------------------------------------------------

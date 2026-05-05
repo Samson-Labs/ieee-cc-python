@@ -361,7 +361,7 @@ log "Tagging resources..."
 
 aws sqs tag-queue \
     --queue-url "${DLQ_URL}" \
-    --tags "Project=ieee-rc,Environment=${ENV}" \
+    --tags "Project=ieee-rc" "Environment=${ENV}" \
     --region "${AWS_REGION}" \
     --profile "${AWS_PROFILE}"
 
