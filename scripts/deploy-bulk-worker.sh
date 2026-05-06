@@ -28,6 +28,12 @@ SNS_TOPIC_NAME="ieee-rc-bulk-completion"
 SQS_QUEUE_NAME="ieee-rc-bulk-processing-queue"
 IMAGE_TAG="latest"
 
+# Publish buckets the worker reads source media from for Strategy A items
+# (the Drupal classifier emits s3_key pointing at the publish-bucket
+# convention, e.g. video/private/{PPN}/{PPN}.{ext}). Comma-separated.
+# Override for prod via environment: SOURCE_PUBLISH_BUCKETS=ieee-conference-cloud-content,ieee-conference-cloud
+SOURCE_PUBLISH_BUCKETS="${SOURCE_PUBLISH_BUCKETS:-dev-ieee-conference-cloud-content,dev-ieee-conference-cloud}"
+
 ECR_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO_NAME}"
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
@@ -90,6 +96,25 @@ create_lambda_role() {
 
     SQS_ARN="arn:aws:sqs:${AWS_REGION}:${AWS_ACCOUNT_ID}:${SQS_QUEUE_NAME}"
 
+    # Build the SOURCE_PUBLISH_BUCKETS list into a JSON array of S3 ARNs.
+    # Hard-fail on empty input: an IAM policy with Resource: [] is rejected
+    # by AWS (MalformedPolicyDocument), and silently installing a placeholder
+    # ARN would mask a configuration error and re-trigger the AccessDenied
+    # bug this PR is fixing.
+    SOURCE_BUCKET_ARNS=$(python3 -c '
+import json, sys
+raw = sys.argv[1]
+names = [b.strip() for b in raw.split(",") if b.strip()]
+if not names:
+    sys.stderr.write(
+        f"ERROR: SOURCE_PUBLISH_BUCKETS resolved to no buckets (raw={raw!r}).\n"
+        f"Refusing to write an IAM policy with no source buckets — Strategy A "
+        f"items would fail with AccessDenied at runtime.\n"
+    )
+    sys.exit(1)
+print(json.dumps([f"arn:aws:s3:::{n}/*" for n in names]))
+' "${SOURCE_PUBLISH_BUCKETS}")
+
     INLINE_POLICY=$(cat <<EOF
 {
     "Version": "2012-10-17",
@@ -112,6 +137,12 @@ create_lambda_role() {
             "Effect": "Allow",
             "Action": ["s3:GetObject"],
             "Resource": "arn:aws:s3:::${S3_BUCKET_NAME}/*/archive/*"
+        },
+        {
+            "Sid": "ReadSourcePublishBuckets",
+            "Effect": "Allow",
+            "Action": ["s3:GetObject"],
+            "Resource": ${SOURCE_BUCKET_ARNS}
         },
         {
             "Effect": "Allow",
@@ -239,7 +270,13 @@ create_event_source_mapping() {
 # Main
 # ---------------------------------------------------------------
 if [[ "${1:-}" == "update" ]]; then
-    log "Update mode — rebuilding image and updating Lambda code only."
+    log "Update mode — refreshing IAM, rebuilding image, and updating Lambda code."
+    # IAM is refreshed every run because create_lambda_role is idempotent
+    # (put-role-policy replaces) and the inline policy may have grown
+    # between deploys. Without this, code that needs new permissions
+    # (e.g. CC3-892's s3:GetObject on publish source buckets) deploys
+    # fine but logs AccessDenied on every invocation.
+    create_lambda_role
     build_and_push
     update_lambda_code
     log "Done."
