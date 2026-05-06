@@ -251,3 +251,54 @@ class TestBulkProcessorHandler:
 
         assert result["statusCode"] == 400
         assert result["body"]["error_type"] == "ValidationError"
+
+    def test_s3_event_invocation(self):
+        """S3 PutObject on bulk/manifests/<batch_id>.json dispatches the batch."""
+        s3_event = {
+            "Records": [{
+                "s3": {
+                    "bucket": {"name": "dev-ieee-conference-cloud-bulk-uploads"},
+                    "object": {"key": "bulk/manifests/strategic-test-001.json"},
+                },
+            }],
+        }
+        with patch("src.handlers.bulk_processor_handler.processor") as mock_proc:
+            mock_proc.process_manifest.return_value = {
+                "batch_id": "strategic-test-001",
+                "total_items": 5,
+                "published_count": 5,
+                "estimated_cost": {"breakdown": {"PDF": 5}, "total_usd": 0.05},
+                "status": "dispatched",
+            }
+            result = handler(s3_event, None)
+
+        mock_proc.process_manifest.assert_called_once_with(
+            bucket="dev-ieee-conference-cloud-bulk-uploads",
+            batch_id="strategic-test-001",
+        )
+        assert result["statusCode"] == 200
+
+    def test_s3_event_wrong_prefix_rejected(self):
+        s3_event = {
+            "Records": [{
+                "s3": {
+                    "bucket": {"name": "bucket"},
+                    "object": {"key": "actions/some-job.json"},
+                },
+            }],
+        }
+        result = handler(s3_event, None)
+        assert result["statusCode"] == 400
+        assert "does not match" in result["body"]["error"]
+
+    def test_s3_event_wrong_suffix_rejected(self):
+        s3_event = {
+            "Records": [{
+                "s3": {
+                    "bucket": {"name": "bucket"},
+                    "object": {"key": "bulk/manifests/something.txt"},
+                },
+            }],
+        }
+        result = handler(s3_event, None)
+        assert result["statusCode"] == 400

@@ -26,6 +26,10 @@ SNS_TOPIC_NAME="ieee-rc-bulk-completion"
 SQS_QUEUE_NAME="ieee-rc-bulk-processing-queue"
 IMAGE_TAG="latest"
 
+TRIGGER_PREFIX="bulk/manifests/"
+TRIGGER_SUFFIX=".json"
+NOTIFICATION_ID="bulk-processor-trigger"
+
 ECR_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO_NAME}"
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
@@ -140,7 +144,18 @@ EOF
 }
 
 # ---------------------------------------------------------------
-# 3. Create SQS queue (idempotent)
+# 3. Create SNS topic for batch-completion notifications (idempotent)
+# ---------------------------------------------------------------
+create_sns_topic() {
+    log "Creating SNS topic: ${SNS_TOPIC_NAME}"
+    aws sns create-topic \
+        --name "${SNS_TOPIC_NAME}" \
+        --region "${AWS_REGION}" \
+        --query TopicArn --output text >/dev/null
+}
+
+# ---------------------------------------------------------------
+# 4. Create SQS queue (idempotent)
 # ---------------------------------------------------------------
 create_sqs_queue() {
     log "Creating SQS queue: ${SQS_QUEUE_NAME}"
@@ -209,6 +224,84 @@ update_lambda_code() {
 }
 
 # ---------------------------------------------------------------
+# 5. Configure S3 event notification (MERGE — must not overwrite the
+#    existing actions/*.json -> image-generator or transfer-actions/*.json
+#    -> wizard-transfer triggers on the same bucket)
+# ---------------------------------------------------------------
+configure_s3_trigger() {
+    log "Merging S3 event notification on ${S3_BUCKET_NAME} -> ${TRIGGER_PREFIX}*${TRIGGER_SUFFIX}"
+
+    LAMBDA_ARN="arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:${LAMBDA_FUNCTION_NAME}"
+
+    # Grant S3 permission to invoke the Lambda (idempotent).
+    aws lambda add-permission \
+        --function-name "${LAMBDA_FUNCTION_NAME}" \
+        --statement-id "s3-trigger-${NOTIFICATION_ID}" \
+        --action "lambda:InvokeFunction" \
+        --principal "s3.amazonaws.com" \
+        --source-arn "arn:aws:s3:::${S3_BUCKET_NAME}" \
+        --source-account "${AWS_ACCOUNT_ID}" \
+        --region "${AWS_REGION}" 2>/dev/null \
+    || log "Permission already exists — skipping."
+
+    # Read-modify-write the bucket notification config so we don't clobber
+    # other Lambdas already wired to this bucket.
+    log "Reading existing bucket notification configuration..."
+    local existing
+    existing=$(aws s3api get-bucket-notification-configuration \
+        --bucket "${S3_BUCKET_NAME}" 2>/dev/null || echo '{}')
+
+    local merged
+    merged=$(LAMBDA_ARN="${LAMBDA_ARN}" \
+             NOTIFICATION_ID="${NOTIFICATION_ID}" \
+             TRIGGER_PREFIX="${TRIGGER_PREFIX}" \
+             TRIGGER_SUFFIX="${TRIGGER_SUFFIX}" \
+             EXISTING="${existing}" \
+             python3 <<'PY'
+import json, os
+
+existing = json.loads(os.environ["EXISTING"] or "{}")
+lambda_arn = os.environ["LAMBDA_ARN"]
+notification_id = os.environ["NOTIFICATION_ID"]
+prefix = os.environ["TRIGGER_PREFIX"]
+suffix = os.environ["TRIGGER_SUFFIX"]
+
+new_entry = {
+    "Id": notification_id,
+    "LambdaFunctionArn": lambda_arn,
+    "Events": ["s3:ObjectCreated:*"],
+    "Filter": {
+        "Key": {
+            "FilterRules": [
+                {"Name": "prefix", "Value": prefix},
+                {"Name": "suffix", "Value": suffix},
+            ]
+        }
+    },
+}
+
+configs = existing.get("LambdaFunctionConfigurations", [])
+configs = [c for c in configs if c.get("Id") != notification_id]
+configs.append(new_entry)
+existing["LambdaFunctionConfigurations"] = configs
+
+for k in ("QueueConfigurations", "TopicConfigurations", "EventBridgeConfiguration"):
+    if k in existing and not existing[k]:
+        del existing[k]
+
+print(json.dumps(existing))
+PY
+)
+
+    log "Writing merged bucket notification configuration..."
+    aws s3api put-bucket-notification-configuration \
+        --bucket "${S3_BUCKET_NAME}" \
+        --notification-configuration "${merged}"
+
+    log "S3 trigger configured: s3://${S3_BUCKET_NAME}/${TRIGGER_PREFIX}*${TRIGGER_SUFFIX} -> ${LAMBDA_FUNCTION_NAME}"
+}
+
+# ---------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------
 if [[ "${1:-}" == "update" ]]; then
@@ -222,14 +315,17 @@ fi
 log "Full deployment starting..."
 create_ecr_repo
 create_lambda_role
+create_sns_topic
 create_sqs_queue
 build_and_push
 create_lambda
+configure_s3_trigger
 log "Deployment complete."
 log ""
 log "  ECR:     ${ECR_URI}:${IMAGE_TAG}"
 log "  Lambda:  ${LAMBDA_FUNCTION_NAME} (512 MB, 5 min timeout)"
 log "  SQS:     ${SQS_QUEUE_NAME}"
+log "  Trigger: s3://${S3_BUCKET_NAME}/${TRIGGER_PREFIX}*${TRIGGER_SUFFIX}"
 log ""
-log "  Invoke:"
+log "  Invoke (direct, for replay):"
 log "    ./scripts/invoke-bulk-processor.sh <batch_id>"
