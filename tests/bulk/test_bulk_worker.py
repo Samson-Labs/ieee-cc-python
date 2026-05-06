@@ -287,7 +287,7 @@ class TestUpdateProgress:
         # not the stale value (2 -> 3) — proving the retry re-read.
         assert progress["completed"] == 4
 
-    def test_raises_after_max_concurrent_retries(self, worker):
+    def test_raises_bulk_processing_error_after_max_concurrent_retries(self, worker):
         w, _, s3_mock, _ = worker
         response = _progress_response(completed=0, total=10)
         response["ETag"] = '"e"'
@@ -298,8 +298,39 @@ class TestUpdateProgress:
         )
 
         with patch("src.bulk.bulk_worker.time.sleep"):
-            with pytest.raises(ClientError):
+            with pytest.raises(BulkProcessingError, match="concurrent-write retries"):
                 w._update_progress("bucket", "bulk-test-001", 42, True, 10)
+
+    def test_non_412_put_error_propagates_immediately(self, worker):
+        """AccessDenied / network / throttling on PutObject should NOT be
+        retried as if it were a concurrency conflict.
+        """
+        w, _, s3_mock, _ = worker
+        response = _progress_response(completed=0, total=10)
+        response["ETag"] = '"e"'
+        s3_mock.get_object.return_value = response
+        s3_mock.put_object.side_effect = ClientError(
+            {"Error": {"Code": "AccessDenied", "Message": "denied"}}, "PutObject"
+        )
+
+        with pytest.raises(ClientError, match="AccessDenied"):
+            w._update_progress("bucket", "bulk-test-001", 42, True, 10)
+        # First attempt should fail immediately, no retry.
+        assert s3_mock.put_object.call_count == 1
+
+    def test_non_nosuchkey_get_error_propagates(self, worker):
+        """AccessDenied on the GET must not be silently masked into a
+        fresh-default retry loop that would overwrite real state.
+        """
+        w, _, s3_mock, _ = worker
+        s3_mock.get_object.side_effect = ClientError(
+            {"Error": {"Code": "AccessDenied", "Message": "denied"}}, "GetObject"
+        )
+
+        with pytest.raises(ClientError, match="AccessDenied"):
+            w._update_progress("bucket", "bulk-test-001", 42, True, 10)
+        # No PUT should have been attempted.
+        s3_mock.put_object.assert_not_called()
 
 
 # --- Completion notification ---

@@ -280,12 +280,15 @@ class BulkWorker:
                 self._s3.put_object(**put_kwargs)
             except ClientError as exc:
                 code = exc.response.get("Error", {}).get("Code", "")
-                if code in ("PreconditionFailed", "ConditionalRequestConflict"):
-                    # Another worker beat us to the write. Re-read and retry.
-                    if attempt < max_attempts - 1:
-                        time.sleep(0.05 * (attempt + 1))
-                        continue
-                raise
+                if code not in ("PreconditionFailed", "ConditionalRequestConflict"):
+                    raise
+                # Another worker beat us to the write. Re-read and retry,
+                # except on the final attempt — fall through to the
+                # BulkProcessingError below for a cleaner error type.
+                if attempt < max_attempts - 1:
+                    time.sleep(0.05 * (attempt + 1))
+                    continue
+                break
 
             if done % 100 == 0 or done >= total_items:
                 logger.info(
@@ -310,19 +313,29 @@ class BulkWorker:
         batch_id: str,
         total_items: int,
     ) -> tuple[str | None, dict]:
-        """Fetch progress + its ETag, or a fresh default if absent."""
+        """Fetch progress + its ETag, or a fresh default if absent.
+
+        Only treats a true NoSuchKey as "absent". Other S3 errors
+        (AccessDenied, throttling, network) propagate so they aren't
+        silently masked into a retry loop that overwrites real state.
+        """
         try:
             response = self._s3.get_object(Bucket=bucket, Key=progress_key)
             return response.get("ETag"), json.loads(response["Body"].read().decode())
-        except (ClientError, json.JSONDecodeError, KeyError):
-            return None, {
-                "batch_id": batch_id,
-                "total_items": total_items,
-                "published": total_items,
-                "completed": 0,
-                "failed": 0,
-                "status": "processing",
-            }
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") != "NoSuchKey":
+                raise
+        except (json.JSONDecodeError, KeyError):
+            pass
+
+        return None, {
+            "batch_id": batch_id,
+            "total_items": total_items,
+            "published": total_items,
+            "completed": 0,
+            "failed": 0,
+            "status": "processing",
+        }
 
     def _send_completion_notification(self, batch_id: str, progress: dict) -> None:
         """Publish batch completion to SNS."""
