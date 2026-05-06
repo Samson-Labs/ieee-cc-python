@@ -206,6 +206,131 @@ class TestBackfillValidation:
         assert result["published_count"] == 3
 
 
+def _strategy_a_manifest():
+    """Strategy A item: file-bearing, input_text empty by design."""
+    return {
+        "batch_id": "strategy-a-001",
+        "callback_url": "https://example.com/webhook",
+        "items": [{
+            "item_id": 400,
+            "request_id": 0,
+            "resource_center": "MTT",
+            "s3_key": "video/private/MTTIMSWEB0010/MTTIMSWEB0010.mp4",
+            "media_type": "MP4",
+            "source_bucket": "ieee-conference-cloud-content",
+            "input_text": "",
+            "input_text_mode": "",
+        }],
+    }
+
+
+class TestEmptySentinelTolerance:
+    """The Drupal builder emits empty-string sentinels for inapplicable
+    fields (Strategy A items have ``input_text=""`` by design, text-only
+    items have ``source_bucket=""`` because there's no source to fetch).
+    The validator must tolerate these without rejecting the item.
+    """
+
+    def test_strategy_a_item_with_empty_input_text_accepted(self, processor):
+        proc, s3_mock, sqs_mock, _ = processor
+        manifest = _strategy_a_manifest()
+        s3_mock.get_object.return_value = _s3_manifest_response(manifest)
+        s3_mock.exceptions.NoSuchKey = type("NoSuchKey", (Exception,), {})
+
+        with patch.dict("os.environ", {"BULK_QUEUE_URL": "https://sqs/q"}):
+            result = proc.process_manifest("bucket", "strategy-a-001")
+
+        assert result["published_count"] == 1
+
+    def test_text_only_item_with_empty_source_bucket_accepted(self, processor):
+        """No s3_key → source_bucket is irrelevant, empty value tolerated."""
+        proc, s3_mock, sqs_mock, _ = processor
+        manifest = _text_only_manifest()
+        manifest["items"][0]["source_bucket"] = ""
+        s3_mock.get_object.return_value = _s3_manifest_response(manifest)
+        s3_mock.exceptions.NoSuchKey = type("NoSuchKey", (Exception,), {})
+
+        with patch.dict("os.environ", {"BULK_QUEUE_URL": "https://sqs/q"}):
+            result = proc.process_manifest("bucket", "backfill-001")
+
+        assert result["published_count"] == 1
+
+    def test_file_item_with_empty_source_bucket_rejected(self, processor):
+        """Has s3_key → source_bucket must be non-empty (worker uses it)."""
+        proc, s3_mock, _, _ = processor
+        manifest = _strategy_a_manifest()
+        manifest["items"][0]["source_bucket"] = ""
+        s3_mock.get_object.return_value = _s3_manifest_response(manifest)
+        s3_mock.exceptions.NoSuchKey = type("NoSuchKey", (Exception,), {})
+
+        with pytest.raises(ValidationError, match="source_bucket.*non-empty"):
+            proc.process_manifest("bucket", "test")
+
+    def test_empty_input_text_mode_treated_as_absent(self, processor):
+        """input_text_mode="" must not trigger 'invalid input_text_mode'."""
+        proc, s3_mock, sqs_mock, _ = processor
+        manifest = _strategy_a_manifest()  # input_text_mode="" already
+        s3_mock.get_object.return_value = _s3_manifest_response(manifest)
+        s3_mock.exceptions.NoSuchKey = type("NoSuchKey", (Exception,), {})
+
+        with patch.dict("os.environ", {"BULK_QUEUE_URL": "https://sqs/q"}):
+            result = proc.process_manifest("bucket", "strategy-a-001")
+
+        assert result["published_count"] == 1
+
+    def test_input_text_mode_still_rejected_when_set_invalid(self, processor):
+        """Non-empty invalid input_text_mode is still rejected."""
+        proc, s3_mock, _, _ = processor
+        manifest = _text_only_manifest()
+        manifest["items"][0]["input_text_mode"] = "garbage"
+        s3_mock.get_object.return_value = _s3_manifest_response(manifest)
+        s3_mock.exceptions.NoSuchKey = type("NoSuchKey", (Exception,), {})
+
+        with pytest.raises(ValidationError, match="input_text_mode"):
+            proc.process_manifest("bucket", "test")
+
+    def test_empty_input_text_mode_rejected_when_text_present(self, processor):
+        """Hybrid item with input_text but empty mode must fail —
+        worker would otherwise pass empty mode through to orchestrator.
+        """
+        proc, s3_mock, _, _ = processor
+        manifest = _text_only_manifest()
+        manifest["items"][0]["input_text_mode"] = ""
+        s3_mock.get_object.return_value = _s3_manifest_response(manifest)
+        s3_mock.exceptions.NoSuchKey = type("NoSuchKey", (Exception,), {})
+
+        with pytest.raises(ValidationError, match="input_text_mode"):
+            proc.process_manifest("bucket", "test")
+
+    def test_null_source_bucket_rejected(self, processor):
+        """null source_bucket would propagate via worker.get(...,bucket)
+        as None and break S3 CopyObject.
+        """
+        proc, s3_mock, _, _ = processor
+        manifest = _strategy_a_manifest()
+        manifest["items"][0]["source_bucket"] = None
+        s3_mock.get_object.return_value = _s3_manifest_response(manifest)
+        s3_mock.exceptions.NoSuchKey = type("NoSuchKey", (Exception,), {})
+
+        with pytest.raises(ValidationError, match="source_bucket.*string"):
+            proc.process_manifest("bucket", "test")
+
+    def test_non_string_input_text_rejected(self, processor):
+        """input_text must be a string when present (not int/list/dict).
+        Without this check, a truthy non-string value would pass the
+        'has_text' falsy guard but still propagate to the worker via
+        `item.get('input_text')` truthy checks.
+        """
+        proc, s3_mock, _, _ = processor
+        manifest = _strategy_a_manifest()
+        manifest["items"][0]["input_text"] = 42
+        s3_mock.get_object.return_value = _s3_manifest_response(manifest)
+        s3_mock.exceptions.NoSuchKey = type("NoSuchKey", (Exception,), {})
+
+        with pytest.raises(ValidationError, match="input_text.*string"):
+            proc.process_manifest("bucket", "test")
+
+
 # --- Cost estimation ---
 
 
