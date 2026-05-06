@@ -97,11 +97,23 @@ create_lambda_role() {
     SQS_ARN="arn:aws:sqs:${AWS_REGION}:${AWS_ACCOUNT_ID}:${SQS_QUEUE_NAME}"
 
     # Build the SOURCE_PUBLISH_BUCKETS list into a JSON array of S3 ARNs.
-    SOURCE_BUCKET_ARNS=$(python3 -c "
-import json, os
-names = [b.strip() for b in os.environ['SOURCE_PUBLISH_BUCKETS'].split(',') if b.strip()]
-print(json.dumps([f'arn:aws:s3:::{n}/*' for n in names]))
-" SOURCE_PUBLISH_BUCKETS="${SOURCE_PUBLISH_BUCKETS}")
+    # Hard-fail on empty input: an IAM policy with Resource: [] is rejected
+    # by AWS (MalformedPolicyDocument), and silently installing a placeholder
+    # ARN would mask a configuration error and re-trigger the AccessDenied
+    # bug this PR is fixing.
+    SOURCE_BUCKET_ARNS=$(python3 -c '
+import json, sys
+raw = sys.argv[1]
+names = [b.strip() for b in raw.split(",") if b.strip()]
+if not names:
+    sys.stderr.write(
+        f"ERROR: SOURCE_PUBLISH_BUCKETS resolved to no buckets (raw={raw!r}).\n"
+        f"Refusing to write an IAM policy with no source buckets — Strategy A "
+        f"items would fail with AccessDenied at runtime.\n"
+    )
+    sys.exit(1)
+print(json.dumps([f"arn:aws:s3:::{n}/*" for n in names]))
+' "${SOURCE_PUBLISH_BUCKETS}")
 
     INLINE_POLICY=$(cat <<EOF
 {
