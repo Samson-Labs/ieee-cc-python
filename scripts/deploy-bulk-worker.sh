@@ -28,6 +28,12 @@ SNS_TOPIC_NAME="ieee-rc-bulk-completion"
 SQS_QUEUE_NAME="ieee-rc-bulk-processing-queue"
 IMAGE_TAG="latest"
 
+# Publish buckets the worker reads source media from for Strategy A items
+# (the Drupal classifier emits s3_key pointing at the publish-bucket
+# convention, e.g. video/private/{PPN}/{PPN}.{ext}). Comma-separated.
+# Override for prod via environment: SOURCE_PUBLISH_BUCKETS=ieee-conference-cloud-content,ieee-conference-cloud
+SOURCE_PUBLISH_BUCKETS="${SOURCE_PUBLISH_BUCKETS:-dev-ieee-conference-cloud-content,dev-ieee-conference-cloud}"
+
 ECR_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO_NAME}"
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
@@ -90,6 +96,13 @@ create_lambda_role() {
 
     SQS_ARN="arn:aws:sqs:${AWS_REGION}:${AWS_ACCOUNT_ID}:${SQS_QUEUE_NAME}"
 
+    # Build the SOURCE_PUBLISH_BUCKETS list into a JSON array of S3 ARNs.
+    SOURCE_BUCKET_ARNS=$(python3 -c "
+import json, os
+names = [b.strip() for b in os.environ['SOURCE_PUBLISH_BUCKETS'].split(',') if b.strip()]
+print(json.dumps([f'arn:aws:s3:::{n}/*' for n in names]))
+" SOURCE_PUBLISH_BUCKETS="${SOURCE_PUBLISH_BUCKETS}")
+
     INLINE_POLICY=$(cat <<EOF
 {
     "Version": "2012-10-17",
@@ -112,6 +125,12 @@ create_lambda_role() {
             "Effect": "Allow",
             "Action": ["s3:GetObject"],
             "Resource": "arn:aws:s3:::${S3_BUCKET_NAME}/*/archive/*"
+        },
+        {
+            "Sid": "ReadSourcePublishBuckets",
+            "Effect": "Allow",
+            "Action": ["s3:GetObject"],
+            "Resource": ${SOURCE_BUCKET_ARNS}
         },
         {
             "Effect": "Allow",
@@ -239,7 +258,13 @@ create_event_source_mapping() {
 # Main
 # ---------------------------------------------------------------
 if [[ "${1:-}" == "update" ]]; then
-    log "Update mode — rebuilding image and updating Lambda code only."
+    log "Update mode — refreshing IAM, rebuilding image, and updating Lambda code."
+    # IAM is refreshed every run because create_lambda_role is idempotent
+    # (put-role-policy replaces) and the inline policy may have grown
+    # between deploys. Without this, code that needs new permissions
+    # (e.g. CC3-892's s3:GetObject on publish source buckets) deploys
+    # fine but logs AccessDenied on every invocation.
+    create_lambda_role
     build_and_push
     update_lambda_code
     log "Done."
