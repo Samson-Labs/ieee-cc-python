@@ -230,6 +230,108 @@ class TestUpdateProgress:
         assert progress["completed"] == 1
         assert progress["total_items"] == 10
 
+    def test_uses_if_match_when_etag_known(self, worker):
+        w, _, s3_mock, _ = worker
+        response = _progress_response(completed=5, total=10)
+        response["ETag"] = '"abc123"'
+        s3_mock.get_object.return_value = response
+
+        w._update_progress("bucket", "bulk-test-001", 42, True, 10)
+
+        put_kwargs = s3_mock.put_object.call_args[1]
+        assert put_kwargs["IfMatch"] == '"abc123"'
+        assert "IfNoneMatch" not in put_kwargs
+
+    def test_uses_if_none_match_when_progress_missing(self, worker):
+        w, _, s3_mock, _ = worker
+        s3_mock.get_object.side_effect = ClientError(
+            {"Error": {"Code": "NoSuchKey", "Message": "Not found"}}, "GetObject"
+        )
+
+        w._update_progress("bucket", "bulk-test-001", 42, True, 10)
+
+        put_kwargs = s3_mock.put_object.call_args[1]
+        assert put_kwargs["IfNoneMatch"] == "*"
+        assert "IfMatch" not in put_kwargs
+
+    def test_retries_on_concurrent_write_conflict(self, worker):
+        """Two workers race on the same progress file. The first PUT
+        raises PreconditionFailed (someone else won); the worker re-reads
+        and retries with the new ETag, picking up the other's increment.
+        """
+        w, _, s3_mock, _ = worker
+
+        # Read sequence: first attempt sees stale state, retry sees the
+        # other worker's update with a fresh ETag.
+        first_read = _progress_response(completed=2, total=10)
+        first_read["ETag"] = '"stale"'
+        second_read = _progress_response(completed=3, total=10)
+        second_read["ETag"] = '"fresh"'
+        s3_mock.get_object.side_effect = [first_read, second_read]
+
+        # First put raises 412; second succeeds.
+        s3_mock.put_object.side_effect = [
+            ClientError(
+                {"Error": {"Code": "PreconditionFailed", "Message": "ETag mismatch"}},
+                "PutObject",
+            ),
+            None,
+        ]
+
+        with patch("src.bulk.bulk_worker.time.sleep"):
+            progress = w._update_progress("bucket", "bulk-test-001", 42, True, 10)
+
+        assert s3_mock.get_object.call_count == 2
+        assert s3_mock.put_object.call_count == 2
+        # Counter built on top of the OTHER worker's update (3 -> 4),
+        # not the stale value (2 -> 3) — proving the retry re-read.
+        assert progress["completed"] == 4
+
+    def test_raises_bulk_processing_error_after_max_concurrent_retries(self, worker):
+        w, _, s3_mock, _ = worker
+        response = _progress_response(completed=0, total=10)
+        response["ETag"] = '"e"'
+        s3_mock.get_object.return_value = response
+        s3_mock.put_object.side_effect = ClientError(
+            {"Error": {"Code": "PreconditionFailed", "Message": "ETag mismatch"}},
+            "PutObject",
+        )
+
+        with patch("src.bulk.bulk_worker.time.sleep"):
+            with pytest.raises(BulkProcessingError, match="concurrent-write retries"):
+                w._update_progress("bucket", "bulk-test-001", 42, True, 10)
+
+    def test_non_412_put_error_propagates_immediately(self, worker):
+        """AccessDenied / network / throttling on PutObject should NOT be
+        retried as if it were a concurrency conflict.
+        """
+        w, _, s3_mock, _ = worker
+        response = _progress_response(completed=0, total=10)
+        response["ETag"] = '"e"'
+        s3_mock.get_object.return_value = response
+        s3_mock.put_object.side_effect = ClientError(
+            {"Error": {"Code": "AccessDenied", "Message": "denied"}}, "PutObject"
+        )
+
+        with pytest.raises(ClientError, match="AccessDenied"):
+            w._update_progress("bucket", "bulk-test-001", 42, True, 10)
+        # First attempt should fail immediately, no retry.
+        assert s3_mock.put_object.call_count == 1
+
+    def test_non_nosuchkey_get_error_propagates(self, worker):
+        """AccessDenied on the GET must not be silently masked into a
+        fresh-default retry loop that would overwrite real state.
+        """
+        w, _, s3_mock, _ = worker
+        s3_mock.get_object.side_effect = ClientError(
+            {"Error": {"Code": "AccessDenied", "Message": "denied"}}, "GetObject"
+        )
+
+        with pytest.raises(ClientError, match="AccessDenied"):
+            w._update_progress("bucket", "bulk-test-001", 42, True, 10)
+        # No PUT should have been attempted.
+        s3_mock.put_object.assert_not_called()
+
 
 # --- Completion notification ---
 
