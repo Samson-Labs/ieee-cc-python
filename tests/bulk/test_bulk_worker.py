@@ -230,6 +230,77 @@ class TestUpdateProgress:
         assert progress["completed"] == 1
         assert progress["total_items"] == 10
 
+    def test_uses_if_match_when_etag_known(self, worker):
+        w, _, s3_mock, _ = worker
+        response = _progress_response(completed=5, total=10)
+        response["ETag"] = '"abc123"'
+        s3_mock.get_object.return_value = response
+
+        w._update_progress("bucket", "bulk-test-001", 42, True, 10)
+
+        put_kwargs = s3_mock.put_object.call_args[1]
+        assert put_kwargs["IfMatch"] == '"abc123"'
+        assert "IfNoneMatch" not in put_kwargs
+
+    def test_uses_if_none_match_when_progress_missing(self, worker):
+        w, _, s3_mock, _ = worker
+        s3_mock.get_object.side_effect = ClientError(
+            {"Error": {"Code": "NoSuchKey", "Message": "Not found"}}, "GetObject"
+        )
+
+        w._update_progress("bucket", "bulk-test-001", 42, True, 10)
+
+        put_kwargs = s3_mock.put_object.call_args[1]
+        assert put_kwargs["IfNoneMatch"] == "*"
+        assert "IfMatch" not in put_kwargs
+
+    def test_retries_on_concurrent_write_conflict(self, worker):
+        """Two workers race on the same progress file. The first PUT
+        raises PreconditionFailed (someone else won); the worker re-reads
+        and retries with the new ETag, picking up the other's increment.
+        """
+        w, _, s3_mock, _ = worker
+
+        # Read sequence: first attempt sees stale state, retry sees the
+        # other worker's update with a fresh ETag.
+        first_read = _progress_response(completed=2, total=10)
+        first_read["ETag"] = '"stale"'
+        second_read = _progress_response(completed=3, total=10)
+        second_read["ETag"] = '"fresh"'
+        s3_mock.get_object.side_effect = [first_read, second_read]
+
+        # First put raises 412; second succeeds.
+        s3_mock.put_object.side_effect = [
+            ClientError(
+                {"Error": {"Code": "PreconditionFailed", "Message": "ETag mismatch"}},
+                "PutObject",
+            ),
+            None,
+        ]
+
+        with patch("src.bulk.bulk_worker.time.sleep"):
+            progress = w._update_progress("bucket", "bulk-test-001", 42, True, 10)
+
+        assert s3_mock.get_object.call_count == 2
+        assert s3_mock.put_object.call_count == 2
+        # Counter built on top of the OTHER worker's update (3 -> 4),
+        # not the stale value (2 -> 3) — proving the retry re-read.
+        assert progress["completed"] == 4
+
+    def test_raises_after_max_concurrent_retries(self, worker):
+        w, _, s3_mock, _ = worker
+        response = _progress_response(completed=0, total=10)
+        response["ETag"] = '"e"'
+        s3_mock.get_object.return_value = response
+        s3_mock.put_object.side_effect = ClientError(
+            {"Error": {"Code": "PreconditionFailed", "Message": "ETag mismatch"}},
+            "PutObject",
+        )
+
+        with patch("src.bulk.bulk_worker.time.sleep"):
+            with pytest.raises(ClientError):
+                w._update_progress("bucket", "bulk-test-001", 42, True, 10)
+
 
 # --- Completion notification ---
 

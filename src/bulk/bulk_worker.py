@@ -238,14 +238,84 @@ class BulkWorker:
         success: bool,
         total_items: int,
     ) -> dict:
-        """Update the batch progress file in S3."""
-        progress_key = f"bulk/progress/{batch_id}_progress.json"
+        """Update the batch progress file in S3 with optimistic concurrency.
 
+        Multiple workers may run in parallel (SQS event source ``MaxConcurrency=10``)
+        and increment the same progress file. Without this, a naive
+        read-modify-write loses updates whenever two workers' reads
+        interleave — that's how a 4-fail batch ended up with
+        ``{failed: 4, status: "dispatched"}`` instead of ``"completed"``.
+
+        Uses S3 conditional writes (``If-Match`` on existing files,
+        ``If-None-Match: *`` for the first writer) and retries on
+        ``PreconditionFailed`` until the increment lands cleanly.
+        """
+        progress_key = f"bulk/progress/{batch_id}_progress.json"
+        max_attempts = 12
+
+        for attempt in range(max_attempts):
+            etag, progress = self._read_progress(bucket, progress_key, batch_id, total_items)
+
+            if success:
+                progress["completed"] = progress.get("completed", 0) + 1
+            else:
+                progress["failed"] = progress.get("failed", 0) + 1
+
+            done = progress["completed"] + progress["failed"]
+            if done >= total_items > 0:
+                progress["status"] = "completed"
+
+            put_kwargs = {
+                "Bucket": bucket,
+                "Key": progress_key,
+                "Body": json.dumps(progress).encode(),
+                "ContentType": "application/json",
+            }
+            if etag is not None:
+                put_kwargs["IfMatch"] = etag
+            else:
+                put_kwargs["IfNoneMatch"] = "*"
+
+            try:
+                self._s3.put_object(**put_kwargs)
+            except ClientError as exc:
+                code = exc.response.get("Error", {}).get("Code", "")
+                if code in ("PreconditionFailed", "ConditionalRequestConflict"):
+                    # Another worker beat us to the write. Re-read and retry.
+                    if attempt < max_attempts - 1:
+                        time.sleep(0.05 * (attempt + 1))
+                        continue
+                raise
+
+            if done % 100 == 0 or done >= total_items:
+                logger.info(
+                    "[%s] Progress: %d/%d completed, %d failed",
+                    batch_id,
+                    progress["completed"],
+                    total_items,
+                    progress["failed"],
+                )
+
+            return progress
+
+        raise BulkProcessingError(
+            f"Failed to update progress for batch {batch_id} item {item_id} "
+            f"after {max_attempts} concurrent-write retries"
+        )
+
+    def _read_progress(
+        self,
+        bucket: str,
+        progress_key: str,
+        batch_id: str,
+        total_items: int,
+    ) -> tuple[str | None, dict]:
+        """Fetch progress + its ETag, or a fresh default if absent."""
         try:
             response = self._s3.get_object(Bucket=bucket, Key=progress_key)
-            progress = json.loads(response["Body"].read().decode())
+            return response.get("ETag"), json.loads(response["Body"].read().decode())
         except (ClientError, json.JSONDecodeError, KeyError):
-            progress = {
+            return None, {
                 "batch_id": batch_id,
                 "total_items": total_items,
                 "published": total_items,
@@ -253,33 +323,6 @@ class BulkWorker:
                 "failed": 0,
                 "status": "processing",
             }
-
-        if success:
-            progress["completed"] = progress.get("completed", 0) + 1
-        else:
-            progress["failed"] = progress.get("failed", 0) + 1
-
-        done = progress["completed"] + progress["failed"]
-        if done >= total_items > 0:
-            progress["status"] = "completed"
-
-        self._s3.put_object(
-            Bucket=bucket,
-            Key=progress_key,
-            Body=json.dumps(progress).encode(),
-            ContentType="application/json",
-        )
-
-        if done % 100 == 0 or done >= total_items:
-            logger.info(
-                "[%s] Progress: %d/%d completed, %d failed",
-                batch_id,
-                progress["completed"],
-                total_items,
-                progress["failed"],
-            )
-
-        return progress
 
     def _send_completion_notification(self, batch_id: str, progress: dict) -> None:
         """Publish batch completion to SNS."""
