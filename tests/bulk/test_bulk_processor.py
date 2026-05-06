@@ -289,6 +289,47 @@ class TestEmptySentinelTolerance:
         with pytest.raises(ValidationError, match="input_text_mode"):
             proc.process_manifest("bucket", "test")
 
+    def test_empty_input_text_mode_rejected_when_text_present(self, processor):
+        """Hybrid item with input_text but empty mode must fail —
+        worker would otherwise pass empty mode through to orchestrator.
+        """
+        proc, s3_mock, _, _ = processor
+        manifest = _text_only_manifest()
+        manifest["items"][0]["input_text_mode"] = ""
+        s3_mock.get_object.return_value = _s3_manifest_response(manifest)
+        s3_mock.exceptions.NoSuchKey = type("NoSuchKey", (Exception,), {})
+
+        with pytest.raises(ValidationError, match="input_text_mode"):
+            proc.process_manifest("bucket", "test")
+
+    def test_null_source_bucket_rejected(self, processor):
+        """null source_bucket would propagate via worker.get(...,bucket)
+        as None and break S3 CopyObject.
+        """
+        proc, s3_mock, _, _ = processor
+        manifest = _strategy_a_manifest()
+        manifest["items"][0]["source_bucket"] = None
+        s3_mock.get_object.return_value = _s3_manifest_response(manifest)
+        s3_mock.exceptions.NoSuchKey = type("NoSuchKey", (Exception,), {})
+
+        with pytest.raises(ValidationError, match="source_bucket.*string"):
+            proc.process_manifest("bucket", "test")
+
+    def test_non_string_input_text_rejected(self, processor):
+        """input_text must be a string when present (not int/list/dict).
+        Without this check, a truthy non-string value would pass the
+        'has_text' falsy guard but still propagate to the worker via
+        `item.get('input_text')` truthy checks.
+        """
+        proc, s3_mock, _, _ = processor
+        manifest = _strategy_a_manifest()
+        manifest["items"][0]["input_text"] = 42
+        s3_mock.get_object.return_value = _s3_manifest_response(manifest)
+        s3_mock.exceptions.NoSuchKey = type("NoSuchKey", (Exception,), {})
+
+        with pytest.raises(ValidationError, match="input_text.*string"):
+            proc.process_manifest("bucket", "test")
+
 
 # --- Cost estimation ---
 

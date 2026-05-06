@@ -133,6 +133,10 @@ class BulkProcessor:
             # Use consistent truthiness checks (matches BulkWorker routing)
             has_file = bool(item.get("s3_key"))
             input_text = item.get("input_text")
+            if input_text is not None and not isinstance(input_text, str):
+                raise ValidationError(
+                    f"Item {i} 'input_text' must be a string"
+                )
             has_text = isinstance(input_text, str) and bool(input_text.strip())
 
             # Must have at least one of s3_key or input_text — the only
@@ -160,32 +164,41 @@ class BulkProcessor:
                         f"expected one of {sorted(VALID_MEDIA_TYPES)}"
                     )
 
-                source_bucket = item.get("source_bucket")
-                if source_bucket is not None:
-                    if not isinstance(source_bucket, str):
-                        raise ValidationError(
-                            f"Item {i} 'source_bucket' must be a string"
-                        )
-                    if not source_bucket.strip():
-                        raise ValidationError(
-                            f"Item {i} 'source_bucket' must be non-empty when "
-                            f"'s3_key' is set"
-                        )
-
-            # input_text_mode is only meaningful when input_text is used;
-            # empty/None treated as absent (Strategy A items send "").
-            input_text_mode = item.get("input_text_mode")
-            if input_text_mode:
-                if not has_text:
+            # source_bucket: validate type if the key is present (null
+            # would otherwise propagate through worker.get(...,bucket) as
+            # None and break S3 CopyObject). Non-empty enforced only for
+            # file items, where the worker actually uses it.
+            if "source_bucket" in item:
+                source_bucket = item["source_bucket"]
+                if not isinstance(source_bucket, str):
                     raise ValidationError(
-                        f"Item {i} has 'input_text_mode' without 'input_text'"
+                        f"Item {i} 'source_bucket' must be a string"
                     )
-                if input_text_mode not in VALID_INPUT_TEXT_MODES:
+                if has_file and not source_bucket.strip():
+                    raise ValidationError(
+                        f"Item {i} 'source_bucket' must be non-empty when "
+                        f"'s3_key' is set"
+                    )
+
+            # input_text_mode: empty string is a Drupal sentinel for "not
+            # applicable" — tolerated only when there's no input_text to
+            # operate on (Strategy A). When input_text IS provided, mode
+            # must be a valid non-empty member of VALID_INPUT_TEXT_MODES
+            # if the key is present (key absent is fine — the worker
+            # defaults to "as_source").
+            input_text_mode = item.get("input_text_mode")
+            if has_text:
+                if "input_text_mode" in item and input_text_mode not in VALID_INPUT_TEXT_MODES:
                     raise ValidationError(
                         f"Item {i} has invalid input_text_mode "
                         f"'{input_text_mode}'; "
                         f"expected one of {sorted(VALID_INPUT_TEXT_MODES)}"
                     )
+            elif input_text_mode:
+                # Mode set (non-empty) but no text to apply it to.
+                raise ValidationError(
+                    f"Item {i} has 'input_text_mode' without 'input_text'"
+                )
 
             requested_fields = item.get("requested_fields")
             if requested_fields is not None:
