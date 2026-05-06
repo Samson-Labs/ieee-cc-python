@@ -367,3 +367,114 @@ class TestBulkProcessorHandler:
 
         assert result["statusCode"] == 400
         assert result["body"]["error_type"] == "ValidationError"
+
+    def test_s3_event_invocation(self):
+        """S3 PutObject on bulk/manifests/<batch_id>.json dispatches the batch."""
+        s3_event = {
+            "Records": [{
+                "s3": {
+                    "bucket": {"name": "dev-ieee-conference-cloud-bulk-uploads"},
+                    "object": {"key": "bulk/manifests/strategic-test-001.json"},
+                },
+            }],
+        }
+        with patch("src.handlers.bulk_processor_handler.processor") as mock_proc:
+            mock_proc.process_manifest.return_value = {
+                "batch_id": "strategic-test-001",
+                "total_items": 5,
+                "published_count": 5,
+                "estimated_cost": {"breakdown": {"PDF": 5}, "total_usd": 0.05},
+                "status": "dispatched",
+            }
+            result = handler(s3_event, None)
+
+        mock_proc.process_manifest.assert_called_once_with(
+            bucket="dev-ieee-conference-cloud-bulk-uploads",
+            batch_id="strategic-test-001",
+        )
+        assert result["statusCode"] == 200
+        assert result["body"]["results"][0]["batch_id"] == "strategic-test-001"
+
+    def test_s3_event_multiple_records(self):
+        """S3 may batch multiple PutObject events; handler must process all."""
+        s3_event = {
+            "Records": [
+                {"s3": {"bucket": {"name": "b"},
+                        "object": {"key": "bulk/manifests/batch-a.json"}}},
+                {"s3": {"bucket": {"name": "b"},
+                        "object": {"key": "bulk/manifests/batch-b.json"}}},
+                {"s3": {"bucket": {"name": "b"},
+                        "object": {"key": "bulk/manifests/batch-c.json"}}},
+            ],
+        }
+        with patch("src.handlers.bulk_processor_handler.processor") as mock_proc:
+            mock_proc.process_manifest.side_effect = lambda bucket, batch_id: {
+                "batch_id": batch_id,
+                "total_items": 1,
+                "published_count": 1,
+                "estimated_cost": {"breakdown": {}, "total_usd": 0.0},
+                "status": "dispatched",
+            }
+            result = handler(s3_event, None)
+
+        assert mock_proc.process_manifest.call_count == 3
+        dispatched = [r["batch_id"] for r in result["body"]["results"]]
+        assert dispatched == ["batch-a", "batch-b", "batch-c"]
+        assert result["statusCode"] == 200
+
+    def test_s3_event_partial_failure_does_not_raise(self):
+        """One record failing must not block others or trigger a Lambda retry."""
+        s3_event = {
+            "Records": [
+                {"s3": {"bucket": {"name": "b"},
+                        "object": {"key": "bulk/manifests/good.json"}}},
+                {"s3": {"bucket": {"name": "b"},
+                        "object": {"key": "bulk/manifests/bad.json"}}},
+            ],
+        }
+
+        def fake_process(bucket, batch_id):
+            if batch_id == "bad":
+                raise ValidationError("boom")
+            return {
+                "batch_id": batch_id, "total_items": 1, "published_count": 1,
+                "estimated_cost": {"breakdown": {}, "total_usd": 0.0},
+                "status": "dispatched",
+            }
+
+        with patch("src.handlers.bulk_processor_handler.processor") as mock_proc:
+            mock_proc.process_manifest.side_effect = fake_process
+            result = handler(s3_event, None)
+
+        assert result["statusCode"] == 200
+        results = result["body"]["results"]
+        assert results[0]["batch_id"] == "good"
+        assert results[1]["status"] == "failed"
+
+    def test_s3_event_wrong_prefix_skipped(self):
+        s3_event = {
+            "Records": [{
+                "s3": {
+                    "bucket": {"name": "bucket"},
+                    "object": {"key": "actions/some-job.json"},
+                },
+            }],
+        }
+        result = handler(s3_event, None)
+        assert result["statusCode"] == 200
+        assert result["body"]["results"][0]["status"] == "skipped"
+        assert "does not match" in result["body"]["results"][0]["error"]
+
+    def test_s3_event_wrong_suffix_skipped(self):
+        s3_event = {
+            "Records": [{
+                "s3": {
+                    "bucket": {"name": "bucket"},
+                    "object": {"key": "bulk/manifests/something.txt"},
+                },
+            }],
+        }
+        result = handler(s3_event, None)
+        assert result["statusCode"] == 200
+        assert result["body"]["results"][0]["status"] == "skipped"
+        assert "does not match" in result["body"]["results"][0]["error"]

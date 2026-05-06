@@ -151,7 +151,19 @@ EOF
 }
 
 # ---------------------------------------------------------------
-# 3. Create or update Lambda function
+# 3. Create SNS topic for batch-completion notifications (idempotent)
+#    Shared with the bulk-processor; safe to (re)create from either script.
+# ---------------------------------------------------------------
+create_sns_topic() {
+    log "Creating SNS topic: ${SNS_TOPIC_NAME}"
+    aws sns create-topic \
+        --name "${SNS_TOPIC_NAME}" \
+        --region "${AWS_REGION}" \
+        --query TopicArn --output text >/dev/null
+}
+
+# ---------------------------------------------------------------
+# 4. Create or update Lambda function
 # ---------------------------------------------------------------
 create_lambda() {
     log "Creating Lambda function: ${LAMBDA_FUNCTION_NAME}"
@@ -237,6 +249,7 @@ fi
 log "Full deployment starting..."
 create_ecr_repo
 create_lambda_role
+create_sns_topic
 build_and_push
 create_lambda
 create_event_source_mapping
