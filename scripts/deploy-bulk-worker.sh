@@ -96,14 +96,23 @@ create_lambda_role() {
 
     SQS_ARN="arn:aws:sqs:${AWS_REGION}:${AWS_ACCOUNT_ID}:${SQS_QUEUE_NAME}"
 
-    # Build the SOURCE_PUBLISH_BUCKETS list into a JSON array of S3 ARNs.
+    # Build the SOURCE_PUBLISH_BUCKETS list into JSON ARN arrays for both
+    # object-level (s3:GetObject, requires "/*") and bucket-level
+    # (s3:ListBucket, requires bare bucket ARN) statements. The worker's
+    # CopyObject path consults the source bucket before copying, so both
+    # are required — having only s3:GetObject reproduces the AccessDenied
+    # this whole IAM thread has been chasing.
+    #
     # Hard-fail on empty input: an IAM policy with Resource: [] is rejected
     # by AWS (MalformedPolicyDocument), and silently installing a placeholder
     # ARN would mask a configuration error and re-trigger the AccessDenied
-    # bug this PR is fixing.
-    SOURCE_BUCKET_ARNS=$(python3 -c '
+    # at runtime.
+    _render_arns() {
+        # $1 = suffix ("/*" for objects, "" for bucket-level)
+        python3 -c '
 import json, sys
 raw = sys.argv[1]
+suffix = sys.argv[2]
 names = [b.strip() for b in raw.split(",") if b.strip()]
 if not names:
     sys.stderr.write(
@@ -112,8 +121,11 @@ if not names:
         f"items would fail with AccessDenied at runtime.\n"
     )
     sys.exit(1)
-print(json.dumps([f"arn:aws:s3:::{n}/*" for n in names]))
-' "${SOURCE_PUBLISH_BUCKETS}")
+print(json.dumps([f"arn:aws:s3:::{n}{suffix}" for n in names]))
+' "${SOURCE_PUBLISH_BUCKETS}" "$1"
+    }
+    SOURCE_BUCKET_OBJECT_ARNS=$(_render_arns "/*")
+    SOURCE_BUCKET_LIST_ARNS=$(_render_arns "")
 
     INLINE_POLICY=$(cat <<EOF
 {
@@ -142,7 +154,13 @@ print(json.dumps([f"arn:aws:s3:::{n}/*" for n in names]))
             "Sid": "ReadSourcePublishBuckets",
             "Effect": "Allow",
             "Action": ["s3:GetObject"],
-            "Resource": ${SOURCE_BUCKET_ARNS}
+            "Resource": ${SOURCE_BUCKET_OBJECT_ARNS}
+        },
+        {
+            "Sid": "ListSourcePublishBuckets",
+            "Effect": "Allow",
+            "Action": ["s3:ListBucket"],
+            "Resource": ${SOURCE_BUCKET_LIST_ARNS}
         },
         {
             "Effect": "Allow",
