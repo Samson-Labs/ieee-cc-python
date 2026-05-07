@@ -29,7 +29,15 @@ SUPPORTED_FORMATS = {"mp4", "mov", "webm", "mp3"}
 LANGUAGE_CODE = "en-US"
 MAX_SPEAKERS = 2
 POLL_INTERVAL_SECONDS = 30
-POLL_TIMEOUT_SECONDS = 800
+# Single-pass time budget allocation against the Lambda's 900s timeout:
+#   audio_extractor.POLL_TIMEOUT_SECONDS (240s ceiling, ~90s typical) +
+#   this Transcribe poll (600s ceiling, 200-540s typical) +
+#   handler init / head_object / metadata / cleanup overhead (~30-60s)
+#   = ≤ 900s on a non-retrying happy path.
+# Audio-extraction retries (1401/1402 transient codes) can push the total
+# over 900s in pathological cases; the SQS retry layer is the safety net
+# for that and is preferable to a silently-prolonged single invocation.
+POLL_TIMEOUT_SECONDS = 600
 JOB_NAME_PREFIX = "ieee-rc"
 
 # AWS Transcribe rejects input files larger than 2 GB. Files above this
@@ -121,7 +129,6 @@ class VideoTranscriber:
         # downstream Transcribe call stays under the 2 GB service limit. Skip
         # the size check entirely when the feature flag is off to avoid an
         # extra S3 head_object roundtrip on the fast path.
-        extract_audio = False
         extracted_audio_key: str | None = None
         transcribe_uri = media_uri
         transcribe_format = media_format
@@ -146,7 +153,6 @@ class VideoTranscriber:
                 _, extracted_audio_key = self._parse_s3_uri(audio_uri)
                 transcribe_uri = audio_uri
                 transcribe_format = "mp3"
-                extract_audio = True
 
         try:
             # Step 1b: Start transcription job

@@ -18,7 +18,11 @@ from src.common.exceptions import MediaConvertError
 logger = logging.getLogger(__name__)
 
 POLL_INTERVAL_SECONDS = 30
-POLL_TIMEOUT_SECONDS = 600
+# Single-attempt ceiling for MediaConvert audio extraction. Sized so this
+# phase plus the downstream Transcribe poll plus handler overhead fits the
+# Lambda's 900s timeout on a non-retrying happy path. Observed extraction
+# time for a 2.4 GB / 2.5 hr MP4 is ~90s, so 240s is ~2.5× margin.
+POLL_TIMEOUT_SECONDS = 240
 
 MP3_BITRATE = 128_000
 MP3_SAMPLE_RATE = 44_100
