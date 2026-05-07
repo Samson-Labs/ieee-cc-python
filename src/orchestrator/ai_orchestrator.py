@@ -85,6 +85,36 @@ REQUIRED_CONTENT_FIELDS = {"media_type"}
 
 VALID_INPUT_TEXT_MODES = frozenset({"as_source", "as_abstract"})
 
+# Drupal sets this flag on every metadata_ready ack regardless of whether any
+# AI fields were actually applied. A response that lists only this field (or
+# none at all) means Drupal reached the controller but dropped every Bedrock
+# value — the silent-drop pattern that hid CC3-772 for 438 nodes.
+_DRUPAL_ACK_MARKER_FIELD = "field_ai_processed"
+
+
+def _make_drupal_ack_validator(generated_fields: list[str]):
+    """Build a validator that rejects empty/marker-only Drupal acks.
+
+    When the orchestrator generated zero AI fields, there is nothing to apply
+    on the Drupal side, so any 2xx is acceptable. Otherwise, the response must
+    include at least one updated field beyond ``field_ai_processed``.
+    """
+
+    def _validate(body: dict | None) -> tuple[bool, str]:
+        if not generated_fields:
+            return True, ""
+        if not isinstance(body, dict):
+            return False, "non-JSON or missing response body"
+        updated = body.get("updated_fields")
+        if not isinstance(updated, list) or not updated:
+            return False, "updated_fields missing or empty"
+        non_marker = [f for f in updated if f != _DRUPAL_ACK_MARKER_FIELD]
+        if not non_marker:
+            return False, f"updated_fields contains only {_DRUPAL_ACK_MARKER_FIELD!r}"
+        return True, ""
+
+    return _validate
+
 
 class OrchestratorResult(TypedDict):
     """Result of an orchestration run."""
@@ -354,13 +384,17 @@ class AIOrchestrator:
                 .isoformat()
                 .replace("+00:00", "Z"),
                 "extraction": extraction_result,
-                "data": bedrock_result,
+                "metadata": bedrock_result,
                 "generated_fields": generated_fields,
                 "vtt_s3_key": vtt_key if vtt_key else None,
             }
             webhook_secret = self._resolve_webhook_secret(correlation)
             webhook_sent = self._webhook_sender.send(
-                callback_url, webhook_secret, payload, correlation,
+                callback_url,
+                webhook_secret,
+                payload,
+                correlation,
+                response_validator=_make_drupal_ack_validator(generated_fields),
             )
 
         # Step 6: Move file from /pending/ to /processed/
