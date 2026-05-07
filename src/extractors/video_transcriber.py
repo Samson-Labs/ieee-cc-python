@@ -20,16 +20,21 @@ from typing import TypedDict
 import boto3
 
 from src.common.metrics import publish_metrics
+from src.extractors.audio_extractor import AudioExtractor
 
 logger = logging.getLogger(__name__)
 
 # Transcribe settings
-SUPPORTED_FORMATS = {"mp4", "mov", "webm"}
+SUPPORTED_FORMATS = {"mp4", "mov", "webm", "mp3"}
 LANGUAGE_CODE = "en-US"
 MAX_SPEAKERS = 2
 POLL_INTERVAL_SECONDS = 30
-POLL_TIMEOUT_SECONDS = 600
+POLL_TIMEOUT_SECONDS = 800
 JOB_NAME_PREFIX = "ieee-rc"
+
+# AWS Transcribe rejects input files larger than 2 GB. Files above this
+# threshold are routed through MediaConvert audio extraction first.
+TRANSCRIBE_MAX_BYTES = 1_900_000_000
 
 # Bedrock transcript cleanup
 CLEANUP_MODEL_ID = os.environ.get(
@@ -66,6 +71,7 @@ class VideoTranscriber:
         transcribe_client=None,
         bedrock_client=None,
         cloudwatch_client=None,
+        audio_extractor: AudioExtractor | None = None,
     ):
         self._s3 = s3_client or boto3.client("s3")
         self._transcribe = transcribe_client or boto3.client("transcribe")
@@ -73,6 +79,10 @@ class VideoTranscriber:
             "bedrock-runtime", region_name="us-east-1"
         )
         self._cloudwatch = cloudwatch_client
+        self._audio_extractor = audio_extractor
+        self._audio_extraction_enabled = (
+            os.environ.get("ENABLE_AUDIO_EXTRACTION", "true").lower() == "true"
+        )
 
     def transcribe(
         self,
@@ -107,11 +117,61 @@ class VideoTranscriber:
 
         logger.info("Starting transcription job %s for %s", job_name, media_uri)
 
-        # Step 1: Start transcription job
-        self._start_job(job_name, media_uri, media_format, output_bucket=bucket)
+        # Step 1a: For oversized files, extract audio via MediaConvert so the
+        # downstream Transcribe call stays under the 2 GB service limit. Skip
+        # the size check entirely when the feature flag is off to avoid an
+        # extra S3 head_object roundtrip on the fast path.
+        extract_audio = False
+        extracted_audio_key: str | None = None
+        transcribe_uri = media_uri
+        transcribe_format = media_format
 
-        # Step 2: Poll for completion
-        job = self._poll_job(job_name)
+        if self._audio_extraction_enabled:
+            size_bytes = self._s3.head_object(
+                Bucket=bucket, Key=key
+            )["ContentLength"]
+            if size_bytes > TRANSCRIBE_MAX_BYTES:
+                logger.info(
+                    "File size %d > %d, extracting audio via MediaConvert",
+                    size_bytes,
+                    TRANSCRIBE_MAX_BYTES,
+                )
+                if self._audio_extractor is None:
+                    self._audio_extractor = AudioExtractor()
+                audio_uri = self._audio_extractor.extract_audio(
+                    source_uri=media_uri,
+                    output_bucket=bucket,
+                    output_key_prefix=f"transcribe-input/{job_name}",
+                )
+                _, extracted_audio_key = self._parse_s3_uri(audio_uri)
+                transcribe_uri = audio_uri
+                transcribe_format = "mp3"
+                extract_audio = True
+
+        try:
+            # Step 1b: Start transcription job
+            self._start_job(
+                job_name, transcribe_uri, transcribe_format, output_bucket=bucket
+            )
+
+            # Step 2: Poll for completion
+            job = self._poll_job(job_name)
+        finally:
+            if extracted_audio_key:
+                try:
+                    self._s3.delete_object(Bucket=bucket, Key=extracted_audio_key)
+                    logger.info(
+                        "Deleted extracted audio s3://%s/%s",
+                        bucket,
+                        extracted_audio_key,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to delete extracted audio s3://%s/%s: %s",
+                        bucket,
+                        extracted_audio_key,
+                        exc,
+                    )
 
         # Step 3: Fetch transcript and VTT subtitle key
         transcript_uri = job["TranscriptionJob"]["Transcript"]["TranscriptFileUri"]

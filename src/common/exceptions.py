@@ -23,6 +23,13 @@ class TranscribeError(PipelineError):
     is_retriable: bool = True
 
 
+class MediaConvertError(PipelineError):
+    """AWS Elemental MediaConvert failures (job error, timeout, endpoint discovery)."""
+
+    error_type: str = "MediaConvertError"
+    is_retriable: bool = True
+
+
 class BedrockError(PipelineError):
     """AWS Bedrock / Claude inference failures (throttling, bad response)."""
 
