@@ -98,6 +98,33 @@ for FN in "${ORCHESTRATOR_FN}" "${IMAGE_GEN_FN}"; do
     echo "  found: ${FN}"
 done
 
+# Preflight: verify each Lambda's execution role can sqs:SendMessage to the DLQ.
+# This is required for OnFailure async destinations to work. We check now
+# (before the DLQ ARN is needed) by deriving the role ARN from the Lambda config.
+# If the DLQ doesn't exist yet, skip — it will be created in step [5/7].
+_DLQ_ARN_PREFLIGHT="arn:aws:sqs:${AWS_REGION}:${ACCOUNT}:ieee-rc-processing-dlq${SUFFIX}"
+for FN in "${ORCHESTRATOR_FN}" "${IMAGE_GEN_FN}"; do
+    ROLE_ARN=$(aws lambda get-function-configuration \
+        --function-name "${FN}" \
+        --region "${AWS_REGION}" --profile "${AWS_PROFILE}" \
+        --query 'Role' --output text 2>/dev/null || true)
+    if [[ -n "${ROLE_ARN}" ]]; then
+        DECISION=$(aws iam simulate-principal-policy \
+            --policy-source-arn "${ROLE_ARN}" \
+            --action-names "sqs:SendMessage" \
+            --resource-arns "${_DLQ_ARN_PREFLIGHT}" \
+            --query 'EvaluationResults[0].EvalDecision' \
+            --output text 2>/dev/null || echo "unknown")
+        if [[ "${DECISION}" != "allowed" ]]; then
+            echo "WARNING: ${FN} role (${ROLE_ARN}) cannot sqs:SendMessage on ${_DLQ_ARN_PREFLIGHT}" >&2
+            echo "  OnFailure DLQ delivery will silently fail until the role is updated." >&2
+            echo "  Add sqs:SendMessage on ${_DLQ_ARN_PREFLIGHT} to the Lambda's inline policy." >&2
+        else
+            echo "  iam ok: ${FN} can sqs:SendMessage on DLQ"
+        fi
+    fi
+done
+
 # ---------------------------------------------------------------
 # 1. Enable EventBridge notifications on bucket
 # ---------------------------------------------------------------
@@ -300,11 +327,6 @@ for FN in "${ORCHESTRATOR_FN}" "${IMAGE_GEN_FN}"; do
     echo "  configured: ${FN} (retries=2, dlq=${DLQ_NAME})"
 done
 
-# NOTE: Each Lambda's execution role must have sqs:SendMessage on ${DLQ_ARN}
-# for OnFailure delivery to succeed. Verify with:
-#   aws iam simulate-principal-policy --policy-source-arn <role-arn> \
-#     --action-names sqs:SendMessage --resource-arns ${DLQ_ARN}
-log "  NOTE: ensure execution roles have sqs:SendMessage on ${DLQ_ARN}"
 
 # ---------------------------------------------------------------
 # 7. CloudWatch alarms
@@ -315,8 +337,8 @@ ALERTS_ARN="arn:aws:sns:${AWS_REGION}:${ACCOUNT}:${SNS_ALERTS}"
 
 # Lambda errors >= 5 in 5 min
 aws cloudwatch put-metric-alarm \
-    --alarm-name "ieee-rc-lambda-errors${SUFFIX}" \
-    --alarm-description "Lambda errors >= 5 in 5 min (${ENV})" \
+    --alarm-name "ieee-rc-orchestrator-errors${SUFFIX}" \
+    --alarm-description "Orchestrator Lambda errors >= 5 in 5 min (${ENV})" \
     --metric-name Errors \
     --namespace AWS/Lambda \
     --statistic Sum \
@@ -329,7 +351,7 @@ aws cloudwatch put-metric-alarm \
     --tags "Key=Project,Value=ieee-rc" "Key=Environment,Value=${ENV}" \
     --region "${AWS_REGION}" \
     --profile "${AWS_PROFILE}"
-echo "  upserted: ieee-rc-lambda-errors${SUFFIX}"
+echo "  upserted: ieee-rc-orchestrator-errors${SUFFIX}"
 
 # DLQ message count > 0
 aws cloudwatch put-metric-alarm \
@@ -399,17 +421,7 @@ aws events tag-resource \
     --region "${AWS_REGION}" \
     --profile "${AWS_PROFILE}"
 
-# Tag CloudWatch alarms
-for ALARM in \
-    "ieee-rc-lambda-error-rate${SUFFIX}" \
-    "ieee-rc-dlq-messages${SUFFIX}" \
-    "ieee-rc-bedrock-throttling${SUFFIX}"; do
-    aws cloudwatch tag-resource \
-        --resource-arn "arn:aws:cloudwatch:${AWS_REGION}:${ACCOUNT}:alarm:${ALARM}" \
-        --tags "Key=Project,Value=ieee-rc" "Key=Environment,Value=${ENV}" \
-        --region "${AWS_REGION}" \
-        --profile "${AWS_PROFILE}"
-done
+# CloudWatch alarms are already tagged via --tags in put-metric-alarm above.
 
 echo "  tagged all resources"
 
