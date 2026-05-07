@@ -9,7 +9,13 @@ from unittest.mock import MagicMock, patch, call
 
 import pytest
 
-from src.webhook.sender import WebhookSender, MAX_RETRIES, BACKOFF_DELAYS, SNS_TOPIC_ENV
+from src.webhook.sender import (
+    WebhookSender,
+    MAX_RETRIES,
+    BACKOFF_DELAYS,
+    MAX_RESPONSE_BYTES,
+    SNS_TOPIC_ENV,
+)
 
 
 @pytest.fixture
@@ -241,6 +247,21 @@ class TestResponseValidator:
         ws.send(URL, SECRET, PAYLOAD, CORRELATION, response_validator=_capture)
 
         assert seen["body"] is None
+
+    @patch("src.webhook.sender.urllib.request.urlopen")
+    def test_response_read_is_capped_at_max_bytes(self, mock_urlopen, sender):
+        """Defense-in-depth: a runaway peer response must not exhaust Lambda memory."""
+        ws, _ = sender
+        resp = _mock_success_response()
+        resp.read = MagicMock(return_value=b'{"updated_fields":["body"]}')
+        mock_urlopen.return_value = resp
+
+        ws.send(
+            URL, SECRET, PAYLOAD, CORRELATION,
+            response_validator=lambda body: (True, ""),
+        )
+
+        resp.read.assert_called_once_with(MAX_RESPONSE_BYTES)
 
     @patch("src.webhook.sender.urllib.request.urlopen")
     def test_no_validator_does_not_read_body(self, mock_urlopen, sender):

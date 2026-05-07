@@ -21,6 +21,11 @@ MAX_RETRIES = 3
 BACKOFF_DELAYS = [2, 4, 8]  # seconds
 SNS_TOPIC_ENV = "WEBHOOK_FAILURES_SNS_TOPIC_ARN"
 
+# Cap on response-body bytes when a validator is supplied. Drupal acks
+# are O(100 bytes); 1 MiB is well above any legitimate response and keeps
+# a malfunctioning or malicious peer from filling the Lambda's memory.
+MAX_RESPONSE_BYTES = 1 * 1024 * 1024
+
 ResponseValidator = Callable[[dict | None], "tuple[bool, str]"]
 
 
@@ -37,9 +42,13 @@ class WebhookSender:
 
     @staticmethod
     def _parse_response_body(resp) -> dict | None:
-        """Best-effort JSON parse of a response body. Returns None on failure."""
+        """Best-effort JSON parse of a response body. Returns None on failure.
+
+        Reads at most ``MAX_RESPONSE_BYTES`` to bound memory use against a
+        runaway peer; a body that doesn't fit is treated as unparseable.
+        """
         try:
-            raw = resp.read()
+            raw = resp.read(MAX_RESPONSE_BYTES)
         except Exception:
             return None
         if not raw:
