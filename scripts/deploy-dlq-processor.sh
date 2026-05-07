@@ -193,28 +193,33 @@ update_lambda_code() {
         --function-name "${LAMBDA_FUNCTION_NAME}" \
         --region "${AWS_REGION}"
 
-    # Merge owned env vars into existing configuration so out-of-band vars are preserved
-    EXISTING_VARS=$(aws lambda get-function-configuration \
+    # Merge owned env vars into existing configuration so out-of-band vars are preserved.
+    # Existing vars are written to a temp file to avoid shell quoting / newline issues.
+    ENV_TMPFILE=$(mktemp)
+    aws lambda get-function-configuration \
         --function-name "${LAMBDA_FUNCTION_NAME}" \
         --region "${AWS_REGION}" \
-        --query 'Environment.Variables' --output json 2>/dev/null || echo "{}")
-    MERGED_VARS=$(python3 -c "
+        --query 'Environment.Variables' --output json 2>/dev/null > "${ENV_TMPFILE}" || echo "{}" > "${ENV_TMPFILE}"
+
+    ENV_JSON_FILE=$(mktemp)
+    python3 - "${ENV_TMPFILE}" > "${ENV_JSON_FILE}" <<PYEOF
 import json, sys
-existing = json.loads('${EXISTING_VARS}'.replace(\"'\", '\"'))
-owned = {
-    'LOG_LEVEL': 'INFO',
-    'STAGE': '${ENV}',
-    'ORCHESTRATOR_FUNCTION_NAME': '${ORCHESTRATOR_FUNCTION_NAME}',
-    'ARCHIVE_BUCKET': '${S3_BUCKET_NAME}',
-    'FAILURES_SNS_TOPIC_ARN': '${SNS_TOPIC_ARN}',
-}
-existing.update(owned)
-print(json.dumps(existing))
-")
+with open(sys.argv[1]) as f:
+    existing = json.load(f)
+existing.update({
+    "LOG_LEVEL": "INFO",
+    "STAGE": "${ENV}",
+    "ORCHESTRATOR_FUNCTION_NAME": "${ORCHESTRATOR_FUNCTION_NAME}",
+    "ARCHIVE_BUCKET": "${S3_BUCKET_NAME}",
+    "FAILURES_SNS_TOPIC_ARN": "${SNS_TOPIC_ARN}",
+})
+print(json.dumps({"Variables": existing}))
+PYEOF
     aws lambda update-function-configuration \
         --function-name "${LAMBDA_FUNCTION_NAME}" \
         --region "${AWS_REGION}" \
-        --environment "Variables=${MERGED_VARS}"
+        --environment "file://${ENV_JSON_FILE}"
+    rm -f "${ENV_TMPFILE}" "${ENV_JSON_FILE}"
 
     aws lambda wait function-updated-v2 \
         --function-name "${LAMBDA_FUNCTION_NAME}" \
