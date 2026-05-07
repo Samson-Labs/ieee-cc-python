@@ -51,7 +51,8 @@ esac
 
 AWS_PROFILE="${AWS_PROFILE:-ieee-cc}"
 AWS_REGION="${AWS_REGION:-us-east-1}"
-ACCOUNT="$(aws sts get-caller-identity --profile "${AWS_PROFILE}" --query Account --output text)"
+export AWS_PROFILE AWS_REGION
+ACCOUNT="$(aws sts get-caller-identity --profile "${AWS_PROFILE}" --region "${AWS_REGION}" --query Account --output text)"
 
 # ---------------------------------------------------------------
 # Naming — prod has no suffix (account convention)
