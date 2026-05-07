@@ -86,8 +86,11 @@ class AudioExtractor:
         job_id = response["Job"]["Id"]
         logger.info("MediaConvert job %s submitted", job_id)
 
-        job = self._poll_job(job_id)
-        return self._extract_output_uri(job)
+        self._poll_job(job_id)
+        # MediaConvert's GetJob response does not return the output URI for
+        # FILE_GROUP_SETTINGS outputs, so we compute it deterministically:
+        #   {destination}{source_basename_no_ext}{NameModifier}.mp3
+        return self._compute_output_uri(source_uri, destination)
 
     @staticmethod
     def _build_job_settings(source_uri: str, destination: str) -> dict:
@@ -119,6 +122,7 @@ class AudioExtractor:
                                         "Mp3Settings": {
                                             "Bitrate": MP3_BITRATE,
                                             "Channels": MP3_CHANNELS,
+                                            "RateControlMode": "CBR",
                                             "SampleRate": MP3_SAMPLE_RATE,
                                         },
                                     },
@@ -164,18 +168,16 @@ class AudioExtractor:
         )
 
     @staticmethod
-    def _extract_output_uri(job: dict) -> str:
-        """Pull the resulting MP3's S3 URI out of the completed job response."""
-        try:
-            return (
-                job["OutputGroupDetails"][0]
-                ["OutputDetails"][0]
-                ["OutputFilePaths"][0]
-            )
-        except (KeyError, IndexError) as exc:
-            raise MediaConvertError(
-                f"MediaConvert job completed but output URI missing: {exc}"
-            ) from exc
+    def _compute_output_uri(source_uri: str, destination: str) -> str:
+        """Derive the resulting MP3 S3 URI from the job inputs.
+
+        MediaConvert's FILE_GROUP_SETTINGS output writes to
+        ``{destination}{source_basename_without_ext}{NameModifier}.{codec_ext}``.
+        For MP3 codec in a RAW container, the extension is ``.mp3``.
+        """
+        basename = source_uri.rsplit("/", 1)[-1]
+        stem = basename.rsplit(".", 1)[0] if "." in basename else basename
+        return f"{destination}{stem}{NAME_MODIFIER}.mp3"
 
     @staticmethod
     def _discover_endpoint() -> str:

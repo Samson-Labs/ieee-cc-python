@@ -16,23 +16,22 @@ ROLE_ARN = "arn:aws:iam::123456789012:role/ieee-cc-mediaconvert-dev-role"
 ENDPOINT = "https://abcd1234.mediaconvert.us-east-1.amazonaws.com"
 
 
-def _mock_complete_job(mc_mock, output_uri):
-    """Set up the MediaConvert mock for a successful job."""
+def _mock_complete_job(mc_mock):
+    """Set up the MediaConvert mock for a successful job.
+
+    The output URI is derived deterministically from the source/destination,
+    not read from the job response.
+    """
     mc_mock.create_job.return_value = {"Job": {"Id": "job-123"}}
     mc_mock.get_job.return_value = {
-        "Job": {
-            "Status": "COMPLETE",
-            "OutputGroupDetails": [
-                {"OutputDetails": [{"OutputFilePaths": [output_uri]}]},
-            ],
-        }
+        "Job": {"Status": "COMPLETE", "OutputGroupDetails": [{"OutputDetails": [{}]}]}
     }
 
 
 class TestExtractAudioJobSpec:
     def test_create_job_payload_shape(self):
         mc_mock = MagicMock()
-        _mock_complete_job(mc_mock, "s3://bucket/transcribe-input/job/in-audio.mp3")
+        _mock_complete_job(mc_mock)
 
         extractor = AudioExtractor(
             mediaconvert_client=mc_mock, role_arn=ROLE_ARN, endpoint_url=ENDPOINT
@@ -67,14 +66,13 @@ class TestExtractAudioJobSpec:
         assert codec["Mp3Settings"] == {
             "Bitrate": 128_000,
             "Channels": 1,
+            "RateControlMode": "CBR",
             "SampleRate": 44_100,
         }
 
-    def test_returns_output_uri(self):
+    def test_returns_output_uri_derived_from_source(self):
         mc_mock = MagicMock()
-        _mock_complete_job(
-            mc_mock, "s3://bucket/transcribe-input/job/in-audio.mp3"
-        )
+        _mock_complete_job(mc_mock)
 
         extractor = AudioExtractor(
             mediaconvert_client=mc_mock, role_arn=ROLE_ARN, endpoint_url=ENDPOINT
@@ -87,6 +85,21 @@ class TestExtractAudioJobSpec:
 
         assert result == "s3://bucket/transcribe-input/job/in-audio.mp3"
 
+    def test_returns_output_uri_for_basename_without_extension(self):
+        mc_mock = MagicMock()
+        _mock_complete_job(mc_mock)
+
+        extractor = AudioExtractor(
+            mediaconvert_client=mc_mock, role_arn=ROLE_ARN, endpoint_url=ENDPOINT
+        )
+        result = extractor.extract_audio(
+            source_uri="s3://bucket/PES/pending/noext",
+            output_bucket="bucket",
+            output_key_prefix="transcribe-input/job",
+        )
+
+        assert result == "s3://bucket/transcribe-input/job/noext-audio.mp3"
+
 
 class TestPolling:
     @patch("src.extractors.audio_extractor.time.sleep")
@@ -95,14 +108,7 @@ class TestPolling:
         mc_mock.create_job.return_value = {"Job": {"Id": "job-1"}}
         mc_mock.get_job.side_effect = [
             {"Job": {"Status": "PROGRESSING"}},
-            {
-                "Job": {
-                    "Status": "COMPLETE",
-                    "OutputGroupDetails": [
-                        {"OutputDetails": [{"OutputFilePaths": ["s3://b/k.mp3"]}]}
-                    ],
-                }
-            },
+            {"Job": {"Status": "COMPLETE"}},
         ]
 
         extractor = AudioExtractor(
@@ -110,7 +116,7 @@ class TestPolling:
         )
         result = extractor.extract_audio("s3://b/in.mp4", "b", "transcribe-input/job")
 
-        assert result == "s3://b/k.mp3"
+        assert result == "s3://b/transcribe-input/job/in-audio.mp3"
         assert mc_mock.get_job.call_count == 2
 
     @patch("src.extractors.audio_extractor.time.sleep")
@@ -161,19 +167,6 @@ class TestPolling:
         # POLL_TIMEOUT_SECONDS / POLL_INTERVAL_SECONDS = 600 / 30 = 20 polls
         assert mc_mock.get_job.call_count == POLL_TIMEOUT_SECONDS // 30
 
-    def test_completed_job_with_missing_output_raises(self):
-        mc_mock = MagicMock()
-        mc_mock.create_job.return_value = {"Job": {"Id": "job-5"}}
-        mc_mock.get_job.return_value = {
-            "Job": {"Status": "COMPLETE", "OutputGroupDetails": []}
-        }
-
-        extractor = AudioExtractor(
-            mediaconvert_client=mc_mock, role_arn=ROLE_ARN, endpoint_url=ENDPOINT
-        )
-
-        with pytest.raises(MediaConvertError, match="output URI missing"):
-            extractor.extract_audio("s3://b/in.mp4", "b", "transcribe-input/job")
 
 
 class TestEndpointDiscovery:
