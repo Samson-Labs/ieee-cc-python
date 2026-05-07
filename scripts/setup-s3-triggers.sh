@@ -92,16 +92,18 @@ for FN in "${ORCHESTRATOR_FN}" "${IMAGE_GEN_FN}"; do
     if ! aws lambda get-function --function-name "${FN}" \
         --region "${AWS_REGION}" --profile "${AWS_PROFILE}" &>/dev/null; then
         echo "ERROR: Lambda '${FN}' does not exist. Deploy it first." >&2
-        echo "  ./scripts/deploy-ai-orchestrator.sh ${ENV}" >&2
+        if [[ "${FN}" == "${ORCHESTRATOR_FN}" ]]; then
+            echo "  ./scripts/deploy-ai-orchestrator.sh ${ENV}" >&2
+        else
+            echo "  ./scripts/deploy-image-overlay.sh ${ENV}" >&2
+        fi
         exit 1
     fi
     echo "  found: ${FN}"
 done
 
 # Preflight: verify each Lambda's execution role can sqs:SendMessage to the DLQ.
-# This is required for OnFailure async destinations to work. We check now
-# (before the DLQ ARN is needed) by deriving the role ARN from the Lambda config.
-# If the DLQ doesn't exist yet, skip — it will be created in step [5/7].
+# IAM simulation does not require the queue to exist — it evaluates policy only.
 _DLQ_ARN_PREFLIGHT="arn:aws:sqs:${AWS_REGION}:${ACCOUNT}:ieee-rc-processing-dlq${SUFFIX}"
 for FN in "${ORCHESTRATOR_FN}" "${IMAGE_GEN_FN}"; do
     ROLE_ARN=$(aws lambda get-function-configuration \
@@ -115,12 +117,14 @@ for FN in "${ORCHESTRATOR_FN}" "${IMAGE_GEN_FN}"; do
             --resource-arns "${_DLQ_ARN_PREFLIGHT}" \
             --query 'EvaluationResults[0].EvalDecision' \
             --output text 2>/dev/null || echo "unknown")
-        if [[ "${DECISION}" != "allowed" ]]; then
+        if [[ "${DECISION}" == "allowed" ]]; then
+            echo "  iam ok: ${FN} can sqs:SendMessage on DLQ"
+        elif [[ "${DECISION}" == "unknown" ]]; then
+            echo "  iam check skipped for ${FN}: could not run simulate-principal-policy (check iam:SimulatePrincipalPolicy permission)" >&2
+        else
             echo "WARNING: ${FN} role (${ROLE_ARN}) cannot sqs:SendMessage on ${_DLQ_ARN_PREFLIGHT}" >&2
             echo "  OnFailure DLQ delivery will silently fail until the role is updated." >&2
             echo "  Add sqs:SendMessage on ${_DLQ_ARN_PREFLIGHT} to the Lambda's inline policy." >&2
-        else
-            echo "  iam ok: ${FN} can sqs:SendMessage on DLQ"
         fi
     fi
 done
@@ -301,13 +305,13 @@ DLQ_ARN=$(aws sqs get-queue-attributes \
     --profile "${AWS_PROFILE}" \
     --query 'Attributes.QueueArn' --output text)
 
-# SNS topics
+# SNS topics (create-topic is idempotent)
 for TOPIC_NAME in "${SNS_WEBHOOK}" "${SNS_ALERTS}"; do
-    TOPIC_ARN=$(aws sns create-topic \
+    aws sns create-topic \
         --name "${TOPIC_NAME}" \
         --region "${AWS_REGION}" \
         --profile "${AWS_PROFILE}" \
-        --query 'TopicArn' --output text)
+        --query 'TopicArn' --output text > /dev/null
     echo "  upserted: ${TOPIC_NAME}"
 done
 
