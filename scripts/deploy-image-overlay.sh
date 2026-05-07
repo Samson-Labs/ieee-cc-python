@@ -37,6 +37,10 @@ IMAGE_TAG="latest"
 ECR_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO_NAME}"
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
+# Optional — passed through to the Lambda environment if set.
+WEBHOOK_FAILURES_SNS_TOPIC_ARN="${WEBHOOK_FAILURES_SNS_TOPIC_ARN:-}"
+DRUPAL_WEBHOOK_SECRET="${DRUPAL_WEBHOOK_SECRET:-}"
+
 export AWS_PROFILE AWS_REGION
 
 # ---------------------------------------------------------------
@@ -163,6 +167,15 @@ create_lambda() {
     log "Creating Lambda function: ${LAMBDA_FUNCTION_NAME}"
     ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/${LAMBDA_ROLE_NAME}"
 
+    # Build environment-variables map (only include set vars).
+    local env_vars="LOG_LEVEL=INFO,STAGE=${ENV}"
+    if [[ -n "${DRUPAL_WEBHOOK_SECRET}" ]]; then
+        env_vars="${env_vars},DRUPAL_WEBHOOK_SECRET=${DRUPAL_WEBHOOK_SECRET}"
+    fi
+    if [[ -n "${WEBHOOK_FAILURES_SNS_TOPIC_ARN}" ]]; then
+        env_vars="${env_vars},WEBHOOK_FAILURES_SNS_TOPIC_ARN=${WEBHOOK_FAILURES_SNS_TOPIC_ARN}"
+    fi
+
     if aws lambda get-function --function-name "${LAMBDA_FUNCTION_NAME}" \
         --region "${AWS_REGION}" >/dev/null 2>&1; then
         log "Lambda already exists — updating code..."
@@ -181,7 +194,7 @@ create_lambda() {
             --memory-size 1024 \
             --timeout 60 \
             --architectures x86_64 \
-            --environment "Variables={LOG_LEVEL=INFO,STAGE=${ENV}}"
+            --environment "Variables={${env_vars}}"
 
         aws lambda wait function-active-v2 \
             --function-name "${LAMBDA_FUNCTION_NAME}" \

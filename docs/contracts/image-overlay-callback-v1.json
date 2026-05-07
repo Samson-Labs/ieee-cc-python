@@ -39,10 +39,10 @@
       "type": "string",
       "description": "Required on status=complete. Final S3 key of the rendered image."
     },
-    "bytes": {
+    "bytes_transferred": {
       "type": "integer",
       "minimum": 0,
-      "description": "Required on status=complete. Size of the rendered image in bytes."
+      "description": "Required on status=complete. Size of the rendered image in bytes. Field name matches transfer-callback-v1.json so Drupal's WebhookController can validate both callbacks uniformly."
     },
     "s3_etag": {
       "type": "string",
@@ -77,7 +77,7 @@
   "allOf": [
     {
       "if": { "properties": { "status": { "const": "complete" } } },
-      "then": { "required": ["dest_bucket", "dest_key", "bytes", "s3_etag", "width", "height"] }
+      "then": { "required": ["dest_bucket", "dest_key", "bytes_transferred", "s3_etag", "width", "height"] }
     },
     {
       "if": { "properties": { "status": { "const": "error" } } },
@@ -93,7 +93,7 @@
       "product_part_number": "SPSCONF2026",
       "dest_bucket": "dev-ieee-conference-cloud-bulk-uploads",
       "dest_key": "SPS/SPSCONF2026.jpg",
-      "bytes": 184_293,
+      "bytes_transferred": 184293,
       "s3_etag": "\"5d41402abc4b2a76b9719d911017c592\"",
       "width": 1920,
       "height": 1080

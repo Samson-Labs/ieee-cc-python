@@ -627,7 +627,7 @@ class ImageOverlayGenerator:
         else:
             payload["dest_bucket"] = dest_bucket
             payload["dest_key"] = dest_key
-            payload["bytes"] = bytes_
+            payload["bytes_transferred"] = bytes_
             payload["s3_etag"] = s3_etag
             payload["width"] = width
             payload["height"] = height

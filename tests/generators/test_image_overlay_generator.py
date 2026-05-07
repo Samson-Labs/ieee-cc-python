@@ -1318,7 +1318,7 @@ class TestCallbackSuccessPath:
         assert payload["dest_bucket"] == "ieee-conference-cloud-bulk-uploads"
         assert payload["dest_key"] == "SPS/SPSTEST001.jpg"
         assert payload["s3_etag"] == "\"5d41402abc4b2a76b9719d911017c592\""
-        assert payload["bytes"] > 0
+        assert payload["bytes_transferred"] > 0
         assert payload["width"] == 800
         assert payload["height"] == 600
 
