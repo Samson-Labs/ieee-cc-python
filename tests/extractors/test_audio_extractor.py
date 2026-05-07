@@ -9,6 +9,7 @@ import pytest
 from src.common.exceptions import MediaConvertError
 from src.extractors.audio_extractor import (
     POLL_TIMEOUT_SECONDS,
+    RETRIABLE_ERROR_CODES,
     AudioExtractor,
 )
 
@@ -162,11 +163,99 @@ class TestPolling:
         )
 
         with pytest.raises(MediaConvertError, match="timed out"):
-            extractor.extract_audio("s3://b/in.mp4", "b", "transcribe-input/job")
+            extractor.extract_audio(
+                "s3://b/in.mp4", "b", "transcribe-input/job", max_attempts=1
+            )
 
         # POLL_TIMEOUT_SECONDS / POLL_INTERVAL_SECONDS = 600 / 30 = 20 polls
         assert mc_mock.get_job.call_count == POLL_TIMEOUT_SECONDS // 30
 
+
+class TestRetryOnTransientErrors:
+    """Option A: in-Lambda retry on MediaConvert transient demuxer errors.
+
+    1401 / 1402 (Audio input pipeline / Demuxer failures) are typically
+    caused by S3 read flakiness on freshly-staged large MP4s; they
+    resolve within a single retry once the source bytes are fully
+    cache-coherent.
+    """
+
+    @patch("src.extractors.audio_extractor.time.sleep")
+    def test_retries_on_1401_then_succeeds(self, mock_sleep):
+        mc_mock = MagicMock()
+        mc_mock.create_job.side_effect = [
+            {"Job": {"Id": "attempt-1"}},
+            {"Job": {"Id": "attempt-2"}},
+        ]
+        mc_mock.get_job.side_effect = [
+            {
+                "Job": {
+                    "Status": "ERROR",
+                    "ErrorCode": 1401,
+                    "ErrorMessage": "Demuxer: Failed to read data",
+                }
+            },
+            {"Job": {"Status": "COMPLETE"}},
+        ]
+
+        extractor = AudioExtractor(
+            mediaconvert_client=mc_mock, role_arn=ROLE_ARN, endpoint_url=ENDPOINT
+        )
+        result = extractor.extract_audio("s3://b/in.mp4", "b", "transcribe-input/job")
+
+        assert result == "s3://b/transcribe-input/job/in-audio.mp3"
+        assert mc_mock.create_job.call_count == 2
+
+    @patch("src.extractors.audio_extractor.time.sleep")
+    def test_does_not_retry_on_non_retriable_code(self, mock_sleep):
+        mc_mock = MagicMock()
+        mc_mock.create_job.return_value = {"Job": {"Id": "single"}}
+        mc_mock.get_job.return_value = {
+            "Job": {
+                "Status": "ERROR",
+                "ErrorCode": 1404,
+                "ErrorMessage": "Codec not supported",
+            }
+        }
+
+        extractor = AudioExtractor(
+            mediaconvert_client=mc_mock, role_arn=ROLE_ARN, endpoint_url=ENDPOINT
+        )
+
+        with pytest.raises(MediaConvertError, match="Codec not supported"):
+            extractor.extract_audio("s3://b/in.mp4", "b", "transcribe-input/job")
+
+        # 1404 is not retriable — exactly one job submitted.
+        assert mc_mock.create_job.call_count == 1
+
+    @patch("src.extractors.audio_extractor.time.sleep")
+    def test_exhausts_retries_then_raises(self, mock_sleep):
+        mc_mock = MagicMock()
+        mc_mock.create_job.side_effect = [
+            {"Job": {"Id": f"attempt-{i}"}} for i in range(1, 4)
+        ]
+        mc_mock.get_job.return_value = {
+            "Job": {
+                "Status": "ERROR",
+                "ErrorCode": 1401,
+                "ErrorMessage": "Demuxer: Failed to read data",
+            }
+        }
+
+        extractor = AudioExtractor(
+            mediaconvert_client=mc_mock, role_arn=ROLE_ARN, endpoint_url=ENDPOINT
+        )
+
+        with pytest.raises(MediaConvertError, match="Failed to read data"):
+            extractor.extract_audio(
+                "s3://b/in.mp4", "b", "transcribe-input/job", max_attempts=3
+            )
+
+        assert mc_mock.create_job.call_count == 3
+
+    def test_retriable_codes_documented(self):
+        # Sanity check that the documented codes are what's wired in.
+        assert RETRIABLE_ERROR_CODES == frozenset({1401, 1402})
 
 
 class TestEndpointDiscovery:

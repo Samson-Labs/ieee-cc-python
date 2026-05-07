@@ -20,6 +20,16 @@ ORCHESTRATOR_FUNCTION = os.environ.get(
     "ORCHESTRATOR_FUNCTION_NAME", "ieee-rc-ai-orchestrator"
 )
 
+# Probe a freshly-copied object end-to-end before invoking downstream services.
+# A 2.4 GB cross-bucket copy can be visible to ListObjects/HeadObject before
+# range reads of the tail (where MP4 moov atoms live) are fully consistent —
+# that race is what trips MediaConvert's demuxer with code 1401 and the
+# video-transcriber's head_object with 404 in the strategic-backfill flow.
+# Linear backoff: 1, 2, 3, 4, 5s (≤15s worst case).
+READBACK_MAX_ATTEMPTS = 5
+READBACK_BACKOFF_SECONDS = 1
+READBACK_PROBE_BYTES = 64 * 1024
+
 # Map manifest media_type strings to MIME types for .meta.json.
 MEDIA_TYPE_MAP = {
     "PDF": "application/pdf",
@@ -140,7 +150,69 @@ class BulkWorker:
             Key=pending_key,
         )
         logger.info("Copied %s -> %s", s3_key, pending_key)
+
+        size = self._wait_for_object_readable(bucket, pending_key)
+        logger.info("Confirmed %s readable (%d bytes)", pending_key, size)
         return pending_key
+
+    def _wait_for_object_readable(self, bucket: str, key: str) -> int:
+        """Probe head + tail bytes of a just-copied object until consistent.
+
+        S3 strong read-after-write consistency makes the object metadata
+        visible immediately, but for large multi-GB copies the tail-byte
+        read pattern (which MP4 demuxers and video transcribers exercise)
+        can transiently fail. Probing both ends here catches that before
+        downstream services ever see the file.
+
+        Returns:
+            Object size in bytes.
+
+        Raises:
+            BulkProcessingError: If the object is not fully readable after
+                ``READBACK_MAX_ATTEMPTS`` attempts.
+        """
+        last_exc: Exception | None = None
+        for attempt in range(1, READBACK_MAX_ATTEMPTS + 1):
+            try:
+                head = self._s3.head_object(Bucket=bucket, Key=key)
+                size = head["ContentLength"]
+                if size > 0:
+                    self._read_range(
+                        bucket, key, 0, min(size, READBACK_PROBE_BYTES) - 1
+                    )
+                    if size > READBACK_PROBE_BYTES:
+                        self._read_range(
+                            bucket, key, size - READBACK_PROBE_BYTES, size - 1
+                        )
+                return size
+            except ClientError as exc:
+                last_exc = exc
+                if attempt >= READBACK_MAX_ATTEMPTS:
+                    break
+                backoff = READBACK_BACKOFF_SECONDS * attempt
+                logger.warning(
+                    "Object s3://%s/%s not yet readable (attempt %d/%d): %s; "
+                    "sleeping %ds",
+                    bucket,
+                    key,
+                    attempt,
+                    READBACK_MAX_ATTEMPTS,
+                    exc,
+                    backoff,
+                )
+                time.sleep(backoff)
+
+        raise BulkProcessingError(
+            f"S3 object s3://{bucket}/{key} not readable after "
+            f"{READBACK_MAX_ATTEMPTS} attempts: {last_exc}"
+        )
+
+    def _read_range(self, bucket: str, key: str, start: int, end: int) -> None:
+        """Force-read an inclusive byte range to validate read consistency."""
+        response = self._s3.get_object(
+            Bucket=bucket, Key=key, Range=f"bytes={start}-{end}"
+        )
+        response["Body"].read()
 
     def _create_meta_json(self, bucket: str, item: dict, callback_url: str) -> str:
         """Write the ``.meta.json`` the orchestrator expects."""
