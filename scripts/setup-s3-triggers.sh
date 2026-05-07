@@ -119,6 +119,8 @@ for FN in "${ORCHESTRATOR_FN}" "${IMAGE_GEN_FN}"; do
             --action-names "sqs:SendMessage" \
             --resource-arns "${_DLQ_ARN_PREFLIGHT}" \
             --query 'EvaluationResults[0].EvalDecision' \
+            --region "${AWS_REGION}" \
+            --profile "${AWS_PROFILE}" \
             --output text 2>/dev/null || echo "unknown")
         if [[ "${DECISION}" == "allowed" ]]; then
             echo "  iam ok: ${FN} can sqs:SendMessage on DLQ"
@@ -144,31 +146,40 @@ EB_STATUS=$(aws s3api get-bucket-notification-configuration \
     --query 'EventBridgeConfiguration' \
     --output text 2>/dev/null || echo "None")
 
-if [[ "${EB_STATUS}" == "None" || -z "${EB_STATUS}" ]]; then
-    # Get current notification config and merge EventBridge in
-    CURRENT_NOTIF=$(aws s3api get-bucket-notification-configuration \
-        --bucket "${BUCKET}" \
-        --region "${AWS_REGION}" \
-        --profile "${AWS_PROFILE}" \
-        --output json 2>/dev/null || echo "{}")
+# Always fetch current config so we can:
+#   a) enable EventBridge (if not already on), and
+#   b) remove any direct S3 LambdaFunctionConfigurations for actions/ prefix
+#      that deploy-image-overlay.sh may have created. Without this removal,
+#      every actions/*.json upload would invoke image-generator TWICE
+#      (once via direct S3 notification + once via the EventBridge rule below).
+CURRENT_NOTIF=$(aws s3api get-bucket-notification-configuration \
+    --bucket "${BUCKET}" \
+    --region "${AWS_REGION}" \
+    --profile "${AWS_PROFILE}" \
+    --output json 2>/dev/null || echo "{}")
 
-    # Add EventBridgeConfiguration to existing config
-    MERGED=$(echo "${CURRENT_NOTIF}" | python3 -c "
+MERGED=$(echo "${CURRENT_NOTIF}" | python3 -c "
 import sys, json
 cfg = json.load(sys.stdin)
+# Enable EventBridge
 cfg['EventBridgeConfiguration'] = {}
+# Remove direct Lambda notifications for actions/ prefix to avoid dual-invoke
+cfg['LambdaFunctionConfigurations'] = [
+    n for n in cfg.get('LambdaFunctionConfigurations', [])
+    if not any(
+        f.get('Name', '') == 'prefix' and f.get('Value', '').startswith('actions/')
+        for f in n.get('Filter', {}).get('Key', {}).get('FilterRules', [])
+    )
+]
 print(json.dumps(cfg))
 ")
 
-    aws s3api put-bucket-notification-configuration \
-        --bucket "${BUCKET}" \
-        --notification-configuration "${MERGED}" \
-        --region "${AWS_REGION}" \
-        --profile "${AWS_PROFILE}"
-    echo "  enabled EventBridge on ${BUCKET}"
-else
-    echo "  already enabled: EventBridgeConfiguration present"
-fi
+aws s3api put-bucket-notification-configuration \
+    --bucket "${BUCKET}" \
+    --notification-configuration "${MERGED}" \
+    --region "${AWS_REGION}" \
+    --profile "${AWS_PROFILE}"
+echo "  enabled EventBridge on ${BUCKET} (removed any direct actions/ notifications)"
 
 # ---------------------------------------------------------------
 # 2. Create/update EventBridge rules
@@ -240,7 +251,7 @@ add_permission_idempotent() {
         --profile "${AWS_PROFILE}" \
         --output text 2>&1); then
         echo "  added: ${SID} on ${FN}"
-    elif echo "${ERR}" | grep -q "ResourceConflictException\|already exists"; then
+    elif echo "${ERR}" | grep -Eq "ResourceConflictException|already exists"; then
         echo "  exists: ${SID} on ${FN} (skipped)"
     else
         echo "ERROR: Failed to add permission ${SID} on ${FN}: ${ERR}" >&2
@@ -342,10 +353,12 @@ log "[7/7] Creating/updating CloudWatch alarms..."
 
 ALERTS_ARN="arn:aws:sns:${AWS_REGION}:${ACCOUNT}:${SNS_ALERTS}"
 
-# Lambda errors >= 5 in 5 min
+# Aggregate Lambda errors >= 5 in 5 min (all functions in account/region)
+# No FunctionName dimension — covers orchestrator, image-gen, transcriber,
+# bedrock-inference, dlq-processor, etc. without per-function alarm sprawl.
 aws cloudwatch put-metric-alarm \
-    --alarm-name "ieee-rc-orchestrator-errors${SUFFIX}" \
-    --alarm-description "Orchestrator Lambda errors >= 5 in 5 min (${ENV})" \
+    --alarm-name "ieee-rc-lambda-errors${SUFFIX}" \
+    --alarm-description "Any pipeline Lambda errors >= 5 in 5 min (${ENV})" \
     --metric-name Errors \
     --namespace AWS/Lambda \
     --statistic Sum \
@@ -353,12 +366,11 @@ aws cloudwatch put-metric-alarm \
     --evaluation-periods 1 \
     --threshold 5 \
     --comparison-operator GreaterThanOrEqualToThreshold \
-    --dimensions "Name=FunctionName,Value=${ORCHESTRATOR_FN}" \
     --alarm-actions "${ALERTS_ARN}" \
     --tags "Key=Project,Value=ieee-rc" "Key=Environment,Value=${ENV}" \
     --region "${AWS_REGION}" \
     --profile "${AWS_PROFILE}"
-echo "  upserted: ieee-rc-orchestrator-errors${SUFFIX}"
+echo "  upserted: ieee-rc-lambda-errors${SUFFIX}"
 
 # DLQ message count > 0
 aws cloudwatch put-metric-alarm \

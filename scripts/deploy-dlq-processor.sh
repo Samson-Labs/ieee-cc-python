@@ -244,6 +244,22 @@ create_event_source_mapping() {
     log "Creating SQS event source mapping..."
     SQS_ARN="arn:aws:sqs:${AWS_REGION}:${AWS_ACCOUNT_ID}:${SQS_QUEUE_NAME}"
 
+    # Remove any stale mappings pointing at a different (legacy/shared) queue.
+    # Without this, a Lambda can have one mapping at ieee-rc-processing-dlq
+    # and one at ieee-rc-processing-dlq-dev, defeating per-env isolation.
+    STALE_UUIDS=$(aws lambda list-event-source-mappings \
+        --function-name "${LAMBDA_FUNCTION_NAME}" \
+        --region "${AWS_REGION}" \
+        --query "EventSourceMappings[?EventSourceArn!='${SQS_ARN}' && contains(EventSourceArn,'ieee-rc-processing-dlq')].UUID" \
+        --output text 2>/dev/null || true)
+
+    for UUID in ${STALE_UUIDS}; do
+        log "  Removing stale DLQ mapping ${UUID} (wrong queue)..."
+        aws lambda delete-event-source-mapping \
+            --uuid "${UUID}" \
+            --region "${AWS_REGION}" || true
+    done
+
     EXISTING=$(aws lambda list-event-source-mappings \
         --function-name "${LAMBDA_FUNCTION_NAME}" \
         --event-source-arn "${SQS_ARN}" \
