@@ -18,12 +18,27 @@ from src.common.exceptions import MediaConvertError
 logger = logging.getLogger(__name__)
 
 POLL_INTERVAL_SECONDS = 30
-POLL_TIMEOUT_SECONDS = 600
+# Single-attempt ceiling for MediaConvert audio extraction. Sized so this
+# phase plus the downstream Transcribe poll plus handler overhead fits the
+# Lambda's 900s timeout on a non-retrying happy path. Observed extraction
+# time for a 2.4 GB / 2.5 hr MP4 is ~90s, so 240s is ~2.5× margin.
+POLL_TIMEOUT_SECONDS = 240
 
 MP3_BITRATE = 128_000
 MP3_SAMPLE_RATE = 44_100
 MP3_CHANNELS = 1
 NAME_MODIFIER = "-audio"
+
+# Codes returned by MediaConvert when the source S3 object is reachable but
+# the demuxer cannot reliably stream its bytes — typically transient on
+# freshly-completed cross-bucket copies of large MP4s, where the moov atom
+# read pattern hits S3 read-after-write hiccups. Retrying with a fresh job
+# almost always succeeds.
+#   1401 — Audio input pipeline error: Demuxer: Failed to read data
+#   1402 — Demuxer: Failed to parse (truncated/incomplete reads)
+RETRIABLE_ERROR_CODES = frozenset({1401, 1402})
+DEFAULT_MAX_ATTEMPTS = 3
+RETRY_BACKOFF_SECONDS = 30
 
 
 class AudioExtractor:
@@ -54,43 +69,72 @@ class AudioExtractor:
         source_uri: str,
         output_bucket: str,
         output_key_prefix: str,
+        max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     ) -> str:
         """Submit a MediaConvert job, poll until done, return MP3 S3 URI.
+
+        Retries the job up to ``max_attempts`` times when MediaConvert reports
+        a transient demuxer error (see ``RETRIABLE_ERROR_CODES``). Each retry
+        creates a new job — MediaConvert jobs are immutable once submitted.
 
         Args:
             source_uri: ``s3://bucket/key`` of the source video.
             output_bucket: S3 bucket for the extracted audio.
             output_key_prefix: Key prefix (no trailing slash) under which
                 MediaConvert writes ``{basename}{NAME_MODIFIER}.mp3``.
+            max_attempts: Total job submissions tolerated before bailing.
 
         Returns:
             ``s3://bucket/key`` of the resulting MP3.
 
         Raises:
-            MediaConvertError: If the job fails, is canceled, or polling
-                exceeds POLL_TIMEOUT_SECONDS.
+            MediaConvertError: If the job fails with a non-retriable code,
+                is canceled, polling exceeds POLL_TIMEOUT_SECONDS, or all
+                attempts are exhausted.
         """
         destination = f"s3://{output_bucket}/{output_key_prefix}/"
         job_settings = self._build_job_settings(source_uri, destination)
 
-        logger.info(
-            "Submitting MediaConvert job: source=%s destination=%s",
-            source_uri,
-            destination,
-        )
-        response = self._mc.create_job(
-            Role=self._role_arn,
-            Settings=job_settings,
-            StatusUpdateInterval="SECONDS_30",
-        )
-        job_id = response["Job"]["Id"]
-        logger.info("MediaConvert job %s submitted", job_id)
+        for attempt in range(1, max_attempts + 1):
+            logger.info(
+                "Submitting MediaConvert job (attempt %d/%d): source=%s destination=%s",
+                attempt,
+                max_attempts,
+                source_uri,
+                destination,
+            )
+            response = self._mc.create_job(
+                Role=self._role_arn,
+                Settings=job_settings,
+                StatusUpdateInterval="SECONDS_30",
+            )
+            job_id = response["Job"]["Id"]
+            logger.info("MediaConvert job %s submitted", job_id)
 
-        self._poll_job(job_id)
-        # MediaConvert's GetJob response does not return the output URI for
-        # FILE_GROUP_SETTINGS outputs, so we compute it deterministically:
-        #   {destination}{source_basename_no_ext}{NameModifier}.mp3
-        return self._compute_output_uri(source_uri, destination)
+            try:
+                self._poll_job(job_id)
+                return self._compute_output_uri(source_uri, destination)
+            except MediaConvertError as exc:
+                error_code = exc.details.get("error_code")
+                if attempt < max_attempts and error_code in RETRIABLE_ERROR_CODES:
+                    backoff = RETRY_BACKOFF_SECONDS * attempt
+                    logger.warning(
+                        "MediaConvert attempt %d/%d failed with retriable code %s; "
+                        "sleeping %ds before retry: %s",
+                        attempt,
+                        max_attempts,
+                        error_code,
+                        backoff,
+                        exc,
+                    )
+                    time.sleep(backoff)
+                    continue
+                raise
+
+        # Defensive — the loop either returns or re-raises in every iteration.
+        raise MediaConvertError(
+            f"MediaConvert exhausted {max_attempts} attempts without a terminal result"
+        )
 
     @staticmethod
     def _build_job_settings(source_uri: str, destination: str) -> dict:
@@ -147,11 +191,17 @@ class AudioExtractor:
                 logger.info("MediaConvert job %s complete", job_id)
                 return job
             if status in ("ERROR", "CANCELED"):
-                error_code = job.get("ErrorCode", "Unknown")
+                raw_error_code = job.get("ErrorCode")
                 error_message = job.get("ErrorMessage", "Unknown failure")
+                try:
+                    error_code: int | str | None = int(raw_error_code)
+                except (TypeError, ValueError):
+                    error_code = raw_error_code
                 raise MediaConvertError(
                     f"MediaConvert job {job_id} {status.lower()}: "
-                    f"[{error_code}] {error_message}"
+                    f"[{error_code if error_code is not None else 'Unknown'}] "
+                    f"{error_message}",
+                    details={"error_code": error_code, "job_id": job_id},
                 )
 
             logger.info(

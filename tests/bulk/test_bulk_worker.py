@@ -87,6 +87,14 @@ def worker():
     lambda_mock = MagicMock()
     s3_mock = MagicMock()
     sns_mock = MagicMock()
+
+    # Default S3 mocks for the readback verification step in _copy_to_pending.
+    # Tests exercising readback-failure paths override these explicitly.
+    s3_mock.head_object.return_value = {"ContentLength": 1024}
+    default_body = MagicMock()
+    default_body.read.return_value = b""
+    s3_mock.get_object.return_value = {"Body": default_body}
+
     w = BulkWorker(lambda_client=lambda_mock, s3_client=s3_mock, sns_client=sns_mock)
     return w, lambda_mock, s3_mock, sns_mock
 
@@ -115,6 +123,101 @@ class TestCopyToPending:
         key = w._copy_to_pending("bucket", item)
 
         assert key == "PES/pending/99.mp4"
+
+
+# --- Readback verification (Option B) ---
+
+
+class TestReadbackVerification:
+    """Verify a freshly-copied object is end-to-end readable before
+    invoking the orchestrator. Catches the S3-read-after-copy race
+    that surfaces as MediaConvert demuxer 1401 / orchestrator
+    head_object 404 in the strategic-backfill flow.
+    """
+
+    def test_probes_head_only_for_small_files(self, worker):
+        w, _, s3_mock, _ = worker
+        s3_mock.head_object.return_value = {"ContentLength": 4096}
+        item = _make_item(item_id=1, media_type="PDF", s3_key="PES/archive/p.pdf")
+
+        w._copy_to_pending("bucket", item)
+
+        # Single range read for files <= READBACK_PROBE_BYTES (64 KB).
+        range_calls = [
+            c for c in s3_mock.get_object.call_args_list if "Range" in c.kwargs
+        ]
+        assert len(range_calls) == 1
+        assert range_calls[0].kwargs["Range"] == "bytes=0-4095"
+
+    def test_probes_head_and_tail_for_large_files(self, worker):
+        w, _, s3_mock, _ = worker
+        size = 2_576_270_428  # the 2.4 GB MTTIMSWEB0000.mp4 size from CC3-915
+        s3_mock.head_object.return_value = {"ContentLength": size}
+        item = _make_item(item_id=1, media_type="MP4", s3_key="PES/archive/v.mp4")
+
+        w._copy_to_pending("bucket", item)
+
+        range_calls = [
+            c.kwargs["Range"]
+            for c in s3_mock.get_object.call_args_list
+            if "Range" in c.kwargs
+        ]
+        # Head probe: first 64 KB. Tail probe: last 64 KB (where the moov
+        # atom typically lives in MP4s).
+        assert range_calls == [
+            "bytes=0-65535",
+            f"bytes={size - 65536}-{size - 1}",
+        ]
+
+    def test_skips_range_reads_for_zero_byte_object(self, worker):
+        w, _, s3_mock, _ = worker
+        s3_mock.head_object.return_value = {"ContentLength": 0}
+        item = _make_item(item_id=1, media_type="PDF", s3_key="PES/archive/p.pdf")
+
+        w._copy_to_pending("bucket", item)
+
+        # No Range get_object calls — head_object alone is enough.
+        range_calls = [
+            c for c in s3_mock.get_object.call_args_list if "Range" in c.kwargs
+        ]
+        assert range_calls == []
+
+    @patch("src.bulk.bulk_worker.time.sleep")
+    def test_retries_on_transient_read_failure_then_succeeds(self, mock_sleep, worker):
+        w, _, s3_mock, _ = worker
+        not_found = ClientError(
+            {"Error": {"Code": "NoSuchKey", "Message": "Not found"}}, "HeadObject"
+        )
+        s3_mock.head_object.side_effect = [
+            not_found,
+            not_found,
+            {"ContentLength": 1024},
+        ]
+        body = MagicMock()
+        body.read.return_value = b""
+        s3_mock.get_object.return_value = {"Body": body}
+        item = _make_item(item_id=1, media_type="PDF", s3_key="PES/archive/p.pdf")
+
+        w._copy_to_pending("bucket", item)
+
+        assert s3_mock.head_object.call_count == 3
+        # Linear backoff between failed attempts.
+        assert mock_sleep.call_count == 2
+
+    @patch("src.bulk.bulk_worker.time.sleep")
+    def test_raises_after_exhausted_retries(self, mock_sleep, worker):
+        w, _, s3_mock, _ = worker
+        s3_mock.head_object.side_effect = ClientError(
+            {"Error": {"Code": "NoSuchKey", "Message": "Not found"}}, "HeadObject"
+        )
+        item = _make_item(item_id=1, media_type="PDF", s3_key="PES/archive/p.pdf")
+
+        with pytest.raises(BulkProcessingError, match="not readable after"):
+            w._copy_to_pending("bucket", item)
+
+        # 5 attempts (READBACK_MAX_ATTEMPTS), 4 sleep calls between them.
+        assert s3_mock.head_object.call_count == 5
+        assert mock_sleep.call_count == 4
 
 
 # --- Create meta JSON ---
@@ -340,7 +443,16 @@ class TestCompletionNotification:
     def test_sends_sns_on_completion(self, worker):
         w, lambda_mock, s3_mock, sns_mock = worker
         lambda_mock.invoke.return_value = _orchestrator_success_response()
-        s3_mock.get_object.return_value = _progress_response(completed=9, total=10)
+
+        # Readback's range get_object and progress's get_object share the same
+        # mock; dispatch on Range so the progress read returns fresh bytes
+        # each call instead of seeing an exhausted BytesIO.
+        def get_object_dispatch(**kwargs):
+            if "Range" in kwargs:
+                return {"Body": BytesIO(b"")}
+            return _progress_response(completed=9, total=10)
+
+        s3_mock.get_object.side_effect = get_object_dispatch
         record = _make_sqs_record(total_items=10)
 
         with patch.dict("os.environ", {"COMPLETION_SNS_TOPIC_ARN": "arn:aws:sns:us-east-1:123:topic"}):
