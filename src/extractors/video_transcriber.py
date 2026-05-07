@@ -80,6 +80,9 @@ class VideoTranscriber:
         )
         self._cloudwatch = cloudwatch_client
         self._audio_extractor = audio_extractor
+        self._audio_extraction_enabled = (
+            os.environ.get("ENABLE_AUDIO_EXTRACTION", "true").lower() == "true"
+        )
 
     def transcribe(
         self,
@@ -115,35 +118,35 @@ class VideoTranscriber:
         logger.info("Starting transcription job %s for %s", job_name, media_uri)
 
         # Step 1a: For oversized files, extract audio via MediaConvert so the
-        # downstream Transcribe call stays under the 2 GB service limit.
-        size_bytes = self._s3.head_object(Bucket=bucket, Key=key)["ContentLength"]
-        audio_extraction_enabled = (
-            os.environ.get("ENABLE_AUDIO_EXTRACTION", "true").lower() == "true"
-        )
-        extract_audio = (
-            audio_extraction_enabled and size_bytes > TRANSCRIBE_MAX_BYTES
-        )
+        # downstream Transcribe call stays under the 2 GB service limit. Skip
+        # the size check entirely when the feature flag is off to avoid an
+        # extra S3 head_object roundtrip on the fast path.
+        extract_audio = False
         extracted_audio_key: str | None = None
+        transcribe_uri = media_uri
+        transcribe_format = media_format
 
-        if extract_audio:
-            logger.info(
-                "File size %d > %d, extracting audio via MediaConvert",
-                size_bytes,
-                TRANSCRIBE_MAX_BYTES,
-            )
-            if self._audio_extractor is None:
-                self._audio_extractor = AudioExtractor()
-            audio_uri = self._audio_extractor.extract_audio(
-                source_uri=media_uri,
-                output_bucket=bucket,
-                output_key_prefix=f"transcribe-input/{job_name}",
-            )
-            _, extracted_audio_key = self._parse_s3_uri(audio_uri)
-            transcribe_uri = audio_uri
-            transcribe_format = "mp3"
-        else:
-            transcribe_uri = media_uri
-            transcribe_format = media_format
+        if self._audio_extraction_enabled:
+            size_bytes = self._s3.head_object(
+                Bucket=bucket, Key=key
+            )["ContentLength"]
+            if size_bytes > TRANSCRIBE_MAX_BYTES:
+                logger.info(
+                    "File size %d > %d, extracting audio via MediaConvert",
+                    size_bytes,
+                    TRANSCRIBE_MAX_BYTES,
+                )
+                if self._audio_extractor is None:
+                    self._audio_extractor = AudioExtractor()
+                audio_uri = self._audio_extractor.extract_audio(
+                    source_uri=media_uri,
+                    output_bucket=bucket,
+                    output_key_prefix=f"transcribe-input/{job_name}",
+                )
+                _, extracted_audio_key = self._parse_s3_uri(audio_uri)
+                transcribe_uri = audio_uri
+                transcribe_format = "mp3"
+                extract_audio = True
 
         try:
             # Step 1b: Start transcription job

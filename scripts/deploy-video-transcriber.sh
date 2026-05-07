@@ -201,7 +201,7 @@ create_mediaconvert_role() {
             },
             {
                 \"Effect\": \"Allow\",
-                \"Action\": [\"s3:PutObject\", \"s3:DeleteObject\"],
+                \"Action\": [\"s3:PutObject\"],
                 \"Resource\": \"arn:aws:s3:::${S3_BUCKET_NAME}/transcribe-input/*\"
             }
         ]
