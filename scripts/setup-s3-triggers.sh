@@ -92,7 +92,9 @@ for FN in "${ORCHESTRATOR_FN}" "${IMAGE_GEN_FN}"; do
     if ! aws lambda get-function --function-name "${FN}" \
         --region "${AWS_REGION}" --profile "${AWS_PROFILE}" &>/dev/null; then
         echo "ERROR: Lambda '${FN}' does not exist. Deploy it first." >&2
-        if [[ "${FN}" == "${ORCHESTRATOR_FN}" ]]; then
+        if [[ "${ENV}" == "prod" ]]; then
+            echo "  Prod Lambdas must be deployed before running this script (CC3-851)." >&2
+        elif [[ "${FN}" == "${ORCHESTRATOR_FN}" ]]; then
             echo "  ./scripts/deploy-ai-orchestrator.sh ${ENV}" >&2
         else
             echo "  ./scripts/deploy-image-overlay.sh ${ENV}" >&2

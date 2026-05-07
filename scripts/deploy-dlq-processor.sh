@@ -205,7 +205,7 @@ update_lambda_code() {
     python3 - "${ENV_TMPFILE}" > "${ENV_JSON_FILE}" <<PYEOF
 import json, sys
 with open(sys.argv[1]) as f:
-    existing = json.load(f)
+    existing = json.load(f) or {}
 existing.update({
     "LOG_LEVEL": "INFO",
     "STAGE": "${ENV}",
