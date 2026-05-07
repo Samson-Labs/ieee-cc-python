@@ -32,6 +32,7 @@ ECR_REPO_NAME="ieee-cc-video-transcriber"
 LAMBDA_FUNCTION_NAME="ieee-cc-video-transcriber-${ENV}"
 S3_BUCKET_NAME="${ENV}-ieee-conference-cloud-bulk-uploads"
 LAMBDA_ROLE_NAME="ieee-cc-video-transcriber-${ENV}-role"
+MEDIACONVERT_ROLE_NAME="ieee-cc-mediaconvert-${ENV}-role"
 IMAGE_TAG="latest"
 
 ECR_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO_NAME}"
@@ -96,13 +97,13 @@ create_lambda_role() {
         }]
     }'
 
-    # S3 read/write + Transcribe + Bedrock
+    # S3 read/write/delete + Transcribe + Bedrock + MediaConvert + iam:PassRole
     INLINE_POLICY="{
         \"Version\": \"2012-10-17\",
         \"Statement\": [
             {
                 \"Effect\": \"Allow\",
-                \"Action\": [\"s3:GetObject\", \"s3:PutObject\"],
+                \"Action\": [\"s3:GetObject\", \"s3:PutObject\", \"s3:DeleteObject\"],
                 \"Resource\": \"arn:aws:s3:::${S3_BUCKET_NAME}/*\"
             },
             {
@@ -117,6 +118,25 @@ create_lambda_role() {
                     \"transcribe:GetTranscriptionJob\"
                 ],
                 \"Resource\": \"*\"
+            },
+            {
+                \"Effect\": \"Allow\",
+                \"Action\": [
+                    \"mediaconvert:CreateJob\",
+                    \"mediaconvert:GetJob\",
+                    \"mediaconvert:DescribeEndpoints\"
+                ],
+                \"Resource\": \"*\"
+            },
+            {
+                \"Effect\": \"Allow\",
+                \"Action\": [\"iam:PassRole\"],
+                \"Resource\": \"arn:aws:iam::${AWS_ACCOUNT_ID}:role/${MEDIACONVERT_ROLE_NAME}\",
+                \"Condition\": {
+                    \"StringEquals\": {
+                        \"iam:PassedToService\": \"mediaconvert.amazonaws.com\"
+                    }
+                }
             },
             {
                 \"Effect\": \"Allow\",
@@ -157,16 +177,67 @@ create_lambda_role() {
 }
 
 # ---------------------------------------------------------------
+# 2b. Create MediaConvert service role (idempotent)
+# ---------------------------------------------------------------
+create_mediaconvert_role() {
+    log "Creating IAM role: ${MEDIACONVERT_ROLE_NAME}"
+
+    MC_TRUST_POLICY='{
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Principal": {"Service": "mediaconvert.amazonaws.com"},
+            "Action": "sts:AssumeRole"
+        }]
+    }'
+
+    MC_INLINE_POLICY="{
+        \"Version\": \"2012-10-17\",
+        \"Statement\": [
+            {
+                \"Effect\": \"Allow\",
+                \"Action\": [\"s3:GetObject\"],
+                \"Resource\": \"arn:aws:s3:::${S3_BUCKET_NAME}/*\"
+            },
+            {
+                \"Effect\": \"Allow\",
+                \"Action\": [\"s3:PutObject\", \"s3:DeleteObject\"],
+                \"Resource\": \"arn:aws:s3:::${S3_BUCKET_NAME}/transcribe-input/*\"
+            }
+        ]
+    }"
+
+    aws iam get-role --role-name "${MEDIACONVERT_ROLE_NAME}" >/dev/null 2>&1 \
+    || aws iam create-role \
+        --role-name "${MEDIACONVERT_ROLE_NAME}" \
+        --assume-role-policy-document "${MC_TRUST_POLICY}"
+
+    aws iam put-role-policy \
+        --role-name "${MEDIACONVERT_ROLE_NAME}" \
+        --policy-name "S3TranscribeInputAccess" \
+        --policy-document "${MC_INLINE_POLICY}"
+}
+
+# ---------------------------------------------------------------
 # 3. Create or update Lambda function
 # ---------------------------------------------------------------
 create_lambda() {
     log "Creating Lambda function: ${LAMBDA_FUNCTION_NAME}"
     ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/${LAMBDA_ROLE_NAME}"
+    MEDIACONVERT_ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/${MEDIACONVERT_ROLE_NAME}"
+    MEDIACONVERT_ENDPOINT="$(aws mediaconvert describe-endpoints \
+        --region "${AWS_REGION}" --query 'Endpoints[0].Url' --output text)"
+
+    LAMBDA_ENV_VARS="Variables={LOG_LEVEL=INFO,STAGE=${ENV},CLEANUP_MODEL_ID=us.anthropic.claude-3-5-haiku-20241022-v1:0,ENABLE_AUDIO_EXTRACTION=true,MEDIACONVERT_ENDPOINT=${MEDIACONVERT_ENDPOINT},MEDIACONVERT_ROLE_ARN=${MEDIACONVERT_ROLE_ARN}}"
 
     if aws lambda get-function --function-name "${LAMBDA_FUNCTION_NAME}" \
         --region "${AWS_REGION}" >/dev/null 2>&1; then
-        log "Lambda already exists — updating code..."
+        log "Lambda already exists — updating code + environment..."
         update_lambda_code
+        aws lambda update-function-configuration \
+            --function-name "${LAMBDA_FUNCTION_NAME}" \
+            --region "${AWS_REGION}" \
+            --environment "${LAMBDA_ENV_VARS}"
     else
         log "Waiting for IAM role propagation..."
         aws iam wait role-exists --role-name "${LAMBDA_ROLE_NAME}"
@@ -180,7 +251,7 @@ create_lambda() {
             --memory-size 512 \
             --timeout 900 \
             --architectures x86_64 \
-            --environment "Variables={LOG_LEVEL=INFO,STAGE=${ENV},CLEANUP_MODEL_ID=us.anthropic.claude-3-5-haiku-20241022-v1:0}"
+            --environment "${LAMBDA_ENV_VARS}"
 
         aws lambda wait function-active-v2 \
             --function-name "${LAMBDA_FUNCTION_NAME}" \
@@ -214,6 +285,7 @@ fi
 
 log "Full deployment starting (env=${ENV})..."
 create_ecr_repo
+create_mediaconvert_role
 create_lambda_role
 build_and_push
 create_lambda
