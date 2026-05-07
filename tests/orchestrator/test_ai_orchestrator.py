@@ -484,7 +484,7 @@ class TestWebhook:
         assert payload["request_id"] == 42
         assert payload["ou"] == "PES"
         assert payload["status"] == "success"
-        assert "data" in payload
+        assert "metadata" in payload
         assert "completed_at" in payload
 
     @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
@@ -877,7 +877,7 @@ class TestInputTextAsAbstract:
         orch.process("bucket", "PES/pending/ITEM-100.pdf")
 
         payload = mock_send.call_args[0][2]
-        assert payload["data"]["abstract"] == "My custom abstract."
+        assert payload["metadata"]["abstract"] == "My custom abstract."
         assert "abstract" not in payload["generated_fields"]
 
     @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
@@ -1012,6 +1012,116 @@ class TestCC858Validation:
 
         with pytest.raises(ValueError, match="non-empty"):
             orch.process("bucket", "PES/pending/ITEM-100.pdf")
+
+
+# ---------------------------------------------------------------
+# Webhook contract (CC3-931)
+#
+# Drupal's AiWebhookController originally read the AI fields from
+# `metadata`, while this orchestrator was emitting them under `data`.
+# 438 successful Bedrock outputs in the CC3-772 backfill were silently
+# dropped because Drupal returned 200 with `updated_fields=[
+# "field_ai_processed"]` — no AI fields applied. These tests pin the
+# request shape (key = "metadata") and the response sanity check
+# (empty / marker-only updated_fields → contract failure → DLQ).
+# ---------------------------------------------------------------
+
+class TestWebhookContract:
+    @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
+    def test_payload_uses_metadata_key_with_bedrock_fields(self, mock_send, orchestrator):
+        orch, s3, lam = orchestrator
+        meta = _make_meta(ai_enabled=True, callback_url="https://drupal.example.com/hook")
+        s3.get_object.return_value = _s3_get_object_response(meta)
+
+        bedrock_body = {
+            "abstract": "An IEEE paper about X.",
+            "keywords": ["alpha", "beta"],
+            "learning_level": "Expert",
+            "intended_audience": "Seasoned Engineering Professional",
+            "category": "Research",
+        }
+        lam.invoke.side_effect = [
+            _lambda_invoke_response(200, {"text": "extracted", "page_count": 5}),
+            _lambda_invoke_response(200, bedrock_body),
+        ]
+
+        orch.process("bucket", "PES/pending/STD-12345.pdf")
+
+        payload = mock_send.call_args[0][2]
+        # Bedrock output is keyed under "metadata" (matches Drupal's
+        # AiWebhookController spec); "data" is no longer emitted.
+        assert "metadata" in payload
+        assert "data" not in payload
+        assert payload["metadata"]["abstract"] == "An IEEE paper about X."
+        assert payload["metadata"]["keywords"] == ["alpha", "beta"]
+        assert payload["metadata"]["learning_level"] == "Expert"
+        assert payload["metadata"]["category"] == "Research"
+        assert sorted(payload["generated_fields"]) == [
+            "abstract", "category", "intended_audience", "keywords", "learning_level",
+        ]
+
+    @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
+    def test_response_validator_passed_to_sender(self, mock_send, orchestrator):
+        orch, s3, lam = orchestrator
+        meta = _make_meta(ai_enabled=True, callback_url="https://drupal.example.com/hook")
+        s3.get_object.return_value = _s3_get_object_response(meta)
+        lam.invoke.side_effect = [
+            _lambda_invoke_response(200, {"text": "extracted", "page_count": 5}),
+            _lambda_invoke_response(200, {"abstract": "a", "keywords": []}),
+        ]
+
+        orch.process("bucket", "PES/pending/STD-12345.pdf")
+
+        validator = mock_send.call_args.kwargs.get("response_validator")
+        assert validator is not None
+
+        # Healthy ack — at least one applied field beyond the marker.
+        ok, _ = validator({"status": "ok", "updated_fields": ["body", "field_ai_processed"]})
+        assert ok is True
+
+        # Empty updated_fields → contract failure (silent drop pattern).
+        bad, reason = validator({"status": "ok", "updated_fields": []})
+        assert bad is False
+        assert "empty" in reason.lower()
+
+        # Only the marker → contract failure (CC3-772 incident shape).
+        bad, reason = validator({"status": "ok", "updated_fields": ["field_ai_processed"]})
+        assert bad is False
+        assert "field_ai_processed" in reason
+
+        # Missing key → contract failure.
+        bad, _ = validator({"status": "ok"})
+        assert bad is False
+
+        # Non-dict body → contract failure.
+        bad, _ = validator(None)
+        assert bad is False
+
+    @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
+    def test_validator_skips_check_when_no_fields_generated(self, mock_send, orchestrator):
+        """When Bedrock was skipped (no extracted text), there are no AI fields
+        to apply and an ack with no updated_fields is acceptable.
+        """
+        orch, s3, lam = orchestrator
+        meta = _make_meta(ai_enabled=True, callback_url="https://drupal.example.com/hook")
+        s3.get_object.return_value = _s3_get_object_response(meta)
+        # Empty extracted text → orchestrator skips Bedrock → generated_fields=[]
+        lam.invoke.side_effect = [
+            _lambda_invoke_response(200, {"text": "", "page_count": 0}),
+        ]
+
+        orch.process("bucket", "PES/pending/STD-12345.pdf")
+
+        payload = mock_send.call_args[0][2]
+        assert payload["generated_fields"] == []
+
+        validator = mock_send.call_args.kwargs["response_validator"]
+        # With nothing generated, the controller correctly applies nothing —
+        # both empty and marker-only acks must pass.
+        ok, _ = validator({"updated_fields": []})
+        assert ok is True
+        ok, _ = validator({"updated_fields": ["field_ai_processed"]})
+        assert ok is True
 
 
 # ---------------------------------------------------------------
