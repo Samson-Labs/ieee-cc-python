@@ -10,16 +10,15 @@
 #   ./scripts/deploy-dlq-processor.sh <env>            # first-time setup + deploy
 #   ./scripts/deploy-dlq-processor.sh <env> update     # rebuild + update Lambda code only
 #
-#   <env> = dev | staging   (prod naming handled separately under CC3-851)
+#   <env> = dev | staging | prod
 #
 set -euo pipefail
 
 ENV="${1:-}"
 case "${ENV}" in
-    dev|staging) ;;
+    dev|staging|prod) ;;
     *)
-        echo "Usage: $0 <env> [update]   # env = dev | staging" >&2
-        echo "       (prod naming is part of CC3-851; not accepted here)" >&2
+        echo "Usage: $0 <env> [update]   # env = dev | staging | prod" >&2
         exit 1
         ;;
 esac
@@ -30,14 +29,17 @@ export AWS_PROFILE AWS_REGION
 
 AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
 
+# Prod uses no suffix (account naming convention); dev/staging use -${ENV}
+SUFFIX=$([[ "${ENV}" == "prod" ]] && echo "" || echo "-${ENV}")
+
 ECR_REPO_NAME="ieee-rc-dlq-processor"
-LAMBDA_FUNCTION_NAME="ieee-rc-dlq-processor-${ENV}"
-S3_BUCKET_NAME="${ENV}-ieee-conference-cloud-bulk-uploads"
-LAMBDA_ROLE_NAME="ieee-rc-dlq-processor-${ENV}-role"
-SQS_QUEUE_NAME="ieee-rc-processing-dlq-${ENV}"
-ORCHESTRATOR_FUNCTION_NAME="ieee-rc-ai-orchestrator-${ENV}"
+LAMBDA_FUNCTION_NAME="ieee-rc-dlq-processor${SUFFIX}"
+S3_BUCKET_NAME=$([[ "${ENV}" == "prod" ]] && echo "ieee-conference-cloud-bulk-uploads" || echo "${ENV}-ieee-conference-cloud-bulk-uploads")
+LAMBDA_ROLE_NAME="ieee-rc-dlq-processor${SUFFIX}-role"
+SQS_QUEUE_NAME="ieee-rc-processing-dlq${SUFFIX}"
+ORCHESTRATOR_FUNCTION_NAME="ieee-rc-ai-orchestrator${SUFFIX}"
 # Must match the topic provisioned by setup-s3-triggers.sh
-SNS_TOPIC_NAME="ieee-rc-processing-alerts-${ENV}"
+SNS_TOPIC_NAME="ieee-rc-processing-alerts${SUFFIX}"
 SNS_TOPIC_ARN="arn:aws:sns:${AWS_REGION}:${AWS_ACCOUNT_ID}:${SNS_TOPIC_NAME}"
 IMAGE_TAG="latest"
 
