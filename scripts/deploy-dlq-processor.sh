@@ -10,16 +10,15 @@
 #   ./scripts/deploy-dlq-processor.sh <env>            # first-time setup + deploy
 #   ./scripts/deploy-dlq-processor.sh <env> update     # rebuild + update Lambda code only
 #
-#   <env> = dev | staging   (prod naming handled separately under CC3-851)
+#   <env> = dev | staging | prod
 #
 set -euo pipefail
 
 ENV="${1:-}"
 case "${ENV}" in
-    dev|staging) ;;
+    dev|staging|prod) ;;
     *)
-        echo "Usage: $0 <env> [update]   # env = dev | staging" >&2
-        echo "       (prod naming is part of CC3-851; not accepted here)" >&2
+        echo "Usage: $0 <env> [update]   # env = dev | staging | prod" >&2
         exit 1
         ;;
 esac
@@ -30,15 +29,18 @@ export AWS_PROFILE AWS_REGION
 
 AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
 
+# Prod uses no suffix (account naming convention); dev/staging use -${ENV}
+SUFFIX=$([[ "${ENV}" == "prod" ]] && echo "" || echo "-${ENV}")
+
 ECR_REPO_NAME="ieee-rc-dlq-processor"
-LAMBDA_FUNCTION_NAME="ieee-rc-dlq-processor-${ENV}"
-S3_BUCKET_NAME="${ENV}-ieee-conference-cloud-bulk-uploads"
-LAMBDA_ROLE_NAME="ieee-rc-dlq-processor-${ENV}-role"
-# DLQ + SNS topic remain shared (unsuffixed) — out of scope for CC3-886, and
-# create_event_source_mapping requires the queue to already exist.
-SQS_QUEUE_NAME="ieee-rc-processing-dlq"
-ORCHESTRATOR_FUNCTION_NAME="ieee-rc-ai-orchestrator-${ENV}"
-SNS_TOPIC_NAME="ieee-rc-processing-failures"
+LAMBDA_FUNCTION_NAME="ieee-rc-dlq-processor${SUFFIX}"
+S3_BUCKET_NAME=$([[ "${ENV}" == "prod" ]] && echo "ieee-conference-cloud-bulk-uploads" || echo "${ENV}-ieee-conference-cloud-bulk-uploads")
+LAMBDA_ROLE_NAME="ieee-rc-dlq-processor${SUFFIX}-role"
+SQS_QUEUE_NAME="ieee-rc-processing-dlq${SUFFIX}"
+ORCHESTRATOR_FUNCTION_NAME="ieee-rc-ai-orchestrator${SUFFIX}"
+# Must match the topic provisioned by setup-s3-triggers.sh
+SNS_TOPIC_NAME="ieee-rc-processing-alerts${SUFFIX}"
+SNS_TOPIC_ARN="arn:aws:sns:${AWS_REGION}:${AWS_ACCOUNT_ID}:${SNS_TOPIC_NAME}"
 IMAGE_TAG="latest"
 
 ECR_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO_NAME}"
@@ -171,7 +173,7 @@ create_lambda() {
             --memory-size 256 \
             --timeout 60 \
             --architectures x86_64 \
-            --environment "Variables={LOG_LEVEL=INFO,STAGE=${ENV},ORCHESTRATOR_FUNCTION_NAME=${ORCHESTRATOR_FUNCTION_NAME},ARCHIVE_BUCKET=${S3_BUCKET_NAME}}"
+            --environment "Variables={LOG_LEVEL=INFO,STAGE=${ENV},ORCHESTRATOR_FUNCTION_NAME=${ORCHESTRATOR_FUNCTION_NAME},ARCHIVE_BUCKET=${S3_BUCKET_NAME},FAILURES_SNS_TOPIC_ARN=${SNS_TOPIC_ARN}}"
 
         aws lambda wait function-active-v2 \
             --function-name "${LAMBDA_FUNCTION_NAME}" \
@@ -190,14 +192,73 @@ update_lambda_code() {
     aws lambda wait function-updated-v2 \
         --function-name "${LAMBDA_FUNCTION_NAME}" \
         --region "${AWS_REGION}"
+
+    # Merge owned env vars into existing configuration so out-of-band vars are preserved.
+    # Existing vars are written to a temp file to avoid shell quoting / newline issues.
+    ENV_TMPFILE=$(mktemp)
+    aws lambda get-function-configuration \
+        --function-name "${LAMBDA_FUNCTION_NAME}" \
+        --region "${AWS_REGION}" \
+        --query 'Environment.Variables' --output json 2>/dev/null > "${ENV_TMPFILE}" || echo "{}" > "${ENV_TMPFILE}"
+
+    ENV_JSON_FILE=$(mktemp)
+    python3 - "${ENV_TMPFILE}" > "${ENV_JSON_FILE}" <<PYEOF
+import json, sys
+with open(sys.argv[1]) as f:
+    existing = json.load(f) or {}
+existing.update({
+    "LOG_LEVEL": "INFO",
+    "STAGE": "${ENV}",
+    "ORCHESTRATOR_FUNCTION_NAME": "${ORCHESTRATOR_FUNCTION_NAME}",
+    "ARCHIVE_BUCKET": "${S3_BUCKET_NAME}",
+    "FAILURES_SNS_TOPIC_ARN": "${SNS_TOPIC_ARN}",
+})
+print(json.dumps({"Variables": existing}))
+PYEOF
+    aws lambda update-function-configuration \
+        --function-name "${LAMBDA_FUNCTION_NAME}" \
+        --region "${AWS_REGION}" \
+        --environment "file://${ENV_JSON_FILE}"
+    rm -f "${ENV_TMPFILE}" "${ENV_JSON_FILE}"
+
+    aws lambda wait function-updated-v2 \
+        --function-name "${LAMBDA_FUNCTION_NAME}" \
+        --region "${AWS_REGION}"
 }
 
 # ---------------------------------------------------------------
 # 4. Create SQS event source mapping (idempotent)
 # ---------------------------------------------------------------
+verify_sqs_queue_exists() {
+    if ! aws sqs get-queue-url \
+        --queue-name "${SQS_QUEUE_NAME}" \
+        --region "${AWS_REGION}" >/dev/null 2>&1; then
+        echo "ERROR: SQS queue '${SQS_QUEUE_NAME}' does not exist." >&2
+        echo "  Run: ./scripts/setup-s3-triggers.sh ${ENV}" >&2
+        exit 1
+    fi
+    log "SQS queue verified: ${SQS_QUEUE_NAME}"
+}
+
 create_event_source_mapping() {
     log "Creating SQS event source mapping..."
     SQS_ARN="arn:aws:sqs:${AWS_REGION}:${AWS_ACCOUNT_ID}:${SQS_QUEUE_NAME}"
+
+    # Remove any stale mappings pointing at a different (legacy/shared) queue.
+    # Without this, a Lambda can have one mapping at ieee-rc-processing-dlq
+    # and one at ieee-rc-processing-dlq-dev, defeating per-env isolation.
+    STALE_UUIDS=$(aws lambda list-event-source-mappings \
+        --function-name "${LAMBDA_FUNCTION_NAME}" \
+        --region "${AWS_REGION}" \
+        --query "EventSourceMappings[?EventSourceArn!='${SQS_ARN}' && contains(EventSourceArn,'ieee-rc-processing-dlq')].UUID" \
+        --output text 2>/dev/null || true)
+
+    for UUID in ${STALE_UUIDS}; do
+        log "  Removing stale DLQ mapping ${UUID} (wrong queue)..."
+        aws lambda delete-event-source-mapping \
+            --uuid "${UUID}" \
+            --region "${AWS_REGION}" || true
+    done
 
     EXISTING=$(aws lambda list-event-source-mappings \
         --function-name "${LAMBDA_FUNCTION_NAME}" \
@@ -235,6 +296,7 @@ create_ecr_repo
 create_lambda_role
 build_and_push
 create_lambda
+verify_sqs_queue_exists
 create_event_source_mapping
 log "Deployment complete."
 log ""
