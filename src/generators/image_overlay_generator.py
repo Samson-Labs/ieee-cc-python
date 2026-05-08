@@ -12,12 +12,32 @@ import logging
 import os
 import textwrap
 from io import BytesIO
-from typing import TypedDict
+from typing import Literal, TypedDict
 
 import boto3
-from PIL import Image, ImageDraw, ImageFont
+from botocore.exceptions import ClientError
+from PIL import Image, ImageDraw, ImageFont, UnidentifiedImageError
+
+from src.webhook.sender import WebhookSender
 
 logger = logging.getLogger(__name__)
+
+
+class RenderError(Exception):
+    """Raised when Pillow image decode/encode fails during overlay generation.
+
+    Distinguished from generic Exception so the Drupal callback can emit
+    the documented `render_failed` error_code per
+    docs/contracts/image-overlay-callback-v1.json.
+    """
+
+
+# Callback error codes — mirrors docs/contracts/image-overlay-callback-v1.json
+ERR_SOURCE_NOT_FOUND = "source_not_found"
+ERR_DEST_WRITE_FAILED = "dest_write_failed"
+ERR_VALIDATION = "validation_error"
+ERR_RENDER_FAILED = "render_failed"
+ERR_INTERNAL = "internal"
 
 # Layout constants (proportional to image dimensions)
 TITLE_FONT_RATIO = 0.042  # title font size as fraction of image height
@@ -74,19 +94,38 @@ class TriggerPayload(TypedDict, total=False):
 LEGACY_FIELDS = {"sourceBucket", "sourceName", "destBucket", "destName", "overlay"}
 
 
-class GenerationResult(TypedDict):
+class GenerationResult(TypedDict, total=False):
     output_key: str
     thumbnail_key: str
     width: int
     height: int
     format: str
+    bytes: int
+    s3_etag: str
+    dest_bucket: str
+    callback_sent: bool
 
 
 class ImageOverlayGenerator:
-    """Generates product overlay images from trigger JSON files in S3."""
+    """Generates product overlay images from trigger JSON files in S3.
 
-    def __init__(self, s3_client=None):
+    When the trigger JSON carries CC3-906 webhook fields (`callback_url`,
+    `callback_secret_ref`, `request_id`, `item_id`), this class also POSTs
+    an HMAC-signed `image-overlay-callback-v1` payload to Drupal once the
+    job reaches a terminal state (success or failure). Triggers without
+    those fields work unchanged for backward compatibility.
+    """
+
+    def __init__(
+        self,
+        s3_client=None,
+        secrets_client=None,
+        sns_client=None,
+        webhook_sender=None,
+    ):
         self._s3 = s3_client or boto3.client("s3")
+        self._secrets = secrets_client or boto3.client("secretsmanager")
+        self._webhook_sender = webhook_sender or WebhookSender(sns_client=sns_client)
 
     def process_trigger(self, bucket: str, key: str) -> GenerationResult:
         """Process an S3 trigger JSON file end-to-end.
@@ -97,6 +136,10 @@ class ImageOverlayGenerator:
         1. Read the trigger JSON
         2. Detect schema and route accordingly
         3. Generate overlay, write output, delete trigger
+        4. POST callback to Drupal if the trigger carries webhook fields (CC3-906)
+
+        On failure, post an error callback (best-effort) and re-raise so the
+        Lambda runtime sees the original exception for retry/DLQ.
 
         Args:
             bucket: S3 bucket containing the trigger JSON.
@@ -107,12 +150,66 @@ class ImageOverlayGenerator:
         """
         logger.info("Processing trigger s3://%s/%s", bucket, key)
 
-        payload = self._read_trigger(bucket, key)
+        # Read the trigger up front so we have the callback fields available
+        # even if generation fails. The downstream _process_* methods do not
+        # re-fetch — they receive the already-parsed payload.
+        try:
+            payload = self._read_trigger(bucket, key)
+        except (ClientError, json.JSONDecodeError) as exc:
+            # No trigger payload → no callback fields → can't notify Drupal.
+            # Re-raise so the Lambda invocation lands in DLQ.
+            logger.error("Failed to read trigger s3://%s/%s: %s", bucket, key, exc)
+            raise
 
-        if self._is_legacy_payload(payload):
-            return self._process_legacy(payload, bucket, key)
+        correlation = self._correlation_for(payload)
 
-        return self._process_standard(payload, bucket, key)
+        try:
+            if self._is_legacy_payload(payload):
+                result = self._process_legacy(payload, bucket, key)
+            else:
+                result = self._process_standard(payload, bucket, key)
+        except ValueError as exc:
+            self._post_callback(
+                payload, correlation,
+                status="error", error_code=ERR_VALIDATION, error_message=str(exc),
+            )
+            raise
+        except RenderError as exc:
+            self._post_callback(
+                payload, correlation,
+                status="error", error_code=ERR_RENDER_FAILED, error_message=str(exc),
+            )
+            raise
+        except ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code", "")
+            if code in ("NoSuchKey", "NoSuchBucket"):
+                error_code = ERR_SOURCE_NOT_FOUND
+            else:
+                error_code = ERR_DEST_WRITE_FAILED
+            self._post_callback(
+                payload, correlation,
+                status="error", error_code=error_code, error_message=str(exc),
+            )
+            raise
+        except Exception as exc:
+            self._post_callback(
+                payload, correlation,
+                status="error", error_code=ERR_INTERNAL, error_message=str(exc),
+            )
+            raise
+
+        callback_sent = self._post_callback(
+            payload, correlation,
+            status="complete",
+            dest_bucket=result.get("dest_bucket", ""),
+            dest_key=result.get("output_key", ""),
+            bytes_=result.get("bytes", 0),
+            s3_etag=result.get("s3_etag", ""),
+            width=result.get("width", 0),
+            height=result.get("height", 0),
+        )
+        result["callback_sent"] = callback_sent
+        return result
 
     def _process_standard(
         self, payload: dict, trigger_bucket: str, trigger_key: str
@@ -129,7 +226,10 @@ class ImageOverlayGenerator:
 
         bg_key = f"backgrounds/{payload['background_source']}.jpg"
         bg_bytes = self._download(config["source_bucket"], bg_key)
-        background = Image.open(BytesIO(bg_bytes)).convert("RGBA")
+        try:
+            background = Image.open(BytesIO(bg_bytes)).convert("RGBA")
+        except (UnidentifiedImageError, OSError) as exc:
+            raise RenderError(f"Failed to open background image: {exc}") from exc
 
         overlay = self.generate_overlay(
             background=background,
@@ -142,7 +242,9 @@ class ImageOverlayGenerator:
             f"{config['public_path']}/{payload['product_part_number']}.{output_format}"
         )
         image_bytes = self._encode_image(overlay, output_format, output_quality)
-        self._upload(config["dest_bucket"], output_key, image_bytes, output_format)
+        s3_etag = self._upload(
+            config["dest_bucket"], output_key, image_bytes, output_format
+        )
         logger.info(
             "Wrote overlay to s3://%s/%s", config["dest_bucket"], output_key
         )
@@ -175,6 +277,9 @@ class ImageOverlayGenerator:
             width=overlay.width,
             height=overlay.height,
             format=output_format,
+            bytes=len(image_bytes),
+            s3_etag=s3_etag,
+            dest_bucket=config["dest_bucket"],
         )
 
     def _process_legacy(
@@ -212,7 +317,10 @@ class ImageOverlayGenerator:
 
         # Load background image
         bg_bytes = self._download(source_bucket, source_name)
-        background = Image.open(BytesIO(bg_bytes)).convert("RGBA")
+        try:
+            background = Image.open(BytesIO(bg_bytes)).convert("RGBA")
+        except (UnidentifiedImageError, OSError) as exc:
+            raise RenderError(f"Failed to open background image: {exc}") from exc
 
         # Extract text and styling from overlay specs
         overlay = self.generate_legacy_overlay(
@@ -228,7 +336,7 @@ class ImageOverlayGenerator:
 
         # Write output image
         image_bytes = self._encode_image(overlay, output_format, output_quality)
-        self._upload(dest_bucket, dest_name, image_bytes, output_format)
+        s3_etag = self._upload(dest_bucket, dest_name, image_bytes, output_format)
         logger.info("Wrote overlay to s3://%s/%s", dest_bucket, dest_name)
 
         # Delete trigger JSON on success
@@ -241,6 +349,9 @@ class ImageOverlayGenerator:
             width=overlay.width,
             height=overlay.height,
             format=output_format,
+            bytes=len(image_bytes),
+            s3_etag=s3_etag,
+            dest_bucket=dest_bucket,
         )
 
     def generate_overlay(
@@ -445,14 +556,20 @@ class ImageOverlayGenerator:
 
     def _upload(
         self, bucket: str, key: str, data: bytes, output_format: str
-    ) -> None:
+    ) -> str:
+        """Upload bytes to S3 and return the dest object's ETag.
+
+        ETag is needed for the CC3-906 completion callback payload so Drupal
+        can store it in media_metadata for audit.
+        """
         content_type = "image/png" if output_format == "png" else "image/jpeg"
-        self._s3.put_object(
+        resp = self._s3.put_object(
             Bucket=bucket,
             Key=key,
             Body=data,
             ContentType=content_type,
         )
+        return resp.get("ETag", "")
 
     @staticmethod
     def _encode_image(img: Image.Image, fmt: str, quality: int) -> bytes:
@@ -464,8 +581,133 @@ class ImageOverlayGenerator:
         save_kwargs = {"format": save_format}
         if save_format == "JPEG":
             save_kwargs["quality"] = quality
-        img.save(buf, **save_kwargs)
+        try:
+            img.save(buf, **save_kwargs)
+        except (OSError, ValueError) as exc:
+            raise RenderError(f"Failed to encode {save_format}: {exc}") from exc
         return buf.getvalue()
+
+    # ------------------------------------------------------------------
+    # CC3-906 — Drupal callback
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _correlation_for(payload: dict) -> str:
+        """Build a logging correlation tag from the trigger payload."""
+        request_id = payload.get("request_id", "")
+        item_id = payload.get("item_id", "")
+        if request_id and item_id:
+            return f"[{request_id}:{item_id}]"
+        if item_id:
+            return f"[{item_id}]"
+        return ""
+
+    def _post_callback(
+        self,
+        trigger: dict,
+        correlation: str,
+        *,
+        status: Literal["complete", "error"],
+        error_code: str | None = None,
+        error_message: str | None = None,
+        dest_bucket: str = "",
+        dest_key: str = "",
+        bytes_: int = 0,
+        s3_etag: str = "",
+        width: int = 0,
+        height: int = 0,
+    ) -> bool:
+        """POST the image-overlay-callback-v1 payload to the trigger's callback_url.
+
+        Returns True if the webhook was delivered (2xx); False on permanent
+        failure or when the trigger doesn't carry callback fields (no-op).
+        Webhook failure is logged but never re-raised — image generation
+        succeeded and shouldn't be reverted because Drupal is unreachable.
+        """
+        callback_url = trigger.get("callback_url")
+        secret_ref = trigger.get("callback_secret_ref")
+        request_id = trigger.get("request_id")
+        item_id = trigger.get("item_id")
+
+        if not (callback_url and secret_ref and request_id and item_id):
+            # Backward-compat: pre-CC3-906 triggers without webhook fields.
+            logger.info(
+                "%s No callback fields in trigger — skipping Drupal webhook",
+                correlation or "[no-correlation]",
+            )
+            return False
+
+        payload: dict = {
+            "item_id": item_id,
+            "request_id": request_id,
+            "operation": "generate_image",
+            "status": status,
+        }
+        if "product_part_number" in trigger:
+            payload["product_part_number"] = trigger["product_part_number"]
+
+        if status == "error":
+            payload["error_code"] = error_code or ERR_INTERNAL
+            payload["error_message"] = error_message or ""
+        else:
+            payload["dest_bucket"] = dest_bucket
+            payload["dest_key"] = dest_key
+            payload["bytes_transferred"] = bytes_
+            payload["s3_etag"] = s3_etag
+            payload["width"] = width
+            payload["height"] = height
+
+        # Best-effort: any unexpected failure here (Secrets Manager outage,
+        # malformed callback_url, transport-layer crash) must NOT propagate.
+        # Image generation has already succeeded; an unreachable Drupal must
+        # not put the invocation into DLQ retry.
+        try:
+            secret = self._resolve_callback_secret(secret_ref, correlation)
+            return self._webhook_sender.send(
+                url=callback_url,
+                secret=secret,
+                payload=payload,
+                correlation=correlation,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "%s Webhook delivery failed unexpectedly: %s",
+                correlation or "[no-correlation]",
+                exc,
+            )
+            return False
+
+    def _resolve_callback_secret(self, secret_ref: str, correlation: str) -> str:
+        """Resolve the HMAC signing secret.
+
+        Tries Secrets Manager first using the trigger-supplied secret_ref;
+        falls back to the DRUPAL_WEBHOOK_SECRET env var. Mirrors the
+        resolution policy in src/transfer/wizard_transfer.py and
+        src/orchestrator/ai_orchestrator.py for consistency across all
+        Drupal-bound webhooks.
+        """
+        try:
+            resp = self._secrets.get_secret_value(SecretId=secret_ref)
+            secret = resp.get("SecretString", "")
+            if secret:
+                return secret
+        except ClientError as exc:
+            logger.info(
+                "%s callback_secret_ref %s not in Secrets Manager (%s); "
+                "falling back to env",
+                correlation,
+                secret_ref,
+                exc.response.get("Error", {}).get("Code", "Unknown"),
+            )
+
+        env_secret = os.environ.get("DRUPAL_WEBHOOK_SECRET", "")
+        if not env_secret:
+            logger.error(
+                "%s No webhook secret available "
+                "(Secrets Manager fetch failed and DRUPAL_WEBHOOK_SECRET unset)",
+                correlation,
+            )
+        return env_secret
 
 
 # ------------------------------------------------------------------

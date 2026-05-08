@@ -37,6 +37,10 @@ IMAGE_TAG="latest"
 ECR_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO_NAME}"
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
+# Optional — passed through to the Lambda environment if set.
+WEBHOOK_FAILURES_SNS_TOPIC_ARN="${WEBHOOK_FAILURES_SNS_TOPIC_ARN:-}"
+DRUPAL_WEBHOOK_SECRET="${DRUPAL_WEBHOOK_SECRET:-}"
+
 export AWS_PROFILE AWS_REGION
 
 # ---------------------------------------------------------------
@@ -96,9 +100,11 @@ create_lambda_role() {
         }]
     }'
 
-    # S3 policy: read from any source bucket (backgrounds), write to any dest
-    # bucket, read+delete trigger JSONs from the trigger bucket
-    S3_POLICY="{
+    # S3 + Secrets Manager + SNS policy:
+    # - S3: read backgrounds, write outputs, manage trigger JSONs
+    # - Secrets Manager: fetch the Drupal callback secret (CC3-906)
+    # - SNS: publish webhook delivery failures to the dead-letter topic
+    INLINE_POLICY="{
         \"Version\": \"2012-10-17\",
         \"Statement\": [
             {
@@ -120,6 +126,16 @@ create_lambda_role() {
                 \"Effect\": \"Allow\",
                 \"Action\": [\"s3:ListBucket\"],
                 \"Resource\": \"arn:aws:s3:::${TRIGGER_BUCKET_NAME}\"
+            },
+            {
+                \"Effect\": \"Allow\",
+                \"Action\": [\"secretsmanager:GetSecretValue\"],
+                \"Resource\": \"arn:aws:secretsmanager:${AWS_REGION}:${AWS_ACCOUNT_ID}:secret:iplr/webhook-secret*\"
+            },
+            {
+                \"Effect\": \"Allow\",
+                \"Action\": [\"sns:Publish\"],
+                \"Resource\": \"arn:aws:sns:${AWS_REGION}:${AWS_ACCOUNT_ID}:ieee-rc-webhook-failures*\"
             }
         ]
     }"
@@ -135,11 +151,19 @@ create_lambda_role() {
         --role-name "${LAMBDA_ROLE_NAME}" \
         --policy-arn "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole" 2>/dev/null || true
 
-    # Put inline S3 policy
+    # Remove the legacy "S3Access" inline policy if it was attached by a prior
+    # deploy. put-role-policy below only overwrites the same-named policy, so
+    # without this the role would carry both the old and new policies until
+    # someone cleaned it up by hand.
+    aws iam delete-role-policy \
+        --role-name "${LAMBDA_ROLE_NAME}" \
+        --policy-name "S3Access" 2>/dev/null || true
+
+    # Put inline policy (idempotent — overwrites previous version)
     aws iam put-role-policy \
         --role-name "${LAMBDA_ROLE_NAME}" \
-        --policy-name "S3Access" \
-        --policy-document "${S3_POLICY}"
+        --policy-name "ImageOverlayAccess" \
+        --policy-document "${INLINE_POLICY}"
 
     ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/${LAMBDA_ROLE_NAME}"
 }
@@ -150,6 +174,15 @@ create_lambda_role() {
 create_lambda() {
     log "Creating Lambda function: ${LAMBDA_FUNCTION_NAME}"
     ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/${LAMBDA_ROLE_NAME}"
+
+    # Build environment-variables map (only include set vars).
+    local env_vars="LOG_LEVEL=INFO,STAGE=${ENV}"
+    if [[ -n "${DRUPAL_WEBHOOK_SECRET}" ]]; then
+        env_vars="${env_vars},DRUPAL_WEBHOOK_SECRET=${DRUPAL_WEBHOOK_SECRET}"
+    fi
+    if [[ -n "${WEBHOOK_FAILURES_SNS_TOPIC_ARN}" ]]; then
+        env_vars="${env_vars},WEBHOOK_FAILURES_SNS_TOPIC_ARN=${WEBHOOK_FAILURES_SNS_TOPIC_ARN}"
+    fi
 
     if aws lambda get-function --function-name "${LAMBDA_FUNCTION_NAME}" \
         --region "${AWS_REGION}" >/dev/null 2>&1; then
@@ -169,7 +202,7 @@ create_lambda() {
             --memory-size 1024 \
             --timeout 60 \
             --architectures x86_64 \
-            --environment "Variables={LOG_LEVEL=INFO,STAGE=${ENV}}"
+            --environment "Variables={${env_vars}}"
 
         aws lambda wait function-active-v2 \
             --function-name "${LAMBDA_FUNCTION_NAME}" \
