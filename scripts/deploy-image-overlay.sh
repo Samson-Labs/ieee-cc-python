@@ -151,6 +151,14 @@ create_lambda_role() {
         --role-name "${LAMBDA_ROLE_NAME}" \
         --policy-arn "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole" 2>/dev/null || true
 
+    # Remove the legacy "S3Access" inline policy if it was attached by a prior
+    # deploy. put-role-policy below only overwrites the same-named policy, so
+    # without this the role would carry both the old and new policies until
+    # someone cleaned it up by hand.
+    aws iam delete-role-policy \
+        --role-name "${LAMBDA_ROLE_NAME}" \
+        --policy-name "S3Access" 2>/dev/null || true
+
     # Put inline policy (idempotent — overwrites previous version)
     aws iam put-role-policy \
         --role-name "${LAMBDA_ROLE_NAME}" \

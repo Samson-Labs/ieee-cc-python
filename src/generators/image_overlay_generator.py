@@ -16,11 +16,21 @@ from typing import Literal, TypedDict
 
 import boto3
 from botocore.exceptions import ClientError
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, UnidentifiedImageError
 
 from src.webhook.sender import WebhookSender
 
 logger = logging.getLogger(__name__)
+
+
+class RenderError(Exception):
+    """Raised when Pillow image decode/encode fails during overlay generation.
+
+    Distinguished from generic Exception so the Drupal callback can emit
+    the documented `render_failed` error_code per
+    docs/contracts/image-overlay-callback-v1.json.
+    """
+
 
 # Callback error codes — mirrors docs/contracts/image-overlay-callback-v1.json
 ERR_SOURCE_NOT_FOUND = "source_not_found"
@@ -164,6 +174,12 @@ class ImageOverlayGenerator:
                 status="error", error_code=ERR_VALIDATION, error_message=str(exc),
             )
             raise
+        except RenderError as exc:
+            self._post_callback(
+                payload, correlation,
+                status="error", error_code=ERR_RENDER_FAILED, error_message=str(exc),
+            )
+            raise
         except ClientError as exc:
             code = exc.response.get("Error", {}).get("Code", "")
             if code in ("NoSuchKey", "NoSuchBucket"):
@@ -210,7 +226,10 @@ class ImageOverlayGenerator:
 
         bg_key = f"backgrounds/{payload['background_source']}.jpg"
         bg_bytes = self._download(config["source_bucket"], bg_key)
-        background = Image.open(BytesIO(bg_bytes)).convert("RGBA")
+        try:
+            background = Image.open(BytesIO(bg_bytes)).convert("RGBA")
+        except (UnidentifiedImageError, OSError) as exc:
+            raise RenderError(f"Failed to open background image: {exc}") from exc
 
         overlay = self.generate_overlay(
             background=background,
@@ -298,7 +317,10 @@ class ImageOverlayGenerator:
 
         # Load background image
         bg_bytes = self._download(source_bucket, source_name)
-        background = Image.open(BytesIO(bg_bytes)).convert("RGBA")
+        try:
+            background = Image.open(BytesIO(bg_bytes)).convert("RGBA")
+        except (UnidentifiedImageError, OSError) as exc:
+            raise RenderError(f"Failed to open background image: {exc}") from exc
 
         # Extract text and styling from overlay specs
         overlay = self.generate_legacy_overlay(
@@ -559,7 +581,10 @@ class ImageOverlayGenerator:
         save_kwargs = {"format": save_format}
         if save_format == "JPEG":
             save_kwargs["quality"] = quality
-        img.save(buf, **save_kwargs)
+        try:
+            img.save(buf, **save_kwargs)
+        except (OSError, ValueError) as exc:
+            raise RenderError(f"Failed to encode {save_format}: {exc}") from exc
         return buf.getvalue()
 
     # ------------------------------------------------------------------
@@ -632,13 +657,25 @@ class ImageOverlayGenerator:
             payload["width"] = width
             payload["height"] = height
 
-        secret = self._resolve_callback_secret(secret_ref, correlation)
-        return self._webhook_sender.send(
-            url=callback_url,
-            secret=secret,
-            payload=payload,
-            correlation=correlation,
-        )
+        # Best-effort: any unexpected failure here (Secrets Manager outage,
+        # malformed callback_url, transport-layer crash) must NOT propagate.
+        # Image generation has already succeeded; an unreachable Drupal must
+        # not put the invocation into DLQ retry.
+        try:
+            secret = self._resolve_callback_secret(secret_ref, correlation)
+            return self._webhook_sender.send(
+                url=callback_url,
+                secret=secret,
+                payload=payload,
+                correlation=correlation,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "%s Webhook delivery failed unexpectedly: %s",
+                correlation or "[no-correlation]",
+                exc,
+            )
+            return False
 
     def _resolve_callback_secret(self, secret_ref: str, correlation: str) -> str:
         """Resolve the HMAC signing secret.

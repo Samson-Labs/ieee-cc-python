@@ -8,11 +8,11 @@ from __future__ import annotations
 
 import json
 from io import BytesIO
-from unittest.mock import MagicMock, call
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 from botocore.exceptions import ClientError
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 
 from src.generators.image_overlay_generator import (
     AUTHOR_MAX_LINES,
@@ -1454,6 +1454,53 @@ class TestCallbackErrorPath:
             gen.process_trigger(bucket="trigger-bucket", key="actions/missing.json")
 
         sender.send.assert_not_called()
+
+    def test_render_failed_posts_error(self):
+        """Pillow can't decode the source bytes → callback must emit
+        error_code=render_failed (the documented contract enum value)."""
+        s3_mock = MagicMock()
+        _mock_s3_for_legacy_trigger(s3_mock, _make_legacy_payload_with_callback())
+        sender = _mock_webhook_sender_returning()
+
+        gen = ImageOverlayGenerator(
+            s3_client=s3_mock,
+            secrets_client=_mock_secrets_returning("s"),
+            webhook_sender=sender,
+        )
+
+        from src.generators.image_overlay_generator import RenderError
+
+        with patch(
+            "src.generators.image_overlay_generator.Image.open",
+            side_effect=UnidentifiedImageError("cannot identify image file"),
+        ):
+            with pytest.raises(RenderError):
+                gen.process_trigger(bucket="trigger-bucket", key="actions/job.json")
+
+        payload = sender.send.call_args[1]["payload"]
+        assert payload["status"] == "error"
+        assert payload["error_code"] == "render_failed"
+
+    def test_unexpected_webhook_send_exception_returns_false(self):
+        """_post_callback's docstring promises webhook failure is never re-raised
+        even on unexpected errors (Secrets Manager outage, malformed URL, etc.).
+        This guards the success-path: image already uploaded — Lambda must not
+        DLQ-retry just because Drupal is unreachable."""
+        s3_mock = MagicMock()
+        _mock_s3_for_legacy_trigger(s3_mock, _make_legacy_payload_with_callback())
+        sender = MagicMock()
+        sender.send.side_effect = RuntimeError("transport blew up")
+
+        gen = ImageOverlayGenerator(
+            s3_client=s3_mock,
+            secrets_client=_mock_secrets_returning("s"),
+            webhook_sender=sender,
+        )
+
+        # Should NOT raise — even though the webhook sender threw an unexpected
+        # exception, _post_callback swallows it and the success path completes.
+        result = gen.process_trigger(bucket="trigger-bucket", key="actions/job.json")
+        assert result["callback_sent"] is False
 
 
 class TestSecretResolution:
