@@ -110,32 +110,33 @@ def _normalize_extraction_method(extraction: dict, correlation: str) -> None:
         extraction["extraction_method"] = "failed"
 
 
-# Drupal sets this flag on every metadata_ready ack regardless of whether any
-# AI fields were actually applied. A response that lists only this field (or
-# none at all) means Drupal reached the controller but dropped every Bedrock
-# value — the silent-drop pattern that hid CC3-772 for 438 nodes.
-_DRUPAL_ACK_MARKER_FIELD = "field_ai_processed"
+def _make_drupal_ack_validator():
+    """Build a validator for Drupal's webhook ack body.
 
+    Drupal's WebhookController returns one of:
+        - {"success": True, "message": "Webhook processed successfully."}
+            on a clean apply
+        - {"success": True, "ignored": True, "message": "..."}
+            when the stale-webhook guard rejects a duplicate/late callback
+            (item state is past awaiting_*)
 
-def _make_drupal_ack_validator(generated_fields: list[str]):
-    """Build a validator that rejects empty/marker-only Drupal acks.
+    `ignored: True` is not strictly an error — it means our delivery raced or
+    duplicated a prior one — but it indicates we should not consider the
+    item's AI fields refreshed. Surface it through the SNS dead-letter so it
+    can be investigated.
 
-    When the orchestrator generated zero AI fields, there is nothing to apply
-    on the Drupal side, so any 2xx is acceptable. Otherwise, the response must
-    include at least one updated field beyond ``field_ai_processed``.
+    Note: the original CC3-931 implementation looked for `updated_fields` /
+    `field_ai_processed`, which Drupal has never emitted; replaced here per
+    CC3-952 forensics.
     """
 
     def _validate(body: dict | None) -> tuple[bool, str]:
-        if not generated_fields:
-            return True, ""
         if not isinstance(body, dict):
             return False, "non-JSON or missing response body"
-        updated = body.get("updated_fields")
-        if not isinstance(updated, list) or not updated:
-            return False, "updated_fields missing or empty"
-        non_marker = [f for f in updated if f != _DRUPAL_ACK_MARKER_FIELD]
-        if not non_marker:
-            return False, f"updated_fields contains only {_DRUPAL_ACK_MARKER_FIELD!r}"
+        if body.get("success") is not True:
+            return False, f"response success={body.get('success')!r}"
+        if body.get("ignored") is True:
+            return False, f"webhook ignored: {body.get('message', '(no message)')}"
         return True, ""
 
     return _validate
@@ -421,7 +422,7 @@ class AIOrchestrator:
                 webhook_secret,
                 payload,
                 correlation,
-                response_validator=_make_drupal_ack_validator(generated_fields),
+                response_validator=_make_drupal_ack_validator(),
             )
 
         # Step 6: Move file from /pending/ to /processed/

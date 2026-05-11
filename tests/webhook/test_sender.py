@@ -185,7 +185,9 @@ class TestResponseValidator:
     @patch("src.webhook.sender.urllib.request.urlopen")
     def test_validator_pass_returns_true(self, mock_urlopen, sender):
         ws, _ = sender
-        mock_urlopen.return_value = _mock_success_response(b'{"updated_fields":["body"]}')
+        mock_urlopen.return_value = _mock_success_response(
+            b'{"success":true,"message":"Webhook processed successfully."}'
+        )
 
         result = ws.send(
             URL, SECRET, PAYLOAD, CORRELATION,
@@ -198,26 +200,26 @@ class TestResponseValidator:
     def test_validator_fail_returns_false_and_alerts(self, mock_urlopen, sender):
         ws, sns = sender
         mock_urlopen.return_value = _mock_success_response(
-            b'{"status":"ok","updated_fields":["field_ai_processed"]}'
+            b'{"success":true,"ignored":true,"message":"Webhook ignored: item is no longer awaiting AI processing."}'
         )
 
         with patch.dict("os.environ", {SNS_TOPIC_ENV: "arn:aws:sns:us-east-1:123:topic"}):
             result = ws.send(
                 URL, SECRET, PAYLOAD, CORRELATION,
-                response_validator=lambda body: (False, "marker-only ack"),
+                response_validator=lambda body: (False, "webhook ignored: stale callback"),
             )
 
         assert result is False
         sns.publish.assert_called_once()
         message = json.loads(sns.publish.call_args[1]["Message"])
         assert "contract validation failed" in message["error"]
-        assert "marker-only ack" in message["error"]
+        assert "ignored" in message["error"]
 
     @patch("src.webhook.sender.urllib.request.urlopen")
     def test_validator_receives_parsed_body(self, mock_urlopen, sender):
         ws, _ = sender
         mock_urlopen.return_value = _mock_success_response(
-            b'{"status":"ok","updated_fields":["body","field_ai_abstract"]}'
+            b'{"success":true,"message":"Webhook processed successfully."}'
         )
 
         seen = {}
@@ -229,8 +231,8 @@ class TestResponseValidator:
         ws.send(URL, SECRET, PAYLOAD, CORRELATION, response_validator=_capture)
 
         assert seen["body"] == {
-            "status": "ok",
-            "updated_fields": ["body", "field_ai_abstract"],
+            "success": True,
+            "message": "Webhook processed successfully.",
         }
 
     @patch("src.webhook.sender.urllib.request.urlopen")
@@ -253,7 +255,7 @@ class TestResponseValidator:
         """Defense-in-depth: a runaway peer response must not exhaust Lambda memory."""
         ws, _ = sender
         resp = _mock_success_response()
-        resp.read = MagicMock(return_value=b'{"updated_fields":["body"]}')
+        resp.read = MagicMock(return_value=b'{"success":true,"message":"ok"}')
         mock_urlopen.return_value = resp
 
         ws.send(
