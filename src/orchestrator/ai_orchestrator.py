@@ -110,8 +110,8 @@ def _normalize_extraction_method(extraction: dict, correlation: str) -> None:
         extraction["extraction_method"] = "failed"
 
 
-def _make_drupal_ack_validator():
-    """Build a validator for Drupal's webhook ack body.
+def _drupal_ack_validator(body: dict | None) -> tuple[bool, str]:
+    """Validator for Drupal's webhook ack body.
 
     Drupal's WebhookController returns one of:
         - {"success": True, "message": "Webhook processed successfully."}
@@ -129,17 +129,13 @@ def _make_drupal_ack_validator():
     `field_ai_processed`, which Drupal has never emitted; replaced here per
     CC3-952 forensics.
     """
-
-    def _validate(body: dict | None) -> tuple[bool, str]:
-        if not isinstance(body, dict):
-            return False, "non-JSON or missing response body"
-        if body.get("success") is not True:
-            return False, f"response success={body.get('success')!r}"
-        if body.get("ignored") is True:
-            return False, f"webhook ignored: {body.get('message', '(no message)')}"
-        return True, ""
-
-    return _validate
+    if not isinstance(body, dict):
+        return False, "non-JSON or missing response body"
+    if body.get("success") is not True:
+        return False, f"response success={body.get('success')!r}"
+    if body.get("ignored") is True:
+        return False, f"webhook ignored: {body.get('message', '(no message)')}"
+    return True, ""
 
 
 class OrchestratorResult(TypedDict):
@@ -422,7 +418,7 @@ class AIOrchestrator:
                 webhook_secret,
                 payload,
                 correlation,
-                response_validator=_make_drupal_ack_validator(),
+                response_validator=_drupal_ack_validator,
             )
 
         # Step 6: Move file from /pending/ to /processed/
