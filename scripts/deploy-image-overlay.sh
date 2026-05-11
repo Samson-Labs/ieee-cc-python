@@ -31,6 +31,7 @@ AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
 ECR_REPO_NAME="ieee-rc-image-generator"
 LAMBDA_FUNCTION_NAME="ieee-rc-image-generator-${ENV}"
 TRIGGER_BUCKET_NAME="${ENV}-ieee-conference-cloud-bulk-uploads"
+SOURCE_BUCKET_NAME="${ENV}-ieee-conference-cloud-uploads"
 LAMBDA_ROLE_NAME="ieee-rc-image-generator-${ENV}-role"
 IMAGE_TAG="latest"
 
@@ -125,7 +126,10 @@ create_lambda_role() {
             {
                 \"Effect\": \"Allow\",
                 \"Action\": [\"s3:ListBucket\"],
-                \"Resource\": \"arn:aws:s3:::${TRIGGER_BUCKET_NAME}\"
+                \"Resource\": [
+                    \"arn:aws:s3:::${TRIGGER_BUCKET_NAME}\",
+                    \"arn:aws:s3:::${SOURCE_BUCKET_NAME}\"
+                ]
             },
             {
                 \"Effect\": \"Allow\",
