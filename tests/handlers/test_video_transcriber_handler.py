@@ -16,6 +16,7 @@ MOCK_RESULT = {
     "duration_seconds": 5025,
     "speaker_count": 2,
     "vtt_s3_key": "transcribe-output/ieee-rc-VID-001-123.vtt",
+    "extraction_method": "transcribe",
 }
 
 
@@ -47,6 +48,7 @@ class TestDirectInvocation:
         assert result["body"]["duration_seconds"] == 5025
         assert result["body"]["speaker_count"] == 2
         assert result["body"]["vtt_s3_key"] == "transcribe-output/ieee-rc-VID-001-123.vtt"
+        assert result["body"]["extraction_method"] == "transcribe"
 
     def test_derives_ou_from_key(self, mock_transcriber):
         event = {

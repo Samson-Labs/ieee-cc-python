@@ -249,7 +249,7 @@ class TestPDFFlow:
         meta = _make_meta(ai_enabled=True, media_type="application/pdf")
         s3.get_object.return_value = _s3_get_object_response(meta)
 
-        extraction_body = {"text": "extracted text", "page_count": 10, "extraction_method": "text"}
+        extraction_body = {"text": "extracted text", "page_count": 10, "extraction_method": "extract_text"}
         bedrock_body = {"abstract": "summary", "keywords": ["ai"], "learning_level": "Expert", "intended_audience": "Seasoned", "category": "Research"}
 
         lam.invoke.side_effect = [
@@ -296,7 +296,7 @@ class TestVideoFlow:
         meta["content"]["filename"] = "lecture.mp4"
         s3.get_object.return_value = _s3_get_object_response(meta)
 
-        transcription_body = {"transcript": "hello world", "duration": "00:10:00", "duration_seconds": 600, "speaker_count": 1}
+        transcription_body = {"transcript": "hello world", "duration": "00:10:00", "duration_seconds": 600, "speaker_count": 1, "extraction_method": "transcribe"}
         bedrock_body = {"abstract": "talk", "keywords": ["video"], "learning_level": "Foundational", "intended_audience": "New", "category": "Tutorial"}
 
         lam.invoke.side_effect = [
@@ -317,7 +317,7 @@ class TestVideoFlow:
         s3.get_object.return_value = _s3_get_object_response(meta)
 
         lam.invoke.side_effect = [
-            _lambda_invoke_response(200, {"transcript": "text", "duration": "00:01:00", "duration_seconds": 60, "speaker_count": 1}),
+            _lambda_invoke_response(200, {"transcript": "text", "duration": "00:01:00", "duration_seconds": 60, "speaker_count": 1, "extraction_method": "transcribe"}),
             _lambda_invoke_response(200, {"abstract": "a", "keywords": [], "learning_level": "Expert", "intended_audience": "Seasoned", "category": "Research"}),
         ]
 
@@ -340,7 +340,7 @@ class TestVideoFlow:
         s3.get_object.return_value = _s3_get_object_response(meta)
 
         lam.invoke.side_effect = [
-            _lambda_invoke_response(200, {"transcript": "text", "duration": "00:01:00", "duration_seconds": 60, "speaker_count": 1}),
+            _lambda_invoke_response(200, {"transcript": "text", "duration": "00:01:00", "duration_seconds": 60, "speaker_count": 1, "extraction_method": "transcribe"}),
             _lambda_invoke_response(200, {"abstract": "a", "keywords": [], "learning_level": "Expert"}),
         ]
 
@@ -354,7 +354,7 @@ class TestVideoFlow:
         s3.get_object.return_value = _s3_get_object_response(meta)
 
         lam.invoke.side_effect = [
-            _lambda_invoke_response(200, {"text": "extracted", "page_count": 5}),
+            _lambda_invoke_response(200, {"text": "extracted", "page_count": 5, "extraction_method": "extract_text"}),
             _lambda_invoke_response(200, {"abstract": "a", "keywords": [], "learning_level": "Expert"}),
         ]
 
@@ -376,7 +376,7 @@ class TestPptxFlow:
         meta["content"]["filename"] = "deck.pptx"
         s3.get_object.return_value = _s3_get_object_response(meta)
 
-        extraction_body = {"text": "slide content", "slide_count": 10, "extraction_method": "text"}
+        extraction_body = {"text": "slide content", "slide_count": 10, "extraction_method": "extract_text"}
         bedrock_body = {"abstract": "deck", "keywords": ["slides"], "learning_level": "Foundational", "intended_audience": "New", "category": "Tutorial"}
 
         lam.invoke.side_effect = [
@@ -398,7 +398,7 @@ class TestPptxFlow:
         s3.get_object.return_value = _s3_get_object_response(meta)
 
         lam.invoke.side_effect = [
-            _lambda_invoke_response(200, {"text": "t", "slide_count": 1, "extraction_method": "text"}),
+            _lambda_invoke_response(200, {"text": "t", "slide_count": 1, "extraction_method": "extract_text"}),
             _lambda_invoke_response(200, {"abstract": "a", "keywords": [], "learning_level": "Expert"}),
         ]
 
@@ -414,7 +414,7 @@ class TestPptxFlow:
         s3.get_object.return_value = _s3_get_object_response(meta)
 
         lam.invoke.side_effect = [
-            _lambda_invoke_response(200, {"text": "t", "slide_count": 2, "extraction_method": "text"}),
+            _lambda_invoke_response(200, {"text": "t", "slide_count": 2, "extraction_method": "extract_text"}),
             _lambda_invoke_response(200, {"abstract": "a", "keywords": [], "learning_level": "Expert"}),
         ]
 
@@ -462,7 +462,7 @@ class TestWebhook:
         meta = _make_meta(ai_enabled=True, callback_url="https://drupal.example.com/hook")
         s3.get_object.return_value = _s3_get_object_response(meta)
 
-        extraction_body = {"text": "text", "page_count": 5, "extraction_method": "text"}
+        extraction_body = {"text": "text", "page_count": 5, "extraction_method": "extract_text"}
         bedrock_body = {"abstract": "a", "keywords": [], "learning_level": "Expert", "intended_audience": "Seasoned", "category": "Research"}
         lam.invoke.side_effect = [
             _lambda_invoke_response(200, extraction_body),
@@ -484,7 +484,7 @@ class TestWebhook:
         assert payload["request_id"] == 42
         assert payload["ou"] == "PES"
         assert payload["status"] == "success"
-        assert "metadata" in payload
+        assert "data" in payload
         assert "completed_at" in payload
 
     @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
@@ -495,7 +495,7 @@ class TestWebhook:
         s3.get_object.return_value = _s3_get_object_response(meta)
 
         lam.invoke.side_effect = [
-            _lambda_invoke_response(200, {"text": "text", "page_count": 5}),
+            _lambda_invoke_response(200, {"text": "text", "page_count": 5, "extraction_method": "extract_text"}),
             _lambda_invoke_response(200, {"abstract": "a", "keywords": [], "learning_level": "Expert"}),
         ]
 
@@ -511,7 +511,7 @@ class TestWebhook:
         meta["content"]["filename"] = "lecture.mp4"
         s3.get_object.return_value = _s3_get_object_response(meta)
 
-        transcription_body = {"transcript": "text", "duration": "00:01:00", "duration_seconds": 60, "speaker_count": 1}
+        transcription_body = {"transcript": "text", "duration": "00:01:00", "duration_seconds": 60, "speaker_count": 1, "extraction_method": "transcribe"}
         bedrock_body = {"abstract": "a", "keywords": [], "learning_level": "Expert", "intended_audience": "Seasoned", "category": "Research"}
         lam.invoke.side_effect = [
             _lambda_invoke_response(200, transcription_body),
@@ -534,6 +534,7 @@ class TestWebhook:
             "transcript": "text", "duration": "00:05:00",
             "duration_seconds": 300, "speaker_count": 1,
             "vtt_s3_key": "transcribe-output/job.vtt",
+            "extraction_method": "transcribe",
         }
         bedrock_body = {"abstract": "a", "keywords": [], "learning_level": "Expert"}
         lam.invoke.side_effect = [
@@ -566,6 +567,7 @@ class TestWebhook:
             "transcript": "text", "duration": "00:05:00",
             "duration_seconds": 300, "speaker_count": 1,
             "vtt_s3_key": "",
+            "extraction_method": "transcribe",
         }
         bedrock_body = {"abstract": "a", "keywords": [], "learning_level": "Expert"}
         lam.invoke.side_effect = [
@@ -590,7 +592,7 @@ class TestWebhook:
         s3.get_object.return_value = _s3_get_object_response(meta)
 
         lam.invoke.side_effect = [
-            _lambda_invoke_response(200, {"text": "text", "page_count": 5}),
+            _lambda_invoke_response(200, {"text": "text", "page_count": 5, "extraction_method": "extract_text"}),
             _lambda_invoke_response(200, {"abstract": "a", "keywords": [], "learning_level": "Expert"}),
         ]
 
@@ -604,7 +606,7 @@ class TestWebhook:
         meta = _make_meta(ai_enabled=True)  # No callback_url
         s3.get_object.return_value = _s3_get_object_response(meta)
 
-        extraction_body = {"text": "text", "page_count": 5, "extraction_method": "text"}
+        extraction_body = {"text": "text", "page_count": 5, "extraction_method": "extract_text"}
         bedrock_body = {"abstract": "a", "keywords": [], "learning_level": "Expert", "intended_audience": "Seasoned", "category": "Research"}
         lam.invoke.side_effect = [
             _lambda_invoke_response(200, extraction_body),
@@ -621,7 +623,7 @@ class TestWebhook:
         meta = _make_meta(ai_enabled=True, callback_url="https://drupal.example.com/hook")
         s3.get_object.return_value = _s3_get_object_response(meta)
 
-        extraction_body = {"text": "text", "page_count": 5, "extraction_method": "text"}
+        extraction_body = {"text": "text", "page_count": 5, "extraction_method": "extract_text"}
         bedrock_body = {"abstract": "a", "keywords": [], "learning_level": "Expert", "intended_audience": "Seasoned", "category": "Research"}
         lam.invoke.side_effect = [
             _lambda_invoke_response(200, extraction_body),
@@ -660,7 +662,7 @@ class TestMetrics:
         meta = _make_meta(ai_enabled=True, media_type="application/pdf")
         s3.get_object.return_value = _s3_get_object_response(meta)
 
-        extraction_body = {"text": "text", "page_count": 5}
+        extraction_body = {"text": "text", "page_count": 5, "extraction_method": "extract_text"}
         bedrock_body = {
             "abstract": "a", "keywords": [], "input_tokens": 1000,
             "output_tokens": 500, "learning_level": "Expert",
@@ -692,7 +694,7 @@ class TestMetrics:
         meta["ou"] = "AESS"
         s3.get_object.return_value = _s3_get_object_response(meta)
 
-        extraction_body = {"text": "text", "page_count": 5}
+        extraction_body = {"text": "text", "page_count": 5, "extraction_method": "extract_text"}
         bedrock_body = {
             "abstract": "a", "keywords": [], "input_tokens": 1000,
             "output_tokens": 500, "learning_level": "Expert",
@@ -743,7 +745,7 @@ class TestMetrics:
         meta = _make_meta(ai_enabled=True, media_type="application/pdf")
         s3.get_object.return_value = _s3_get_object_response(meta)
 
-        extraction_body = {"text": "text", "page_count": 5}
+        extraction_body = {"text": "text", "page_count": 5, "extraction_method": "extract_text"}
         bedrock_body = {
             "abstract": "a", "keywords": [], "input_tokens": 1_000_000,
             "output_tokens": 100_000, "learning_level": "Expert",
@@ -769,6 +771,7 @@ class TestMetrics:
         transcription_body = {
             "transcript": "text", "duration": "00:10:00",
             "duration_seconds": 600, "speaker_count": 1,
+            "extraction_method": "transcribe",
         }
         bedrock_body = {
             "abstract": "a", "keywords": [], "input_tokens": 0,
@@ -845,7 +848,9 @@ class TestInputTextAsSource:
 
         payload = mock_send.call_args[0][2]
         assert payload["signal"] == "metadata_ready"
-        assert payload["extraction"]["source"] == "user_provided"
+        # CC3-952 / D3: input_text path omits the `extraction` block entirely
+        # (signal carries the distinction; Drupal does not need extraction_method).
+        assert "extraction" not in payload
         assert "generated_fields" in payload
 
 
@@ -877,7 +882,7 @@ class TestInputTextAsAbstract:
         orch.process("bucket", "PES/pending/ITEM-100.pdf")
 
         payload = mock_send.call_args[0][2]
-        assert payload["metadata"]["abstract"] == "My custom abstract."
+        assert payload["data"]["abstract"] == "My custom abstract."
         assert "abstract" not in payload["generated_fields"]
 
     @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
@@ -971,7 +976,7 @@ class TestCC858BackwardCompat:
         meta = _make_meta(ai_enabled=True)
         s3.get_object.return_value = _s3_get_object_response(meta)
 
-        extraction_body = {"text": "text", "page_count": 5}
+        extraction_body = {"text": "text", "page_count": 5, "extraction_method": "extract_text"}
         bedrock_body = {"abstract": "a", "keywords": [], "learning_level": "Expert"}
         lam.invoke.side_effect = [
             _lambda_invoke_response(200, extraction_body),
@@ -1028,7 +1033,7 @@ class TestCC858Validation:
 
 class TestWebhookContract:
     @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
-    def test_payload_uses_metadata_key_with_bedrock_fields(self, mock_send, orchestrator):
+    def test_payload_uses_data_key_with_bedrock_fields(self, mock_send, orchestrator):
         orch, s3, lam = orchestrator
         meta = _make_meta(ai_enabled=True, callback_url="https://drupal.example.com/hook")
         s3.get_object.return_value = _s3_get_object_response(meta)
@@ -1041,21 +1046,22 @@ class TestWebhookContract:
             "category": "Research",
         }
         lam.invoke.side_effect = [
-            _lambda_invoke_response(200, {"text": "extracted", "page_count": 5}),
+            _lambda_invoke_response(200, {"text": "extracted", "page_count": 5, "extraction_method": "extract_text"}),
             _lambda_invoke_response(200, bedrock_body),
         ]
 
         orch.process("bucket", "PES/pending/STD-12345.pdf")
 
         payload = mock_send.call_args[0][2]
-        # Bedrock output is keyed under "metadata" (matches Drupal's
-        # AiWebhookController spec); "data" is no longer emitted.
-        assert "metadata" in payload
-        assert "data" not in payload
-        assert payload["metadata"]["abstract"] == "An IEEE paper about X."
-        assert payload["metadata"]["keywords"] == ["alpha", "beta"]
-        assert payload["metadata"]["learning_level"] == "Expert"
-        assert payload["metadata"]["category"] == "Research"
+        # CC3-952: Bedrock output is keyed under "data" — what Drupal's
+        # WebhookController reads. CC3-931 briefly renamed to "metadata"
+        # based on a misread of the Drupal spec; reverted here.
+        assert "data" in payload
+        assert "metadata" not in payload
+        assert payload["data"]["abstract"] == "An IEEE paper about X."
+        assert payload["data"]["keywords"] == ["alpha", "beta"]
+        assert payload["data"]["learning_level"] == "Expert"
+        assert payload["data"]["category"] == "Research"
         assert sorted(payload["generated_fields"]) == [
             "abstract", "category", "intended_audience", "keywords", "learning_level",
         ]
@@ -1066,7 +1072,7 @@ class TestWebhookContract:
         meta = _make_meta(ai_enabled=True, callback_url="https://drupal.example.com/hook")
         s3.get_object.return_value = _s3_get_object_response(meta)
         lam.invoke.side_effect = [
-            _lambda_invoke_response(200, {"text": "extracted", "page_count": 5}),
+            _lambda_invoke_response(200, {"text": "extracted", "page_count": 5, "extraction_method": "extract_text"}),
             _lambda_invoke_response(200, {"abstract": "a", "keywords": []}),
         ]
 
@@ -1107,7 +1113,7 @@ class TestWebhookContract:
         s3.get_object.return_value = _s3_get_object_response(meta)
         # Empty extracted text → orchestrator skips Bedrock → generated_fields=[]
         lam.invoke.side_effect = [
-            _lambda_invoke_response(200, {"text": "", "page_count": 0}),
+            _lambda_invoke_response(200, {"text": "", "page_count": 0, "extraction_method": "failed"}),
         ]
 
         orch.process("bucket", "PES/pending/STD-12345.pdf")
@@ -1122,6 +1128,161 @@ class TestWebhookContract:
         assert ok is True
         ok, _ = validator({"updated_fields": ["field_ai_processed"]})
         assert ok is True
+
+
+# ---------------------------------------------------------------
+# CC3-952: extraction.extraction_method webhook contract
+#
+# Drupal's WebhookController accepts only {transcribe, extract_text, ocr,
+# failed} for extraction.extraction_method. Anything else is reported as
+# `(missing)` and every AI field is silently dropped. These tests pin the
+# contract end-to-end across every extraction path.
+# ---------------------------------------------------------------
+
+
+VALID_EXTRACTION_METHODS = {"transcribe", "extract_text", "ocr", "failed"}
+
+
+class TestExtractionMethodContract:
+    @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
+    def test_pdf_success_emits_extract_text(self, mock_send, orchestrator):
+        orch, s3, lam = orchestrator
+        meta = _make_meta(ai_enabled=True, callback_url="https://drupal.example.com/hook")
+        s3.get_object.return_value = _s3_get_object_response(meta)
+        lam.invoke.side_effect = [
+            _lambda_invoke_response(200, {"text": "extracted", "page_count": 5, "extraction_method": "extract_text"}),
+            _lambda_invoke_response(200, {"abstract": "a", "keywords": [], "learning_level": "Expert"}),
+        ]
+
+        orch.process("bucket", "PES/pending/STD-12345.pdf")
+
+        payload = mock_send.call_args[0][2]
+        assert payload["extraction"]["extraction_method"] == "extract_text"
+        assert payload["extraction"]["extraction_method"] in VALID_EXTRACTION_METHODS
+
+    @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
+    def test_pdf_scanned_emits_ocr(self, mock_send, orchestrator):
+        orch, s3, lam = orchestrator
+        meta = _make_meta(ai_enabled=True, callback_url="https://drupal.example.com/hook")
+        s3.get_object.return_value = _s3_get_object_response(meta)
+        lam.invoke.side_effect = [
+            _lambda_invoke_response(200, {"text": "", "page_count": 10, "extraction_method": "ocr"}),
+        ]
+
+        orch.process("bucket", "PES/pending/STD-12345.pdf")
+
+        payload = mock_send.call_args[0][2]
+        assert payload["extraction"]["extraction_method"] == "ocr"
+
+    @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
+    def test_pdf_failed_emits_failed(self, mock_send, orchestrator):
+        orch, s3, lam = orchestrator
+        meta = _make_meta(ai_enabled=True, callback_url="https://drupal.example.com/hook")
+        s3.get_object.return_value = _s3_get_object_response(meta)
+        lam.invoke.side_effect = [
+            _lambda_invoke_response(200, {"text": "", "page_count": 0, "extraction_method": "failed"}),
+        ]
+
+        orch.process("bucket", "PES/pending/STD-12345.pdf")
+
+        payload = mock_send.call_args[0][2]
+        assert payload["extraction"]["extraction_method"] == "failed"
+
+    @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
+    def test_pptx_success_emits_extract_text(self, mock_send, orchestrator):
+        orch, s3, lam = orchestrator
+        meta = _make_meta(ai_enabled=True, media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation", callback_url="https://drupal.example.com/hook")
+        s3.get_object.return_value = _s3_get_object_response(meta)
+        lam.invoke.side_effect = [
+            _lambda_invoke_response(200, {"text": "slide content", "slide_count": 3, "extraction_method": "extract_text"}),
+            _lambda_invoke_response(200, {"abstract": "a", "keywords": [], "learning_level": "Expert"}),
+        ]
+
+        orch.process("bucket", "PES/pending/STD-12345.pptx")
+
+        payload = mock_send.call_args[0][2]
+        assert payload["extraction"]["extraction_method"] == "extract_text"
+
+    @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
+    def test_pptx_empty_emits_extract_text_with_empty_text(self, mock_send, orchestrator):
+        orch, s3, lam = orchestrator
+        meta = _make_meta(ai_enabled=True, media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation", callback_url="https://drupal.example.com/hook")
+        s3.get_object.return_value = _s3_get_object_response(meta)
+        lam.invoke.side_effect = [
+            _lambda_invoke_response(200, {"text": "", "slide_count": 5, "extraction_method": "extract_text"}),
+        ]
+
+        orch.process("bucket", "PES/pending/STD-12345.pptx")
+
+        payload = mock_send.call_args[0][2]
+        assert payload["extraction"]["extraction_method"] == "extract_text"
+        assert payload["extraction"]["text"] == ""
+
+    @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
+    def test_video_success_emits_transcribe(self, mock_send, orchestrator):
+        orch, s3, lam = orchestrator
+        meta = _make_meta(ai_enabled=True, media_type="video/mp4", callback_url="https://drupal.example.com/hook")
+        meta["content"]["filename"] = "lecture.mp4"
+        s3.get_object.return_value = _s3_get_object_response(meta)
+        lam.invoke.side_effect = [
+            _lambda_invoke_response(200, {"transcript": "hi", "duration": "00:01:00", "duration_seconds": 60, "speaker_count": 1, "extraction_method": "transcribe"}),
+            _lambda_invoke_response(200, {"abstract": "a", "keywords": [], "learning_level": "Expert"}),
+        ]
+
+        orch.process("bucket", "PES/pending/lecture.mp4")
+
+        payload = mock_send.call_args[0][2]
+        assert payload["extraction"]["extraction_method"] == "transcribe"
+
+    @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
+    def test_input_text_path_omits_extraction_block(self, mock_send, orchestrator):
+        orch, s3, lam = orchestrator
+        meta = _make_text_meta(input_text_mode="as_source")
+        s3.get_object.return_value = _s3_get_object_response(meta)
+        lam.invoke.return_value = _lambda_invoke_response(200, {"abstract": "a", "keywords": []})
+
+        orch.process("bucket", "PES/pending/ITEM-100.pdf")
+
+        payload = mock_send.call_args[0][2]
+        assert payload["signal"] == "metadata_ready"
+        assert "extraction" not in payload
+
+    @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
+    def test_normalization_guard_coerces_unknown_to_failed(self, mock_send, orchestrator, caplog):
+        """A new/forgotten extractor leaking a non-canonical value must not
+        silently drop the item — the guard coerces to 'failed' and warns."""
+        orch, s3, lam = orchestrator
+        meta = _make_meta(ai_enabled=True, callback_url="https://drupal.example.com/hook")
+        s3.get_object.return_value = _s3_get_object_response(meta)
+        lam.invoke.side_effect = [
+            _lambda_invoke_response(200, {"text": "x", "page_count": 1, "extraction_method": "bogus_value"}),
+            _lambda_invoke_response(200, {"abstract": "a", "keywords": []}),
+        ]
+
+        with caplog.at_level("WARNING"):
+            orch.process("bucket", "PES/pending/STD-12345.pdf")
+
+        payload = mock_send.call_args[0][2]
+        assert payload["extraction"]["extraction_method"] == "failed"
+        assert any("bogus_value" in rec.message for rec in caplog.records)
+
+    @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
+    def test_normalization_guard_coerces_missing_to_failed(self, mock_send, orchestrator):
+        """An extractor that returns a body without extraction_method (e.g. a
+        legacy or partially-deployed Lambda) is coerced to 'failed' so Drupal
+        gets a valid value rather than `(missing)`."""
+        orch, s3, lam = orchestrator
+        meta = _make_meta(ai_enabled=True, callback_url="https://drupal.example.com/hook")
+        s3.get_object.return_value = _s3_get_object_response(meta)
+        lam.invoke.side_effect = [
+            _lambda_invoke_response(200, {"text": "x", "page_count": 1}),
+            _lambda_invoke_response(200, {"abstract": "a", "keywords": []}),
+        ]
+
+        orch.process("bucket", "PES/pending/STD-12345.pdf")
+
+        payload = mock_send.call_args[0][2]
+        assert payload["extraction"]["extraction_method"] == "failed"
 
 
 # ---------------------------------------------------------------

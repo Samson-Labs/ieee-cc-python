@@ -86,7 +86,7 @@ class TestExtractFromBytes:
         result = extractor.extract_from_bytes(pptx)
 
         assert result["slide_count"] == 3
-        assert result["extraction_method"] == "text"
+        assert result["extraction_method"] == "extract_text"
         assert "Introduction" in result["text"]
         assert "Architecture" in result["text"]
         assert "Conclusion" in result["text"]
@@ -110,18 +110,18 @@ class TestExtractFromBytes:
         result = extractor.extract_from_bytes(pptx)
 
         assert result["slide_count"] == 1
-        assert result["extraction_method"] == "text"
+        assert result["extraction_method"] == "extract_text"
         for token in ("Header A", "Header B", "Cell A1", "Cell B1"):
             assert token in result["text"]
 
-    def test_empty_pptx_returns_empty_method(self):
+    def test_empty_pptx_returns_extract_text(self):
         extractor = PPTXExtractor(s3_client=MagicMock())
         pptx = _make_empty_pptx()
 
         result = extractor.extract_from_bytes(pptx)
 
         assert result["slide_count"] == 1
-        assert result["extraction_method"] == "empty"
+        assert result["extraction_method"] == "extract_text"
         assert result["text"] == ""
 
     def test_corrupted_pptx_returns_failed(self):
@@ -142,7 +142,7 @@ class TestExtractFromBytes:
         result = extractor.extract_from_bytes(pptx)
 
         assert len(result["text"]) == MAX_TEXT_LENGTH
-        assert result["extraction_method"] == "text"
+        assert result["extraction_method"] == "extract_text"
 
 
 # ---------------------------------------------------------------------------
@@ -176,7 +176,7 @@ class TestExtract:
 
         body = json.loads(kwargs["Body"])
         assert body["slideCount"] == 2
-        assert body["extractionMethod"] == "text"
+        assert body["extractionMethod"] == "extract_text"
         assert body["extractedAt"].endswith("Z")
 
     def test_s3_get_object_error_propagates(self):

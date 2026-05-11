@@ -25,7 +25,7 @@ HEADER_FOOTER_MARGIN_RATIO = 0.08  # top/bottom 8% of page treated as header/foo
 class ExtractionResult(TypedDict):
     text: str
     page_count: int
-    extraction_method: str  # "text" | "ocr" | "failed"
+    extraction_method: str  # "extract_text" | "ocr" | "failed"
 
 
 class PDFExtractor:
@@ -137,7 +137,7 @@ class PDFExtractor:
             full_text = full_text[:MAX_TEXT_LENGTH]
 
         return ExtractionResult(
-            text=full_text, page_count=page_count, extraction_method="text"
+            text=full_text, page_count=page_count, extraction_method="extract_text"
         )
 
     def _extract_page_text(self, page: fitz.Page) -> str:

@@ -154,7 +154,7 @@ class TestNormalPDF:
     def test_extracts_text(self, extractor: PDFExtractor, normal_pdf: bytes):
         result = extractor.extract_from_bytes(normal_pdf)
 
-        assert result["extraction_method"] == "text"
+        assert result["extraction_method"] == "extract_text"
         assert result["page_count"] == 2
         assert "Hello World" in result["text"]
         assert "page two" in result["text"]
@@ -207,7 +207,7 @@ class TestLargePDF:
     def test_truncates_to_max_length(self, extractor: PDFExtractor, large_pdf: bytes):
         result = extractor.extract_from_bytes(large_pdf)
 
-        assert result["extraction_method"] == "text"
+        assert result["extraction_method"] == "extract_text"
         assert len(result["text"]) <= MAX_TEXT_LENGTH
         assert result["page_count"] > 0
 
@@ -229,7 +229,7 @@ class TestExtractWithS3:
             product_part_number="STD-12345",
         )
 
-        assert result["extraction_method"] == "text"
+        assert result["extraction_method"] == "extract_text"
         assert result["page_count"] == 2
 
         # Verify S3 download
@@ -246,7 +246,7 @@ class TestExtractWithS3:
 
         metadata = json.loads(put_kwargs["Body"].decode())
         assert metadata["pageCount"] == 2
-        assert metadata["extractionMethod"] == "text"
+        assert metadata["extractionMethod"] == "extract_text"
         assert "extractedAt" in metadata
         assert metadata["extractedAt"].endswith("Z")
 
@@ -283,7 +283,7 @@ class TestMultiColumnPDF:
         pdf = _make_multicolumn_pdf()
         result = extractor.extract_from_bytes(pdf)
 
-        assert result["extraction_method"] == "text"
+        assert result["extraction_method"] == "extract_text"
         assert result["page_count"] == 1
         assert "Left column" in result["text"]
         assert "Right column" in result["text"]
@@ -310,7 +310,7 @@ class TestUnicodePDF:
         pdf = _make_unicode_pdf()
         result = extractor.extract_from_bytes(pdf)
 
-        assert result["extraction_method"] == "text"
+        assert result["extraction_method"] == "extract_text"
         assert result["page_count"] == 2
         assert "Caf\u00e9" in result["text"]
         assert "r\u00e9sum\u00e9" in result["text"]
