@@ -1020,15 +1020,20 @@ class TestCC858Validation:
 
 
 # ---------------------------------------------------------------
-# Webhook contract (CC3-931)
+# Webhook contract (CC3-931 + CC3-952 follow-up)
 #
-# Drupal's AiWebhookController originally read the AI fields from
-# `metadata`, while this orchestrator was emitting them under `data`.
-# 438 successful Bedrock outputs in the CC3-772 backfill were silently
-# dropped because Drupal returned 200 with `updated_fields=[
-# "field_ai_processed"]` — no AI fields applied. These tests pin the
-# request shape (key = "metadata") and the response sanity check
-# (empty / marker-only updated_fields → contract failure → DLQ).
+# Request shape: Bedrock output goes under the `data` key — what Drupal's
+# WebhookController.aiEnrichment() reads at line 286 (`$data['data']`).
+# Verified against the cc3-772 epic and confirmed on master.
+#
+# Response shape: Drupal returns one of two body shapes on 2xx:
+#   - {"success": True, "message": "Webhook processed successfully."}
+#       healthy apply
+#   - {"success": True, "ignored": True, "message": "..."}
+#       stale-webhook guard rejected a duplicate/late callback
+# Drupal has never emitted `updated_fields` or `field_ai_processed`;
+# the original CC3-931 validator looked for them and produced false-
+# positive ERRORs on every webhook. Replaced per CC3-952 forensics.
 # ---------------------------------------------------------------
 
 class TestWebhookContract:
@@ -1081,53 +1086,32 @@ class TestWebhookContract:
         validator = mock_send.call_args.kwargs.get("response_validator")
         assert validator is not None
 
-        # Healthy ack — at least one applied field beyond the marker.
-        ok, _ = validator({"status": "ok", "updated_fields": ["body", "field_ai_processed"]})
+        # Healthy ack — Drupal applied the metadata.
+        ok, _ = validator({"success": True, "message": "Webhook processed successfully."})
         assert ok is True
 
-        # Empty updated_fields → contract failure (silent drop pattern).
-        bad, reason = validator({"status": "ok", "updated_fields": []})
+        # Stale-webhook guard fired (item already past awaiting_*) — surface
+        # via SNS DLQ so it can be investigated.
+        bad, reason = validator(
+            {"success": True, "ignored": True, "message": "Webhook ignored: item is no longer awaiting AI processing."}
+        )
         assert bad is False
-        assert "empty" in reason.lower()
+        assert "ignored" in reason.lower()
 
-        # Only the marker → contract failure (CC3-772 incident shape).
-        bad, reason = validator({"status": "ok", "updated_fields": ["field_ai_processed"]})
+        # success: False — Drupal reached the controller but failed to apply.
+        bad, reason = validator({"success": False, "message": "something went wrong"})
         assert bad is False
-        assert "field_ai_processed" in reason
+        assert "success=" in reason
 
-        # Missing key → contract failure.
-        bad, _ = validator({"status": "ok"})
+        # Missing `success` key entirely — fail closed.
+        bad, _ = validator({"message": "Webhook processed successfully."})
         assert bad is False
 
-        # Non-dict body → contract failure.
+        # Non-dict body — fail closed.
         bad, _ = validator(None)
         assert bad is False
-
-    @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
-    def test_validator_skips_check_when_no_fields_generated(self, mock_send, orchestrator):
-        """When Bedrock was skipped (no extracted text), there are no AI fields
-        to apply and an ack with no updated_fields is acceptable.
-        """
-        orch, s3, lam = orchestrator
-        meta = _make_meta(ai_enabled=True, callback_url="https://drupal.example.com/hook")
-        s3.get_object.return_value = _s3_get_object_response(meta)
-        # Empty extracted text → orchestrator skips Bedrock → generated_fields=[]
-        lam.invoke.side_effect = [
-            _lambda_invoke_response(200, {"text": "", "page_count": 0, "extraction_method": "failed"}),
-        ]
-
-        orch.process("bucket", "PES/pending/STD-12345.pdf")
-
-        payload = mock_send.call_args[0][2]
-        assert payload["generated_fields"] == []
-
-        validator = mock_send.call_args.kwargs["response_validator"]
-        # With nothing generated, the controller correctly applies nothing —
-        # both empty and marker-only acks must pass.
-        ok, _ = validator({"updated_fields": []})
-        assert ok is True
-        ok, _ = validator({"updated_fields": ["field_ai_processed"]})
-        assert ok is True
+        bad, _ = validator("not a dict")
+        assert bad is False
 
 
 # ---------------------------------------------------------------
