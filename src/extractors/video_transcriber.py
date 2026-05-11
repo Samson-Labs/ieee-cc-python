@@ -68,6 +68,7 @@ class TranscriptionResult(TypedDict):
     duration_seconds: int
     speaker_count: int
     vtt_s3_key: str  # S3 key of the generated WebVTT subtitle file
+    extraction_method: str  # always "transcribe" — Drupal webhook contract (CC3-952)
 
 
 class VideoTranscriber:
@@ -233,6 +234,7 @@ class VideoTranscriber:
             duration_seconds=duration_seconds,
             speaker_count=speaker_count,
             vtt_s3_key=vtt_s3_key,
+            extraction_method="transcribe",
         )
 
     def transcribe_from_uri(

@@ -178,7 +178,7 @@ EOF
     "status": "completed",
     "completed_at": "2026-03-20T...",
     "extraction": { ... },
-    "metadata": { ... }
+    "data": { ... }
   }
 }
 ```
@@ -288,8 +288,8 @@ Confirm Drupal expects this payload structure:
   "product_part_number": "STD-12345",
   "status": "completed",
   "completed_at": "2026-03-20T12:00:00Z",
-  "extraction": { "text": "...", "page_count": 10, "extraction_method": "text" },
-  "metadata": { "abstract": "...", "keywords": [...], ... }
+  "extraction": { "text": "...", "page_count": 10, "extraction_method": "extract_text" },
+  "data": { "abstract": "...", "keywords": [...], ... }
 }
 ```
 

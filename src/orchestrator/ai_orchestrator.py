@@ -85,6 +85,31 @@ REQUIRED_CONTENT_FIELDS = {"media_type"}
 
 VALID_INPUT_TEXT_MODES = frozenset({"as_source", "as_abstract"})
 
+# Drupal's WebhookController accepts only these values for
+# extraction.extraction_method. Anything else is reported as `(missing)` and
+# every AI field is silently dropped. CC3-952.
+VALID_EXTRACTION_METHODS = frozenset(
+    {"transcribe", "extract_text", "ocr", "failed"}
+)
+
+
+def _normalize_extraction_method(extraction: dict, correlation: str) -> None:
+    """Coerce extraction['extraction_method'] to a Drupal-accepted value.
+
+    Defense-in-depth: extractors are the source of truth, but if a new
+    extractor or path leaks a non-canonical value, fall back to "failed" so
+    Drupal still classifies the item instead of silently dropping every AI
+    field.
+    """
+    method = extraction.get("extraction_method")
+    if method not in VALID_EXTRACTION_METHODS:
+        logger.warning(
+            "%s Coercing extraction_method=%r to 'failed' (valid: %s)",
+            correlation, method, sorted(VALID_EXTRACTION_METHODS),
+        )
+        extraction["extraction_method"] = "failed"
+
+
 # Drupal sets this flag on every metadata_ready ack regardless of whether any
 # AI fields were actually applied. A response that lists only this field (or
 # none at all) means Drupal reached the controller but dropped every Bedrock
@@ -293,15 +318,16 @@ class AIOrchestrator:
         extraction_result = {}
 
         if input_text:
-            # User-provided text — skip extraction entirely
+            # User-provided text — skip extraction entirely. Webhook signal is
+            # `metadata_ready`; no `extraction` block emitted (CC3-952 / D3).
             extracted_text = input_text
-            extraction_result = {"source": "user_provided", "text": input_text}
+            extraction_result = {}
             logger.info("%s Using user-provided input_text (%s mode)", correlation, input_text_mode)
         elif has_file:
-            # Standard extraction from file
             extraction_result = self._dispatch_extraction(
                 bucket, key, ou, product_part_number, media_type, correlation
             )
+            _normalize_extraction_method(extraction_result, correlation)
             extracted_text = extraction_result.get("text") or extraction_result.get("transcript", "")
         else:
             raise ValueError("Direct invocation requires 'input_text' in meta")
@@ -383,11 +409,12 @@ class AIOrchestrator:
                 "completed_at": datetime.now(timezone.utc)
                 .isoformat()
                 .replace("+00:00", "Z"),
-                "extraction": extraction_result,
-                "metadata": bedrock_result,
+                "data": bedrock_result,
                 "generated_fields": generated_fields,
                 "vtt_s3_key": vtt_key if vtt_key else None,
             }
+            if extraction_result:
+                payload["extraction"] = extraction_result
             webhook_secret = self._resolve_webhook_secret(correlation)
             webhook_sent = self._webhook_sender.send(
                 callback_url,

@@ -21,7 +21,7 @@ result = extractor.extract(
 
 print(result["text"])                # extracted text (up to 180k chars)
 print(result["page_count"])          # number of pages in the PDF
-print(result["extraction_method"])   # "text" | "ocr" | "failed"
+print(result["extraction_method"])   # "extract_text" | "ocr" | "failed"
 ```
 
 For testing or non-S3 usage:
@@ -44,7 +44,7 @@ Written to S3 after each extraction:
 ```json
 {
   "pageCount": 42,
-  "extractionMethod": "text",
+  "extractionMethod": "extract_text",
   "extractedAt": "2026-03-09T14:30:00Z"
 }
 ```
@@ -53,9 +53,11 @@ This is consumed by the MetadataExtractor on the Drupal side.
 
 ## Extraction Methods
 
+Vocabulary matches Drupal's `WebhookController` contract (CC3-952): `{transcribe, extract_text, ocr, failed}`.
+
 | Method | Meaning |
 |--------|---------|
-| `text` | Text was successfully extracted from the PDF |
+| `extract_text` | Text was successfully extracted from the PDF |
 | `ocr` | PDF appears scanned (no text layer). Empty text returned with a warning. OCR is not performed. |
 | `failed` | PDF could not be processed (encrypted, corrupted, or unreadable) |
 
@@ -74,6 +76,7 @@ This is consumed by the MetadataExtractor on the Drupal side.
 | Corrupted/unreadable PDF | Returns `extraction_method: "failed"`, empty text, `page_count: 0` |
 | Encrypted PDF | Returns `extraction_method: "failed"`, empty text, page count preserved |
 | Scanned PDF (no text layer) | Returns `extraction_method: "ocr"`, empty text, page count preserved, warning logged |
+| Successful text extraction | Returns `extraction_method: "extract_text"`, full text, `page_count: N` |
 | PDF exceeding 180k chars | Text truncated, info logged |
 
 ## Dependencies

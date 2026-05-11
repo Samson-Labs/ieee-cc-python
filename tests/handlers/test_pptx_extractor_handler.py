@@ -16,7 +16,7 @@ def mock_extractor():
         mock.extract.return_value = {
             "text": "Extracted slide text.",
             "slide_count": 3,
-            "extraction_method": "text",
+            "extraction_method": "extract_text",
         }
         yield mock
 
@@ -37,7 +37,7 @@ class TestDirectInvocation:
 
         assert result["statusCode"] == 200
         assert result["body"]["slide_count"] == 3
-        assert result["body"]["extraction_method"] == "text"
+        assert result["body"]["extraction_method"] == "extract_text"
         mock_extractor.extract.assert_called_once_with(
             bucket="my-bucket",
             key="ieee/pending/STD-123.pptx",

@@ -26,7 +26,7 @@ MAX_TEXT_LENGTH = 180_000
 class ExtractionResult(TypedDict):
     text: str
     slide_count: int
-    extraction_method: str  # "text" | "empty" | "failed"
+    extraction_method: str  # "extract_text" | "failed"
 
 
 class PPTXExtractor:
@@ -103,7 +103,7 @@ class PPTXExtractor:
                 "No extractable text found across %d slides", slide_count
             )
             return ExtractionResult(
-                text="", slide_count=slide_count, extraction_method="empty"
+                text="", slide_count=slide_count, extraction_method="extract_text"
             )
 
         full_text = "\n\n".join(slide_texts)
@@ -118,7 +118,7 @@ class PPTXExtractor:
             full_text = full_text[:MAX_TEXT_LENGTH]
 
         return ExtractionResult(
-            text=full_text, slide_count=slide_count, extraction_method="text"
+            text=full_text, slide_count=slide_count, extraction_method="extract_text"
         )
 
     # ------------------------------------------------------------------
