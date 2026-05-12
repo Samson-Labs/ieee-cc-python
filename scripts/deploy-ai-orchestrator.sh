@@ -34,16 +34,21 @@ S3_BUCKET_NAME="${ENV}-ieee-conference-cloud-bulk-uploads"
 LAMBDA_ROLE_NAME="ieee-rc-ai-orchestrator-${ENV}-role"
 IMAGE_TAG="latest"
 
-# NOTE: PDF_EXTRACTOR_FN points at the env-suffixed name, but the PDF
-# extractor's deploy script (`scripts/deploy.sh`) still creates the
-# unsuffixed legacy name `ieee-cc-pdf-extractor` (Node-14 migration is
-# tracked separately). Until that catches up, override
-# `PDF_EXTRACTOR_FUNCTION` on the orchestrator Lambda manually for the
-# bridge period, or rename the existing PDF Lambda to `-${ENV}` first.
-PDF_EXTRACTOR_FN="ieee-cc-pdf-extractor-${ENV}"
-VIDEO_TRANSCRIBER_FN="ieee-cc-video-transcriber-${ENV}"
-PPTX_EXTRACTOR_FN="ieee-rc-pptx-extractor-${ENV}"
-BEDROCK_FN="ieee-cc-bedrock-inference-${ENV}"
+# NOTE: extractor Lambdas are still deployed under their legacy
+# unsuffixed names on dev (`ieee-cc-pdf-extractor`, `ieee-cc-video-transcriber`,
+# `ieee-rc-pptx-extractor`, `ieee-cc-bedrock-inference`). CC3-886's env-suffix
+# transition hasn't created the `-${ENV}` variants yet, so the orchestrator's
+# `lambda:InvokeFunction` dispatch must target the unsuffixed names today.
+# Flip these back to `-${ENV}` once the suffixed extractors actually exist.
+PDF_EXTRACTOR_FN="ieee-cc-pdf-extractor"
+VIDEO_TRANSCRIBER_FN="ieee-cc-video-transcriber"
+PPTX_EXTRACTOR_FN="ieee-rc-pptx-extractor"
+BEDROCK_FN="ieee-cc-bedrock-inference"
+
+# Webhook failure topic — already exists on dev as the unsuffixed name and is
+# shared with the image-overlay Lambda's WebhookSender. CC3-975.
+SNS_TOPIC_NAME="ieee-rc-webhook-failures"
+SNS_TOPIC_ARN="arn:aws:sns:${AWS_REGION}:${AWS_ACCOUNT_ID}:${SNS_TOPIC_NAME}"
 
 ECR_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO_NAME}"
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -145,6 +150,11 @@ create_lambda_role() {
                 \"Effect\": \"Allow\",
                 \"Action\": [\"secretsmanager:GetSecretValue\"],
                 \"Resource\": \"arn:aws:secretsmanager:${AWS_REGION}:${AWS_ACCOUNT_ID}:secret:iplr/webhook-secret*\"
+            },
+            {
+                \"Effect\": \"Allow\",
+                \"Action\": [\"sns:Publish\"],
+                \"Resource\": \"${SNS_TOPIC_ARN}\"
             }
         ]
     }"
@@ -190,7 +200,7 @@ create_lambda() {
             --memory-size 512 \
             --timeout 900 \
             --architectures x86_64 \
-            --environment "Variables={LOG_LEVEL=INFO,STAGE=${ENV},PDF_EXTRACTOR_FUNCTION=${PDF_EXTRACTOR_FN},VIDEO_TRANSCRIBER_FUNCTION=${VIDEO_TRANSCRIBER_FN},PPTX_EXTRACTOR_FUNCTION=${PPTX_EXTRACTOR_FN},BEDROCK_FUNCTION=${BEDROCK_FN}}"
+            --environment "Variables={LOG_LEVEL=INFO,STAGE=${ENV},PDF_EXTRACTOR_FUNCTION=${PDF_EXTRACTOR_FN},VIDEO_TRANSCRIBER_FUNCTION=${VIDEO_TRANSCRIBER_FN},PPTX_EXTRACTOR_FUNCTION=${PPTX_EXTRACTOR_FN},BEDROCK_FUNCTION=${BEDROCK_FN},WEBHOOK_FAILURES_SNS_TOPIC_ARN=${SNS_TOPIC_ARN}}"
 
         aws lambda wait function-active-v2 \
             --function-name "${LAMBDA_FUNCTION_NAME}" \
