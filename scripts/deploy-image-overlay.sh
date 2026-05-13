@@ -31,6 +31,8 @@ AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
 ECR_REPO_NAME="ieee-rc-image-generator"
 LAMBDA_FUNCTION_NAME="ieee-rc-image-generator-${ENV}"
 TRIGGER_BUCKET_NAME="${ENV}-ieee-conference-cloud-bulk-uploads"
+# Source bucket: where backgrounds (and overlay sources) are read from.
+# Distinct from TRIGGER_BUCKET (which holds actions/*.json + dest images).
 SOURCE_BUCKET_NAME="${ENV}-ieee-conference-cloud-uploads"
 LAMBDA_ROLE_NAME="ieee-rc-image-generator-${ENV}-role"
 IMAGE_TAG="latest"
@@ -102,7 +104,12 @@ create_lambda_role() {
     }'
 
     # S3 + Secrets Manager + SNS policy:
-    # - S3: read backgrounds, write outputs, manage trigger JSONs
+    # - S3: read backgrounds (source bucket), write outputs + manage trigger
+    #   JSONs (trigger bucket). Tightened from "arn:aws:s3:::*/*" to named
+    #   buckets only so the policy emission doesn't carry an over-broad grant.
+    #   ListBucket covers both buckets — without it on the source bucket,
+    #   GetObject of a missing key returns AccessDenied instead of NoSuchKey,
+    #   which is opaque to the Lambda error mapping (see CC3-920 forensics).
     # - Secrets Manager: fetch the Drupal callback secret (CC3-906)
     # - SNS: publish webhook delivery failures to the dead-letter topic
     INLINE_POLICY="{
@@ -111,12 +118,17 @@ create_lambda_role() {
             {
                 \"Effect\": \"Allow\",
                 \"Action\": [\"s3:GetObject\"],
-                \"Resource\": \"arn:aws:s3:::*/*\"
+                \"Resource\": [
+                    \"arn:aws:s3:::${SOURCE_BUCKET_NAME}/*\",
+                    \"arn:aws:s3:::${TRIGGER_BUCKET_NAME}/*\"
+                ]
             },
             {
                 \"Effect\": \"Allow\",
                 \"Action\": [\"s3:PutObject\"],
-                \"Resource\": \"arn:aws:s3:::*/*\"
+                \"Resource\": [
+                    \"arn:aws:s3:::${TRIGGER_BUCKET_NAME}/*\"
+                ]
             },
             {
                 \"Effect\": \"Allow\",
@@ -127,8 +139,8 @@ create_lambda_role() {
                 \"Effect\": \"Allow\",
                 \"Action\": [\"s3:ListBucket\"],
                 \"Resource\": [
-                    \"arn:aws:s3:::${TRIGGER_BUCKET_NAME}\",
-                    \"arn:aws:s3:::${SOURCE_BUCKET_NAME}\"
+                    \"arn:aws:s3:::${SOURCE_BUCKET_NAME}\",
+                    \"arn:aws:s3:::${TRIGGER_BUCKET_NAME}\"
                 ]
             },
             {
@@ -274,10 +286,54 @@ configure_s3_trigger() {
 # ---------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------
+# ---------------------------------------------------------------
+# Seed default-background placeholders for BOTH trigger schemas:
+#   - Legacy (Drupal today) — `video-image-backgrounds/{ou,conference,
+#     presentation}/default.jpg`, resolved via Drupal's
+#     ImageGenerationService::resolveBackgroundSource priority chain.
+#   - Standard (image_overlay_generator.py:227) — `backgrounds/default.jpg`,
+#     where the Lambda prepends `backgrounds/` to the trigger payload's
+#     `background_source` field. Currently unused by Drupal but seeded so
+#     any future client that uses the standard schema has a fallback.
+# Idempotent — head-object first, only cp if the key is absent. Preserves
+# any admin-supplied prod default. Defined before any usage (both update-
+# mode and full-deploy entrypoints call it).
+# ---------------------------------------------------------------
+seed_default_backgrounds() {
+    log "Seeding default backgrounds on s3://${SOURCE_BUCKET_NAME}/"
+    local placeholder="${PROJECT_ROOT}/assets/default-background.jpg"
+    if [[ ! -f "${placeholder}" ]]; then
+        log "  ERROR: ${placeholder} not found in repo; cannot seed."
+        return 1
+    fi
+    # Keys covering both schemas. Adding a new schema later? Append a key here.
+    local keys=(
+        "video-image-backgrounds/ou/default.jpg"
+        "video-image-backgrounds/conference/default.jpg"
+        "video-image-backgrounds/presentation/default.jpg"
+        "backgrounds/default.jpg"
+    )
+    local key
+    for key in "${keys[@]}"; do
+        if aws s3api head-object --bucket "${SOURCE_BUCKET_NAME}" --key "${key}" \
+            --region "${AWS_REGION}" >/dev/null 2>&1; then
+            log "  s3://${SOURCE_BUCKET_NAME}/${key} — already present, skip"
+        else
+            aws s3 cp "${placeholder}" "s3://${SOURCE_BUCKET_NAME}/${key}" \
+                --region "${AWS_REGION}" --no-progress \
+                --content-type "image/jpeg"
+            log "  s3://${SOURCE_BUCKET_NAME}/${key} — seeded"
+        fi
+    done
+}
+
 if [[ "${2:-}" == "update" ]]; then
     log "Update mode (${ENV}) — rebuilding image and updating Lambda code only."
     build_and_push
     update_lambda_code
+    # Seeding is idempotent and cheap — re-run on update so a deploy
+    # immediately after someone manually deletes a default key restores it.
+    seed_default_backgrounds || true
     log "Done."
     exit 0
 fi
@@ -288,8 +344,10 @@ create_lambda_role
 build_and_push
 create_lambda
 configure_s3_trigger
+seed_default_backgrounds
 log "Deployment complete."
 log ""
 log "  ECR:     ${ECR_URI}:${IMAGE_TAG}"
 log "  Lambda:  ${LAMBDA_FUNCTION_NAME} (1024 MB, 60s timeout)"
 log "  Trigger: s3://${TRIGGER_BUCKET_NAME}/actions/*.json"
+log "  Source:  s3://${SOURCE_BUCKET_NAME}/{video-image-backgrounds,backgrounds}/"
