@@ -187,11 +187,11 @@ create_lambda_role() {
 # ---------------------------------------------------------------
 # 3. Create or update Lambda function
 # ---------------------------------------------------------------
-create_lambda() {
-    log "Creating Lambda function: ${LAMBDA_FUNCTION_NAME}"
-    ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/${LAMBDA_ROLE_NAME}"
-
-    # Build environment-variables map (only include set vars).
+# Builds the comma-separated env-vars value for both create-function and
+# update-function-configuration. Echoed to stdout so callers capture it
+# with $(build_env_vars). Both deploy paths emit the same set so a redeploy
+# never silently strips a previously-set var.
+build_env_vars() {
     local env_vars="LOG_LEVEL=INFO,STAGE=${ENV}"
     if [[ -n "${DRUPAL_WEBHOOK_SECRET}" ]]; then
         env_vars="${env_vars},DRUPAL_WEBHOOK_SECRET=${DRUPAL_WEBHOOK_SECRET}"
@@ -199,10 +199,16 @@ create_lambda() {
     if [[ -n "${WEBHOOK_FAILURES_SNS_TOPIC_ARN}" ]]; then
         env_vars="${env_vars},WEBHOOK_FAILURES_SNS_TOPIC_ARN=${WEBHOOK_FAILURES_SNS_TOPIC_ARN}"
     fi
+    printf '%s' "${env_vars}"
+}
+
+create_lambda() {
+    log "Creating Lambda function: ${LAMBDA_FUNCTION_NAME}"
+    ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/${LAMBDA_ROLE_NAME}"
 
     if aws lambda get-function --function-name "${LAMBDA_FUNCTION_NAME}" \
         --region "${AWS_REGION}" >/dev/null 2>&1; then
-        log "Lambda already exists — updating code..."
+        log "Lambda already exists — updating code and configuration..."
         update_lambda_code
     else
         # Wait for role to propagate
@@ -218,7 +224,7 @@ create_lambda() {
             --memory-size 1024 \
             --timeout 60 \
             --architectures x86_64 \
-            --environment "Variables={${env_vars}}"
+            --environment "Variables={$(build_env_vars)}"
 
         aws lambda wait function-active-v2 \
             --function-name "${LAMBDA_FUNCTION_NAME}" \
@@ -233,6 +239,21 @@ update_lambda_code() {
         --function-name "${LAMBDA_FUNCTION_NAME}" \
         --region "${AWS_REGION}" \
         --image-uri "${ECR_URI}:${IMAGE_TAG}"
+
+    aws lambda wait function-updated-v2 \
+        --function-name "${LAMBDA_FUNCTION_NAME}" \
+        --region "${AWS_REGION}"
+
+    # Re-emit env vars on every deploy so config changes (new vars added to
+    # build_env_vars, secrets rotated, etc.) actually land on existing
+    # Lambdas — not just on first create. Mirrors the IAM policy which is
+    # also re-emitted idempotently every run via put-role-policy. Without
+    # this, --environment changes on the create-function path silently no-op
+    # for any Lambda that already exists.
+    aws lambda update-function-configuration \
+        --function-name "${LAMBDA_FUNCTION_NAME}" \
+        --region "${AWS_REGION}" \
+        --environment "Variables={$(build_env_vars)}"
 
     aws lambda wait function-updated-v2 \
         --function-name "${LAMBDA_FUNCTION_NAME}" \
