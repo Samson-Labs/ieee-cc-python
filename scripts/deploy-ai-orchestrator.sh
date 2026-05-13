@@ -229,6 +229,18 @@ update_lambda_code() {
     aws lambda wait function-updated-v2 \
         --function-name "${LAMBDA_FUNCTION_NAME}" \
         --region "${AWS_REGION}"
+
+    # Re-emit env vars on every deploy so config changes land on existing
+    # Lambdas (not just on first create). Mirrors the IAM policy which is
+    # also re-emitted idempotently every run via put-role-policy. CC3-975.
+    aws lambda update-function-configuration \
+        --function-name "${LAMBDA_FUNCTION_NAME}" \
+        --region "${AWS_REGION}" \
+        --environment "Variables={LOG_LEVEL=INFO,STAGE=${ENV},PDF_EXTRACTOR_FUNCTION=${PDF_EXTRACTOR_FN},VIDEO_TRANSCRIBER_FUNCTION=${VIDEO_TRANSCRIBER_FN},PPTX_EXTRACTOR_FUNCTION=${PPTX_EXTRACTOR_FN},BEDROCK_FUNCTION=${BEDROCK_FN},WEBHOOK_FAILURES_SNS_TOPIC_ARN=${SNS_TOPIC_ARN}}"
+
+    aws lambda wait function-updated-v2 \
+        --function-name "${LAMBDA_FUNCTION_NAME}" \
+        --region "${AWS_REGION}"
 }
 
 # ---------------------------------------------------------------
