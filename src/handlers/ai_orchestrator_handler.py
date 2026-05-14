@@ -127,19 +127,26 @@ def _parse_event(event: dict) -> tuple[str, str]:
     """Extract bucket and key from event.
 
     Supports:
-        1. S3 event: {Records[0].s3...}
-        2. Direct: {bucket, key}
+        1. S3 event:       {Records[0].s3...}
+        2. EventBridge S3: {source: "aws.s3", detail: {bucket.name, object.key}}
+        3. Direct:         {bucket, key}
     """
     if "Records" in event:
         record = event["Records"][0]
         bucket = record["s3"]["bucket"]["name"]
         key = record["s3"]["object"]["key"]
+    elif event.get("source") == "aws.s3" and "detail" in event:
+        detail = event["detail"]
+        bucket = detail["bucket"]["name"]
+        key = detail["object"]["key"]
     elif "bucket" in event and "key" in event:
         bucket = event["bucket"]
         key = event["key"]
     else:
         raise KeyError(
-            "Event must contain 'Records' (S3 trigger) or 'bucket'/'key' (direct)"
+            "Event must contain 'Records' (S3 trigger), "
+            "'source=aws.s3' with 'detail' (EventBridge), "
+            "or 'bucket'/'key' (direct)"
         )
 
     # Validate key pattern

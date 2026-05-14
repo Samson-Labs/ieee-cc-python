@@ -43,6 +43,18 @@ def _direct_event(bucket="bucket", key="PES/pending/STD-12345.pdf"):
     return {"bucket": bucket, "key": key}
 
 
+def _eventbridge_event(bucket="bucket", key="PES/pending/STD-12345.pdf"):
+    return {
+        "version": "0",
+        "source": "aws.s3",
+        "detail-type": "Object Created",
+        "detail": {
+            "bucket": {"name": bucket},
+            "object": {"key": key},
+        },
+    }
+
+
 # ---------------------------------------------------------------
 # Event Parsing
 # ---------------------------------------------------------------
@@ -58,6 +70,11 @@ class TestParseEvent:
         assert bucket == "bucket"
         assert key == "PES/pending/STD-12345.pdf"
 
+    def test_eventbridge_event(self):
+        bucket, key = _parse_event(_eventbridge_event())
+        assert bucket == "bucket"
+        assert key == "PES/pending/STD-12345.pdf"
+
     def test_missing_records_and_bucket_raises(self):
         with pytest.raises(KeyError, match="Records"):
             _parse_event({})
@@ -69,6 +86,10 @@ class TestParseEvent:
     def test_key_without_pending_raises(self):
         with pytest.raises(ValueError, match="does not match"):
             _parse_event({"bucket": "b", "key": "PES/uploads/file.pdf"})
+
+    def test_eventbridge_invalid_key_pattern_raises(self):
+        with pytest.raises(ValueError, match="does not match"):
+            _parse_event(_eventbridge_event(key="iplr_uploads/file.pdf"))
 
 
 # ---------------------------------------------------------------
@@ -109,6 +130,21 @@ class TestS3EventInvocation:
         call_kwargs = mock_orchestrator.process.call_args[1]
         assert call_kwargs["bucket"] == "prod-bucket"
         assert call_kwargs["key"] == "AESS/pending/lecture.mp4"
+
+
+class TestEventBridgeInvocation:
+    def test_success(self, mock_orchestrator):
+        result = handler(_eventbridge_event(), None)
+
+        assert result["statusCode"] == 200
+        mock_orchestrator.process.assert_called_once()
+
+    def test_extracts_bucket_and_key(self, mock_orchestrator):
+        handler(_eventbridge_event("dev-bucket", "PES/pending/93.pdf"), None)
+
+        call_kwargs = mock_orchestrator.process.call_args[1]
+        assert call_kwargs["bucket"] == "dev-bucket"
+        assert call_kwargs["key"] == "PES/pending/93.pdf"
 
 
 # ---------------------------------------------------------------
