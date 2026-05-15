@@ -60,6 +60,39 @@ if [[ "${ENV}" != "dev" ]]; then
 fi
 SNS_TOPIC_ARN="arn:aws:sns:${AWS_REGION}:${AWS_ACCOUNT_ID}:${SNS_TOPIC_NAME}"
 
+# DLQ for retriable orchestrator failures. Consumed by
+# ai_orchestrator_handler._publish_to_dlq via the DLQ_QUEUE_URL env var.
+# Env-aware same as the SNS topic: unsuffixed on dev, `-${ENV}` elsewhere.
+DLQ_NAME="ieee-rc-processing-dlq"
+if [[ "${ENV}" != "dev" ]]; then
+    DLQ_NAME="${DLQ_NAME}-${ENV}"
+fi
+DLQ_QUEUE_URL="https://sqs.${AWS_REGION}.amazonaws.com/${AWS_ACCOUNT_ID}/${DLQ_NAME}"
+
+# Drupal webhook signing secret — used as FALLBACK when Secrets Manager
+# fetch fails (see ai_orchestrator._resolve_webhook_secret). Primary path
+# is SM via WEBHOOK_SECRET_REF=iplr/webhook-secret (which the role has
+# secretsmanager:GetSecretValue on). Plumbing the placeholder explicitly
+# here keeps `update-function-configuration` from wiping it from the live
+# Lambda's env map (--environment replaces wholesale). Moving this to a
+# per-env Secrets Manager entry is tracked separately.
+DRUPAL_WEBHOOK_SECRET="webhook-test-secret"
+
+# Single source of truth for the Lambda's --environment Variables= literal.
+# Referenced by both create_lambda (first deploy) and update_lambda_code
+# (re-deploys), so they can't drift apart. CC3-975.
+LAMBDA_ENV_VARS="Variables={"\
+"LOG_LEVEL=INFO,"\
+"STAGE=${ENV},"\
+"PDF_EXTRACTOR_FUNCTION=${PDF_EXTRACTOR_FN},"\
+"VIDEO_TRANSCRIBER_FUNCTION=${VIDEO_TRANSCRIBER_FN},"\
+"PPTX_EXTRACTOR_FUNCTION=${PPTX_EXTRACTOR_FN},"\
+"BEDROCK_FUNCTION=${BEDROCK_FN},"\
+"WEBHOOK_FAILURES_SNS_TOPIC_ARN=${SNS_TOPIC_ARN},"\
+"DLQ_QUEUE_URL=${DLQ_QUEUE_URL},"\
+"DRUPAL_WEBHOOK_SECRET=${DRUPAL_WEBHOOK_SECRET}"\
+"}"
+
 ECR_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO_NAME}"
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
@@ -164,7 +197,7 @@ create_lambda_role() {
             {
                 \"Effect\": \"Allow\",
                 \"Action\": [\"sns:Publish\"],
-                \"Resource\": \"${SNS_TOPIC_ARN}*\"
+                \"Resource\": \"${SNS_TOPIC_ARN}\"
             }
         ]
     }"
@@ -210,7 +243,7 @@ create_lambda() {
             --memory-size 512 \
             --timeout 900 \
             --architectures x86_64 \
-            --environment "Variables={LOG_LEVEL=INFO,STAGE=${ENV},PDF_EXTRACTOR_FUNCTION=${PDF_EXTRACTOR_FN},VIDEO_TRANSCRIBER_FUNCTION=${VIDEO_TRANSCRIBER_FN},PPTX_EXTRACTOR_FUNCTION=${PPTX_EXTRACTOR_FN},BEDROCK_FUNCTION=${BEDROCK_FN},WEBHOOK_FAILURES_SNS_TOPIC_ARN=${SNS_TOPIC_ARN}}"
+            --environment "${LAMBDA_ENV_VARS}"
 
         aws lambda wait function-active-v2 \
             --function-name "${LAMBDA_FUNCTION_NAME}" \
@@ -233,10 +266,17 @@ update_lambda_code() {
     # Re-emit env vars on every deploy so config changes land on existing
     # Lambdas (not just on first create). Mirrors the IAM policy which is
     # also re-emitted idempotently every run via put-role-policy. CC3-975.
+    #
+    # CRITICAL: `--environment Variables=...` REPLACES the env map wholesale
+    # — anything not in LAMBDA_ENV_VARS gets wiped. The literal is built
+    # once at top-of-script with ALL env vars the Lambda runtime expects,
+    # so update_lambda_code can never drop a key that create_lambda would
+    # have set. Adding a new env var means adding it to LAMBDA_ENV_VARS
+    # (not just here).
     aws lambda update-function-configuration \
         --function-name "${LAMBDA_FUNCTION_NAME}" \
         --region "${AWS_REGION}" \
-        --environment "Variables={LOG_LEVEL=INFO,STAGE=${ENV},PDF_EXTRACTOR_FUNCTION=${PDF_EXTRACTOR_FN},VIDEO_TRANSCRIBER_FUNCTION=${VIDEO_TRANSCRIBER_FN},PPTX_EXTRACTOR_FUNCTION=${PPTX_EXTRACTOR_FN},BEDROCK_FUNCTION=${BEDROCK_FN},WEBHOOK_FAILURES_SNS_TOPIC_ARN=${SNS_TOPIC_ARN}}"
+        --environment "${LAMBDA_ENV_VARS}"
 
     aws lambda wait function-updated-v2 \
         --function-name "${LAMBDA_FUNCTION_NAME}" \
@@ -270,20 +310,6 @@ log ""
 log "  ECR:     ${ECR_URI}:${IMAGE_TAG}"
 log "  Lambda:  ${LAMBDA_FUNCTION_NAME} (512 MB, 15 min timeout)"
 log ""
-
-# Probe the env-suffixed PDF extractor and warn if it doesn't exist yet.
-# The legacy `scripts/deploy.sh` still creates an unsuffixed
-# `ieee-cc-pdf-extractor`; orchestrator deploys here will reference
-# `${PDF_EXTRACTOR_FN}` and fail with ResourceNotFoundException at first
-# PDF dispatch unless the bridge is handled.
-if ! aws lambda get-function --function-name "${PDF_EXTRACTOR_FN}" \
-        --region "${AWS_REGION}" >/dev/null 2>&1; then
-    log "WARNING: Lambda '${PDF_EXTRACTOR_FN}' does not exist yet."
-    log "         Orchestrator will fail at PDF dispatch with ResourceNotFoundException."
-    log "         Bridge until the PDF extractor migrates: either rename the legacy"
-    log "         'ieee-cc-pdf-extractor' to '${PDF_EXTRACTOR_FN}', or override"
-    log "         PDF_EXTRACTOR_FUNCTION on '${LAMBDA_FUNCTION_NAME}' to the legacy name."
-fi
 
 log "  Invoke:"
 log "    ./scripts/invoke-ai-orchestrator.sh <bucket> <key>"
