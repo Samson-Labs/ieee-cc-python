@@ -29,10 +29,21 @@ AWS_REGION="${AWS_REGION:-us-east-1}"
 AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
 
 ECR_REPO_NAME="ieee-rc-ai-orchestrator"
-LAMBDA_FUNCTION_NAME="ieee-rc-ai-orchestrator-${ENV}"
 S3_BUCKET_NAME="${ENV}-ieee-conference-cloud-bulk-uploads"
-LAMBDA_ROLE_NAME="ieee-rc-ai-orchestrator-${ENV}-role"
 IMAGE_TAG="latest"
+
+# Lambda + role names — env-aware. CC3-886's env-suffix transition was
+# never applied to the orchestrator on dev: the live function and role
+# are still the legacy unsuffixed names, and the EventBridge rule
+# `ieee-rc-s3-pending-trigger` targets them by that name. Deploying to
+# `-dev` suffixes here would leave a parallel never-invoked twin while
+# the wired-up Lambda stays stale. On staging the suffixed convention
+# is used. CC3-975 / CC3-886.
+LAMBDA_FUNCTION_NAME="ieee-rc-ai-orchestrator"
+if [[ "${ENV}" != "dev" ]]; then
+    LAMBDA_FUNCTION_NAME="${LAMBDA_FUNCTION_NAME}-${ENV}"
+fi
+LAMBDA_ROLE_NAME="${LAMBDA_FUNCTION_NAME}-role"
 
 # Extractor Lambda function names — env-aware.
 # On `dev`, extractor Lambdas are still deployed under their legacy unsuffixed
