@@ -7,10 +7,22 @@
 #   - Docker running locally
 #
 # Usage:
-#   ./scripts/deploy-bulk-processor.sh                # first-time setup + deploy
-#   ./scripts/deploy-bulk-processor.sh update         # rebuild image + update Lambda code only
+#   ./scripts/deploy-bulk-processor.sh <env>            # first-time setup + deploy
+#   ./scripts/deploy-bulk-processor.sh <env> update     # rebuild + update Lambda code only
+#
+#   <env> = dev | staging   (prod naming handled separately under CC3-851)
 #
 set -euo pipefail
+
+ENV="${1:-}"
+case "${ENV}" in
+    dev|staging) ;;
+    *)
+        echo "Usage: $0 <env> [update]   # env = dev | staging" >&2
+        echo "       (prod naming is part of CC3-851; not accepted here)" >&2
+        exit 1
+        ;;
+esac
 
 AWS_PROFILE="${AWS_PROFILE:-ieee-cc}"
 AWS_REGION="${AWS_REGION:-us-east-1}"
@@ -19,15 +31,24 @@ export AWS_PROFILE AWS_REGION
 AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
 
 ECR_REPO_NAME="ieee-rc-bulk-processor"
-LAMBDA_FUNCTION_NAME="ieee-rc-bulk-processor"
-S3_BUCKET_NAME="${S3_BUCKET_NAME:-dev-ieee-conference-cloud-bulk-uploads}"
-LAMBDA_ROLE_NAME="ieee-rc-bulk-processor-role"
-SNS_TOPIC_NAME="ieee-rc-bulk-completion"
-SQS_QUEUE_NAME="ieee-rc-bulk-processing-queue"
+LAMBDA_FUNCTION_NAME="ieee-rc-bulk-processor-${ENV}"
+S3_BUCKET_NAME="${S3_BUCKET_NAME:-${ENV}-ieee-conference-cloud-bulk-uploads}"
+LAMBDA_ROLE_NAME="ieee-rc-bulk-processor-${ENV}-role"
 IMAGE_TAG="latest"
+
+# Shared SNS topic + SQS queue — strict `-${ENV}` suffix in every env.
+# Matches the pattern in deploy-dlq-processor.sh (CC3-886 Phase 1). The
+# legacy unsuffixed resources on dev stay live until Phase 6.4
+# decommissions them.
+SNS_TOPIC_NAME="ieee-rc-bulk-completion-${ENV}"
+SQS_QUEUE_NAME="ieee-rc-bulk-processing-queue-${ENV}"
 
 TRIGGER_PREFIX="bulk/manifests/"
 TRIGGER_SUFFIX=".json"
+# Stable NOTIFICATION_ID across envs so deploying the env-suffixed Lambda
+# atomically retargets the existing trigger entry (the merge logic replaces
+# by Id). Avoids double-firing the legacy + env-suffixed Lambdas on the
+# same s3:ObjectCreated event during the cutover window.
 NOTIFICATION_ID="bulk-processor-trigger"
 
 ECR_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO_NAME}"
@@ -178,16 +199,29 @@ create_sqs_queue() {
 # ---------------------------------------------------------------
 # 4. Create or update Lambda function
 # ---------------------------------------------------------------
+build_env_vars() {
+    # Single source of truth for the Lambda's env map, so create + update
+    # paths can't drift. Lambda's --environment replaces wholesale; new
+    # vars MUST be added here, not just to the create-function call.
+    local queue_url
+    queue_url=$(aws sqs get-queue-url --queue-name "${SQS_QUEUE_NAME}" \
+        --region "${AWS_REGION}" --query QueueUrl --output text 2>/dev/null || echo "")
+
+    printf '%s' \
+        "LOG_LEVEL=${LOG_LEVEL:-INFO}" \
+        ",STAGE=${ENV}" \
+        ",S3_BUCKET=${S3_BUCKET_NAME}" \
+        ",BULK_QUEUE_URL=${queue_url}" \
+        ",COMPLETION_SNS_TOPIC_ARN=arn:aws:sns:${AWS_REGION}:${AWS_ACCOUNT_ID}:${SNS_TOPIC_NAME}"
+}
+
 create_lambda() {
     log "Creating Lambda function: ${LAMBDA_FUNCTION_NAME}"
     ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/${LAMBDA_ROLE_NAME}"
 
-    QUEUE_URL=$(aws sqs get-queue-url --queue-name "${SQS_QUEUE_NAME}" \
-        --region "${AWS_REGION}" --query QueueUrl --output text 2>/dev/null || echo "")
-
     if aws lambda get-function --function-name "${LAMBDA_FUNCTION_NAME}" \
         --region "${AWS_REGION}" >/dev/null 2>&1; then
-        log "Lambda already exists — updating code..."
+        log "Lambda already exists — updating code and configuration..."
         update_lambda_code
     else
         log "Waiting for IAM role propagation..."
@@ -202,7 +236,7 @@ create_lambda() {
             --memory-size 512 \
             --timeout 300 \
             --architectures x86_64 \
-            --environment "Variables={LOG_LEVEL=${LOG_LEVEL:-INFO},S3_BUCKET=${S3_BUCKET_NAME},BULK_QUEUE_URL=${QUEUE_URL},COMPLETION_SNS_TOPIC_ARN=arn:aws:sns:${AWS_REGION}:${AWS_ACCOUNT_ID}:${SNS_TOPIC_NAME}}"
+            --environment "Variables={$(build_env_vars)}"
 
         aws lambda wait function-active-v2 \
             --function-name "${LAMBDA_FUNCTION_NAME}" \
@@ -217,6 +251,19 @@ update_lambda_code() {
         --function-name "${LAMBDA_FUNCTION_NAME}" \
         --region "${AWS_REGION}" \
         --image-uri "${ECR_URI}:${IMAGE_TAG}"
+
+    aws lambda wait function-updated-v2 \
+        --function-name "${LAMBDA_FUNCTION_NAME}" \
+        --region "${AWS_REGION}"
+
+    # Re-emit env vars on every deploy so config changes (STAGE swap, SQS
+    # URL refreshes, new vars) land on existing Lambdas — not just on first
+    # create. Without this, --environment on the create-function path
+    # silently no-ops when the Lambda already exists.
+    aws lambda update-function-configuration \
+        --function-name "${LAMBDA_FUNCTION_NAME}" \
+        --region "${AWS_REGION}" \
+        --environment "Variables={$(build_env_vars)}"
 
     aws lambda wait function-updated-v2 \
         --function-name "${LAMBDA_FUNCTION_NAME}" \
@@ -304,15 +351,15 @@ PY
 # ---------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------
-if [[ "${1:-}" == "update" ]]; then
-    log "Update mode — rebuilding image and updating Lambda code only."
+if [[ "${2:-}" == "update" ]]; then
+    log "Update mode (${ENV}) — rebuilding image and updating Lambda code only."
     build_and_push
     update_lambda_code
     log "Done."
     exit 0
 fi
 
-log "Full deployment starting..."
+log "Full deployment starting (env=${ENV})..."
 create_ecr_repo
 create_lambda_role
 create_sns_topic

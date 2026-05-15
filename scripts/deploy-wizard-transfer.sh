@@ -13,7 +13,8 @@
 #   - Existing webhook signing secret available at iplr/webhook-secret in
 #     Secrets Manager (shared with the AI orchestrator's webhook)
 #   - Existing SNS topic for webhook failures (WEBHOOK_FAILURES_SNS_TOPIC_ARN)
-#   - Existing SQS DLQ "ieee-rc-processing-dlq" for async invocation failures
+#   - Existing SQS DLQ (`ieee-rc-processing-dlq` on dev,
+#     `ieee-rc-processing-dlq-${ENV}` elsewhere) for async invocation failures
 #
 # Drupal-side prerequisite (A4 — NOT done by this script):
 #   The Drupal s3fs IAM role needs secretsmanager:CreateSecret/PutSecretValue/
@@ -22,24 +23,43 @@
 #   OAuth tokens. Without this, end-to-end smoke tests will fail.
 #
 # Usage:
-#   ./scripts/deploy-wizard-transfer.sh                # first-time setup + deploy
-#   ./scripts/deploy-wizard-transfer.sh update         # rebuild + update code only
+#   ./scripts/deploy-wizard-transfer.sh <env>            # first-time setup + deploy
+#   ./scripts/deploy-wizard-transfer.sh <env> update     # rebuild + update code only
+#
+#   <env> = dev | staging   (prod naming handled separately under CC3-851)
 #
 set -euo pipefail
+
+ENV="${1:-}"
+case "${ENV}" in
+    dev|staging) ;;
+    *)
+        echo "Usage: $0 <env> [update]   # env = dev | staging" >&2
+        echo "       (prod naming is part of CC3-851; not accepted here)" >&2
+        exit 1
+        ;;
+esac
 
 AWS_PROFILE="${AWS_PROFILE:-ieee-cc}"
 AWS_REGION="${AWS_REGION:-us-east-1}"
 AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
 
 ECR_REPO_NAME="ieee-rc-wizard-transfer"
-LAMBDA_FUNCTION_NAME="ieee-rc-wizard-transfer"
-LAMBDA_ROLE_NAME="ieee-rc-wizard-transfer-role"
-TRIGGER_BUCKET_NAME="${TRIGGER_BUCKET_NAME:-dev-ieee-conference-cloud-bulk-uploads}"
+LAMBDA_FUNCTION_NAME="ieee-rc-wizard-transfer-${ENV}"
+LAMBDA_ROLE_NAME="ieee-rc-wizard-transfer-${ENV}-role"
+TRIGGER_BUCKET_NAME="${TRIGGER_BUCKET_NAME:-${ENV}-ieee-conference-cloud-bulk-uploads}"
 TRIGGER_PREFIX="transfer-actions/"
 TRIGGER_SUFFIX=".json"
+# Stable NOTIFICATION_ID across envs — deploying the env-suffixed Lambda
+# atomically retargets the existing trigger entry (the merge logic
+# replaces by Id). Avoids double-firing legacy + env-suffixed Lambdas on
+# the same s3:ObjectCreated event during the cutover window.
 NOTIFICATION_ID="wizard-transfer-trigger"
 
-DLQ_QUEUE_NAME="${DLQ_QUEUE_NAME:-ieee-rc-processing-dlq}"
+# Shared DLQ — strict `-${ENV}` suffix; matches deploy-dlq-processor.sh.
+# Provisioned by setup-s3-triggers.sh / deploy-dlq-processor.sh as part of
+# CC3-886 Phase 1; this script assumes the queue already exists.
+DLQ_QUEUE_NAME="${DLQ_QUEUE_NAME:-ieee-rc-processing-dlq-${ENV}}"
 DLQ_QUEUE_ARN="arn:aws:sqs:${AWS_REGION}:${AWS_ACCOUNT_ID}:${DLQ_QUEUE_NAME}"
 
 # Optional — passed through to the Lambda environment if set.
@@ -186,22 +206,27 @@ EOF
 # ---------------------------------------------------------------
 # 3. Create or update Lambda function
 # ---------------------------------------------------------------
-create_lambda() {
-    log "Creating Lambda function: ${LAMBDA_FUNCTION_NAME}"
-    ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/${LAMBDA_ROLE_NAME}"
-
-    # Build environment-variables map JSON (only include set vars).
-    local env_vars="LOG_LEVEL=INFO"
+build_env_vars() {
+    # Single source of truth for the Lambda's env map, so create + update
+    # paths can't drift. Lambda's --environment replaces wholesale; new
+    # vars MUST be added here, not just to the create-function call.
+    local env_vars="LOG_LEVEL=INFO,STAGE=${ENV}"
     if [[ -n "${DRUPAL_WEBHOOK_SECRET}" ]]; then
         env_vars="${env_vars},DRUPAL_WEBHOOK_SECRET=${DRUPAL_WEBHOOK_SECRET}"
     fi
     if [[ -n "${WEBHOOK_FAILURES_SNS_TOPIC_ARN}" ]]; then
         env_vars="${env_vars},WEBHOOK_FAILURES_SNS_TOPIC_ARN=${WEBHOOK_FAILURES_SNS_TOPIC_ARN}"
     fi
+    printf '%s' "${env_vars}"
+}
+
+create_lambda() {
+    log "Creating Lambda function: ${LAMBDA_FUNCTION_NAME}"
+    ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/${LAMBDA_ROLE_NAME}"
 
     if aws lambda get-function --function-name "${LAMBDA_FUNCTION_NAME}" \
         --region "${AWS_REGION}" >/dev/null 2>&1; then
-        log "Lambda already exists — updating code..."
+        log "Lambda already exists — updating code and configuration..."
         update_lambda_code
     else
         log "Waiting for IAM role propagation..."
@@ -218,7 +243,7 @@ create_lambda() {
             --memory-size 1024 \
             --timeout 900 \
             --architectures x86_64 \
-            --environment "Variables={${env_vars}}"
+            --environment "Variables={$(build_env_vars)}"
 
         aws lambda wait function-active-v2 \
             --function-name "${LAMBDA_FUNCTION_NAME}" \
@@ -233,6 +258,18 @@ update_lambda_code() {
         --function-name "${LAMBDA_FUNCTION_NAME}" \
         --region "${AWS_REGION}" \
         --image-uri "${ECR_URI}:${IMAGE_TAG}"
+
+    aws lambda wait function-updated-v2 \
+        --function-name "${LAMBDA_FUNCTION_NAME}" \
+        --region "${AWS_REGION}"
+
+    # Re-emit env vars on every deploy so config changes (STAGE swap,
+    # webhook secret rotation, new optional vars) actually land on
+    # existing Lambdas — not just on first create.
+    aws lambda update-function-configuration \
+        --function-name "${LAMBDA_FUNCTION_NAME}" \
+        --region "${AWS_REGION}" \
+        --environment "Variables={$(build_env_vars)}"
 
     aws lambda wait function-updated-v2 \
         --function-name "${LAMBDA_FUNCTION_NAME}" \
@@ -334,15 +371,15 @@ PY
 # ---------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------
-if [[ "${1:-}" == "update" ]]; then
-    log "Update mode — rebuilding image and updating Lambda code only."
+if [[ "${2:-}" == "update" ]]; then
+    log "Update mode (${ENV}) — rebuilding image and updating Lambda code only."
     build_and_push
     update_lambda_code
     log "Done."
     exit 0
 fi
 
-log "Full deployment starting..."
+log "Full deployment starting (env=${ENV})..."
 create_ecr_repo
 create_lambda_role
 build_and_push
