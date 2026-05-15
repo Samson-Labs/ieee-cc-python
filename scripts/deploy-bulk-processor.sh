@@ -7,10 +7,19 @@
 #   - Docker running locally
 #
 # Usage:
-#   ./scripts/deploy-bulk-processor.sh <env>            # first-time setup + deploy
+#   ./scripts/deploy-bulk-processor.sh <env>            # additive Lambda deploy (NO trigger retarget)
 #   ./scripts/deploy-bulk-processor.sh <env> update     # rebuild + update Lambda code only
+#   ./scripts/deploy-bulk-processor.sh <env> retarget   # Phase 4 cutover: point S3 trigger at -${env}
 #
 #   <env> = dev | staging   (prod naming handled separately under CC3-851)
+#
+# Default `<env>` mode is INTENTIONALLY additive: it builds + creates the
+# env-suffixed Lambda, IAM role, ECR repo, SNS topic and SQS queue, but
+# does NOT touch the live S3 bucket-notification config — so the legacy
+# unsuffixed Lambda keeps consuming `bulk/manifests/*.json` events while
+# the new `-${env}` twin sits idle and ready for direct-invoke validation
+# (CC3-886 Phase 1 / Phase 3). Trigger retargeting is gated behind the
+# explicit `retarget` mode (CC3-886 Phase 4) so the cutover is reviewable.
 #
 set -euo pipefail
 
@@ -18,8 +27,17 @@ ENV="${1:-}"
 case "${ENV}" in
     dev|staging) ;;
     *)
-        echo "Usage: $0 <env> [update]   # env = dev | staging" >&2
+        echo "Usage: $0 <env> [update|retarget]   # env = dev | staging" >&2
         echo "       (prod naming is part of CC3-851; not accepted here)" >&2
+        exit 1
+        ;;
+esac
+
+MODE="${2:-}"
+case "${MODE}" in
+    ""|update|retarget) ;;
+    *)
+        echo "Usage: $0 <env> [update|retarget]   # unknown mode: ${MODE}" >&2
         exit 1
         ;;
 esac
@@ -203,9 +221,23 @@ build_env_vars() {
     # Single source of truth for the Lambda's env map, so create + update
     # paths can't drift. Lambda's --environment replaces wholesale; new
     # vars MUST be added here, not just to the create-function call.
+    #
+    # Hard-fail on missing SQS queue URL. BULK_QUEUE_URL is load-bearing —
+    # an empty value lets a Lambda boot and silently fail every invocation
+    # with InvalidParameterValue at sqs:SendMessage time. In `update` mode
+    # this script doesn't run create_sqs_queue, so the queue MUST exist
+    # already; surfacing the missing-queue case here gives a clear error
+    # at deploy time instead of a runtime mystery.
     local queue_url
     queue_url=$(aws sqs get-queue-url --queue-name "${SQS_QUEUE_NAME}" \
-        --region "${AWS_REGION}" --query QueueUrl --output text 2>/dev/null || echo "")
+        --region "${AWS_REGION}" --query QueueUrl --output text 2>/dev/null || true)
+
+    if [[ -z "${queue_url}" ]]; then
+        echo "ERROR: SQS queue '${SQS_QUEUE_NAME}' does not exist in ${AWS_REGION}." >&2
+        echo "       Run a full deploy (./scripts/deploy-bulk-processor.sh ${ENV}) first," >&2
+        echo "       which provisions the queue, before re-running in update mode." >&2
+        exit 1
+    fi
 
     printf '%s' \
         "LOG_LEVEL=${LOG_LEVEL:-INFO}" \
@@ -351,7 +383,7 @@ PY
 # ---------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------
-if [[ "${2:-}" == "update" ]]; then
+if [[ "${MODE}" == "update" ]]; then
     log "Update mode (${ENV}) — rebuilding image and updating Lambda code only."
     build_and_push
     update_lambda_code
@@ -359,20 +391,39 @@ if [[ "${2:-}" == "update" ]]; then
     exit 0
 fi
 
-log "Full deployment starting (env=${ENV})..."
+if [[ "${MODE}" == "retarget" ]]; then
+    # Phase 4 cutover: explicitly retarget the S3 bucket notification entry
+    # (Id=${NOTIFICATION_ID}) at the env-suffixed Lambda. Replaces the
+    # legacy unsuffixed entry. Lambda must already exist (run the full
+    # deploy first); this mode only touches the bucket notification.
+    log "Retarget mode (${ENV}) — pointing s3://${S3_BUCKET_NAME}/${TRIGGER_PREFIX}*${TRIGGER_SUFFIX} at ${LAMBDA_FUNCTION_NAME}"
+    if ! aws lambda get-function --function-name "${LAMBDA_FUNCTION_NAME}" \
+            --region "${AWS_REGION}" >/dev/null 2>&1; then
+        echo "ERROR: Lambda '${LAMBDA_FUNCTION_NAME}' does not exist." >&2
+        echo "       Run './scripts/deploy-bulk-processor.sh ${ENV}' (no mode) first." >&2
+        exit 1
+    fi
+    configure_s3_trigger
+    log "Retarget complete."
+    exit 0
+fi
+
+log "Full deployment starting (env=${ENV}) — additive; S3 trigger NOT retargeted."
 create_ecr_repo
 create_lambda_role
 create_sns_topic
 create_sqs_queue
 build_and_push
 create_lambda
-configure_s3_trigger
-log "Deployment complete."
+log "Deployment complete (additive)."
+log ""
+log "  To retarget the S3 bucket notification at the new Lambda (Phase 4):"
+log "    ./scripts/deploy-bulk-processor.sh ${ENV} retarget"
 log ""
 log "  ECR:     ${ECR_URI}:${IMAGE_TAG}"
 log "  Lambda:  ${LAMBDA_FUNCTION_NAME} (512 MB, 5 min timeout)"
 log "  SQS:     ${SQS_QUEUE_NAME}"
-log "  Trigger: s3://${S3_BUCKET_NAME}/${TRIGGER_PREFIX}*${TRIGGER_SUFFIX}"
+log "  Trigger: s3://${S3_BUCKET_NAME}/${TRIGGER_PREFIX}*${TRIGGER_SUFFIX} (NOT WIRED YET — run retarget mode)"
 log ""
 log "  Invoke (direct, for replay):"
 log "    ./scripts/invoke-bulk-processor.sh <batch_id>"

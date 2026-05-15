@@ -5,8 +5,8 @@
 # Prerequisites:
 #   - AWS CLI configured with profile "ieee-cc"
 #   - Docker running locally
-#   - SQS queue already created by deploy-bulk-processor.sh
-#     (`ieee-rc-bulk-processing-queue` on dev, `ieee-rc-bulk-processing-queue-${ENV}` elsewhere)
+#   - SQS queue `ieee-rc-bulk-processing-queue-${ENV}` already created by
+#     deploy-bulk-processor.sh (run that first)
 #
 # Usage:
 #   ./scripts/deploy-bulk-worker.sh <env>            # first-time setup + deploy
