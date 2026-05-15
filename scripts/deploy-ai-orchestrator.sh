@@ -109,21 +109,34 @@ create_lambda_role() {
         }]
     }'
 
-    # S3 read/write/delete + Bedrock + Transcribe + Lambda invoke
+    # Webhook-failure SNS topic + DLQ queue ARNs — derived from env vars
+    # plumbed onto the Lambda (`WEBHOOK_FAILURES_SNS_TOPIC_ARN`,
+    # `DLQ_QUEUE_URL`). On dev the live resources are still unsuffixed
+    # (no `-dev`); on staging they get the env suffix.
+    WEBHOOK_FAILURES_TOPIC_ARN="arn:aws:sns:${AWS_REGION}:${AWS_ACCOUNT_ID}:ieee-rc-webhook-failures"
+    DLQ_QUEUE_ARN="arn:aws:sqs:${AWS_REGION}:${AWS_ACCOUNT_ID}:ieee-rc-processing-dlq"
+    if [[ "${ENV}" != "dev" ]]; then
+        WEBHOOK_FAILURES_TOPIC_ARN="${WEBHOOK_FAILURES_TOPIC_ARN}-${ENV}"
+        DLQ_QUEUE_ARN="${DLQ_QUEUE_ARN}-${ENV}"
+    fi
+
     INLINE_POLICY="{
         \"Version\": \"2012-10-17\",
         \"Statement\": [
             {
+                \"Sid\": \"S3RW\",
                 \"Effect\": \"Allow\",
                 \"Action\": [\"s3:GetObject\", \"s3:PutObject\", \"s3:DeleteObject\"],
                 \"Resource\": \"arn:aws:s3:::${S3_BUCKET_NAME}/*\"
             },
             {
+                \"Sid\": \"S3List\",
                 \"Effect\": \"Allow\",
                 \"Action\": [\"s3:ListBucket\"],
                 \"Resource\": \"arn:aws:s3:::${S3_BUCKET_NAME}\"
             },
             {
+                \"Sid\": \"InvokeExtractorsAndBedrock\",
                 \"Effect\": \"Allow\",
                 \"Action\": [\"lambda:InvokeFunction\"],
                 \"Resource\": [
@@ -134,6 +147,7 @@ create_lambda_role() {
                 ]
             },
             {
+                \"Sid\": \"CWMetrics\",
                 \"Effect\": \"Allow\",
                 \"Action\": [\"cloudwatch:PutMetricData\"],
                 \"Resource\": \"*\",
@@ -144,9 +158,22 @@ create_lambda_role() {
                 }
             },
             {
+                \"Sid\": \"WebhookSecret\",
                 \"Effect\": \"Allow\",
                 \"Action\": [\"secretsmanager:GetSecretValue\"],
                 \"Resource\": \"arn:aws:secretsmanager:${AWS_REGION}:${AWS_ACCOUNT_ID}:secret:iplr/webhook-secret*\"
+            },
+            {
+                \"Sid\": \"PublishWebhookFailures\",
+                \"Effect\": \"Allow\",
+                \"Action\": [\"sns:Publish\"],
+                \"Resource\": \"${WEBHOOK_FAILURES_TOPIC_ARN}\"
+            },
+            {
+                \"Sid\": \"DLQSendMessage\",
+                \"Effect\": \"Allow\",
+                \"Action\": [\"sqs:SendMessage\"],
+                \"Resource\": \"${DLQ_QUEUE_ARN}\"
             }
         ]
     }"
