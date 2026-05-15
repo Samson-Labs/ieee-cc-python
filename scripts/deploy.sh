@@ -7,19 +7,31 @@
 #   - Docker running locally
 #
 # Usage:
-#   ./scripts/deploy.sh          # first-time setup + deploy
-#   ./scripts/deploy.sh update   # rebuild image + update Lambda code only
+#   ./scripts/deploy.sh <env>            # first-time setup + deploy
+#   ./scripts/deploy.sh <env> update     # rebuild image + update Lambda code only
+#
+#   <env> = dev | staging   (prod naming handled separately under CC3-851)
 #
 set -euo pipefail
+
+ENV="${1:-}"
+case "${ENV}" in
+    dev|staging) ;;
+    *)
+        echo "Usage: $0 <env> [update]   # env = dev | staging" >&2
+        echo "       (prod naming is part of CC3-851; not accepted here)" >&2
+        exit 1
+        ;;
+esac
 
 AWS_PROFILE="${AWS_PROFILE:-ieee-cc}"
 AWS_REGION="${AWS_REGION:-us-east-1}"
 AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
 
 ECR_REPO_NAME="ieee-cc-pdf-extractor"
-LAMBDA_FUNCTION_NAME="ieee-cc-pdf-extractor"
-S3_BUCKET_NAME="dev-ieee-conference-cloud-bulk-uploads"
-LAMBDA_ROLE_NAME="ieee-cc-pdf-extractor-role"
+LAMBDA_FUNCTION_NAME="ieee-cc-pdf-extractor-${ENV}"
+S3_BUCKET_NAME="${ENV}-ieee-conference-cloud-bulk-uploads"
+LAMBDA_ROLE_NAME="ieee-cc-pdf-extractor-${ENV}-role"
 IMAGE_TAG="latest"
 
 ECR_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO_NAME}"
@@ -146,13 +158,22 @@ create_lambda_role() {
 # ---------------------------------------------------------------
 # 4. Create or update Lambda function
 # ---------------------------------------------------------------
+build_env_vars() {
+    # Single source of truth for the Lambda's env map, so create + update
+    # paths can't drift. Lambda's --environment replaces wholesale.
+    printf '%s' \
+        "BUCKET_NAME=${S3_BUCKET_NAME}" \
+        ",LOG_LEVEL=INFO" \
+        ",STAGE=${ENV}"
+}
+
 create_lambda() {
     log "Creating Lambda function: ${LAMBDA_FUNCTION_NAME}"
     ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/${LAMBDA_ROLE_NAME}"
 
     if aws lambda get-function --function-name "${LAMBDA_FUNCTION_NAME}" \
         --region "${AWS_REGION}" >/dev/null 2>&1; then
-        log "Lambda already exists — updating code..."
+        log "Lambda already exists — updating code and configuration..."
         update_lambda_code
     else
         # Wait for role to propagate
@@ -168,7 +189,7 @@ create_lambda() {
             --memory-size 3008 \
             --timeout 300 \
             --architectures x86_64 \
-            --environment "Variables={BUCKET_NAME=${S3_BUCKET_NAME},LOG_LEVEL=INFO}"
+            --environment "Variables={$(build_env_vars)}"
 
         aws lambda wait function-active-v2 \
             --function-name "${LAMBDA_FUNCTION_NAME}" \
@@ -187,20 +208,33 @@ update_lambda_code() {
     aws lambda wait function-updated-v2 \
         --function-name "${LAMBDA_FUNCTION_NAME}" \
         --region "${AWS_REGION}"
+
+    # Re-emit env vars on every deploy so config changes (e.g. STAGE swap
+    # between dev/staging, new vars added to build_env_vars) actually land
+    # on existing Lambdas. Without this, --environment changes on the
+    # create-function path silently no-op when the Lambda already exists.
+    aws lambda update-function-configuration \
+        --function-name "${LAMBDA_FUNCTION_NAME}" \
+        --region "${AWS_REGION}" \
+        --environment "Variables={$(build_env_vars)}"
+
+    aws lambda wait function-updated-v2 \
+        --function-name "${LAMBDA_FUNCTION_NAME}" \
+        --region "${AWS_REGION}"
 }
 
 # ---------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------
-if [[ "${1:-}" == "update" ]]; then
-    log "Update mode — rebuilding image and updating Lambda code only."
+if [[ "${2:-}" == "update" ]]; then
+    log "Update mode (${ENV}) — rebuilding image and updating Lambda code only."
     build_and_push
     update_lambda_code
     log "Done."
     exit 0
 fi
 
-log "Full deployment starting..."
+log "Full deployment starting (env=${ENV})..."
 create_ecr_repo
 create_s3_bucket
 create_lambda_role

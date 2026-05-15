@@ -5,13 +5,26 @@
 # Prerequisites:
 #   - AWS CLI configured with profile "ieee-cc"
 #   - Docker running locally
-#   - SQS queue "ieee-rc-bulk-processing-queue" already created by deploy-bulk-processor.sh
+#   - SQS queue already created by deploy-bulk-processor.sh
+#     (`ieee-rc-bulk-processing-queue` on dev, `ieee-rc-bulk-processing-queue-${ENV}` elsewhere)
 #
 # Usage:
-#   ./scripts/deploy-bulk-worker.sh                # first-time setup + deploy
-#   ./scripts/deploy-bulk-worker.sh update         # rebuild image + update Lambda code only
+#   ./scripts/deploy-bulk-worker.sh <env>            # first-time setup + deploy
+#   ./scripts/deploy-bulk-worker.sh <env> update     # rebuild + update Lambda code only
+#
+#   <env> = dev | staging   (prod naming handled separately under CC3-851)
 #
 set -euo pipefail
+
+ENV="${1:-}"
+case "${ENV}" in
+    dev|staging) ;;
+    *)
+        echo "Usage: $0 <env> [update]   # env = dev | staging" >&2
+        echo "       (prod naming is part of CC3-851; not accepted here)" >&2
+        exit 1
+        ;;
+esac
 
 AWS_PROFILE="${AWS_PROFILE:-ieee-cc}"
 AWS_REGION="${AWS_REGION:-us-east-1}"
@@ -20,19 +33,26 @@ export AWS_PROFILE AWS_REGION
 AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
 
 ECR_REPO_NAME="ieee-rc-bulk-worker"
-LAMBDA_FUNCTION_NAME="ieee-rc-bulk-worker"
-S3_BUCKET_NAME="${S3_BUCKET_NAME:-dev-ieee-conference-cloud-bulk-uploads}"
-LAMBDA_ROLE_NAME="ieee-rc-bulk-worker-role"
-ORCHESTRATOR_FUNCTION_NAME="ieee-rc-ai-orchestrator"
-SNS_TOPIC_NAME="ieee-rc-bulk-completion"
-SQS_QUEUE_NAME="ieee-rc-bulk-processing-queue"
+LAMBDA_FUNCTION_NAME="ieee-rc-bulk-worker-${ENV}"
+S3_BUCKET_NAME="${S3_BUCKET_NAME:-${ENV}-ieee-conference-cloud-bulk-uploads}"
+LAMBDA_ROLE_NAME="ieee-rc-bulk-worker-${ENV}-role"
 IMAGE_TAG="latest"
+
+# Orchestrator target — strict `-${ENV}` suffix; the orchestrator's deploy
+# script creates the env-suffixed Lambda in every env (CC3-886 Phase 1).
+ORCHESTRATOR_FUNCTION_NAME="ieee-rc-ai-orchestrator-${ENV}"
+
+# Shared SNS topic + SQS queue (provisioned by deploy-bulk-processor.sh).
+# Strict `-${ENV}` suffix — must stay in lockstep with bulk-processor.
+SNS_TOPIC_NAME="ieee-rc-bulk-completion-${ENV}"
+SQS_QUEUE_NAME="ieee-rc-bulk-processing-queue-${ENV}"
 
 # Publish buckets the worker reads source media from for Strategy A items
 # (the Drupal classifier emits s3_key pointing at the publish-bucket
 # convention, e.g. video/private/{PPN}/{PPN}.{ext}). Comma-separated.
-# Override for prod via environment: SOURCE_PUBLISH_BUCKETS=ieee-conference-cloud-content,ieee-conference-cloud
-SOURCE_PUBLISH_BUCKETS="${SOURCE_PUBLISH_BUCKETS:-dev-ieee-conference-cloud-content,dev-ieee-conference-cloud}"
+# Env-aware default; can still be overridden via the SOURCE_PUBLISH_BUCKETS
+# env var for one-off deploys.
+SOURCE_PUBLISH_BUCKETS="${SOURCE_PUBLISH_BUCKETS:-${ENV}-ieee-conference-cloud-content,${ENV}-ieee-conference-cloud}"
 
 ECR_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO_NAME}"
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -214,13 +234,24 @@ create_sns_topic() {
 # ---------------------------------------------------------------
 # 4. Create or update Lambda function
 # ---------------------------------------------------------------
+build_env_vars() {
+    # Single source of truth for the Lambda's env map, so create + update
+    # paths can't drift. Lambda's --environment replaces wholesale.
+    printf '%s' \
+        "LOG_LEVEL=${LOG_LEVEL:-INFO}" \
+        ",STAGE=${ENV}" \
+        ",ORCHESTRATOR_FUNCTION_NAME=${ORCHESTRATOR_FUNCTION_NAME}" \
+        ",S3_BUCKET=${S3_BUCKET_NAME}" \
+        ",COMPLETION_SNS_TOPIC_ARN=arn:aws:sns:${AWS_REGION}:${AWS_ACCOUNT_ID}:${SNS_TOPIC_NAME}"
+}
+
 create_lambda() {
     log "Creating Lambda function: ${LAMBDA_FUNCTION_NAME}"
     ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/${LAMBDA_ROLE_NAME}"
 
     if aws lambda get-function --function-name "${LAMBDA_FUNCTION_NAME}" \
         --region "${AWS_REGION}" >/dev/null 2>&1; then
-        log "Lambda already exists — updating code..."
+        log "Lambda already exists — updating code and configuration..."
         update_lambda_code
     else
         log "Waiting for IAM role propagation..."
@@ -235,7 +266,7 @@ create_lambda() {
             --memory-size 512 \
             --timeout 300 \
             --architectures x86_64 \
-            --environment "Variables={LOG_LEVEL=${LOG_LEVEL:-INFO},ORCHESTRATOR_FUNCTION_NAME=${ORCHESTRATOR_FUNCTION_NAME},S3_BUCKET=${S3_BUCKET_NAME},COMPLETION_SNS_TOPIC_ARN=arn:aws:sns:${AWS_REGION}:${AWS_ACCOUNT_ID}:${SNS_TOPIC_NAME}}"
+            --environment "Variables={$(build_env_vars)}"
 
         aws lambda wait function-active-v2 \
             --function-name "${LAMBDA_FUNCTION_NAME}" \
@@ -250,6 +281,18 @@ update_lambda_code() {
         --function-name "${LAMBDA_FUNCTION_NAME}" \
         --region "${AWS_REGION}" \
         --image-uri "${ECR_URI}:${IMAGE_TAG}"
+
+    aws lambda wait function-updated-v2 \
+        --function-name "${LAMBDA_FUNCTION_NAME}" \
+        --region "${AWS_REGION}"
+
+    # Re-emit env vars on every deploy so config changes (STAGE swap,
+    # orchestrator name change post-carve-out-revert, new vars) actually
+    # land on existing Lambdas — not just on first create.
+    aws lambda update-function-configuration \
+        --function-name "${LAMBDA_FUNCTION_NAME}" \
+        --region "${AWS_REGION}" \
+        --environment "Variables={$(build_env_vars)}"
 
     aws lambda wait function-updated-v2 \
         --function-name "${LAMBDA_FUNCTION_NAME}" \
@@ -287,8 +330,8 @@ create_event_source_mapping() {
 # ---------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------
-if [[ "${1:-}" == "update" ]]; then
-    log "Update mode — refreshing IAM, rebuilding image, and updating Lambda code."
+if [[ "${2:-}" == "update" ]]; then
+    log "Update mode (${ENV}) — refreshing IAM, rebuilding image, and updating Lambda code."
     # IAM is refreshed every run because create_lambda_role is idempotent
     # (put-role-policy replaces) and the inline policy may have grown
     # between deploys. Without this, code that needs new permissions
@@ -301,7 +344,7 @@ if [[ "${1:-}" == "update" ]]; then
     exit 0
 fi
 
-log "Full deployment starting..."
+log "Full deployment starting (env=${ENV})..."
 create_ecr_repo
 create_lambda_role
 create_sns_topic

@@ -32,25 +32,16 @@ ECR_REPO_NAME="ieee-rc-ai-orchestrator"
 S3_BUCKET_NAME="${ENV}-ieee-conference-cloud-bulk-uploads"
 IMAGE_TAG="latest"
 
-# Lambda + role names — env-aware. CC3-886's env-suffix transition was
-# never applied to the orchestrator on dev: the live function and role
-# are still the legacy unsuffixed names, and the EventBridge rule
-# `ieee-rc-s3-pending-trigger` targets them by that name. Deploying to
-# `-dev` suffixes here would leave a parallel never-invoked twin while
-# the wired-up Lambda stays stale. On staging the suffixed convention
-# is used. CC3-975 / CC3-886.
-LAMBDA_FUNCTION_NAME="ieee-rc-ai-orchestrator"
-if [[ "${ENV}" != "dev" ]]; then
-    LAMBDA_FUNCTION_NAME="${LAMBDA_FUNCTION_NAME}-${ENV}"
-fi
+# Lambda + role names — strict `-${ENV}` suffix in every env. CC3-886
+# Phase 1 wants the new env-suffixed Lambdas to stand up additively
+# alongside the legacy unsuffixed `ieee-rc-ai-orchestrator`, which stays
+# live (and EventBridge-wired) until Phase 4.2 retargets the rule. The
+# earlier dev carve-out (PR #58, commit 44369e0) was a workaround to
+# land the EventBridge parsing fix on the live Lambda; with that fix
+# now deployed and CC3-886 cutover starting, the carve-out is removed.
+LAMBDA_FUNCTION_NAME="ieee-rc-ai-orchestrator-${ENV}"
 LAMBDA_ROLE_NAME="${LAMBDA_FUNCTION_NAME}-role"
 
-# NOTE: PDF_EXTRACTOR_FN points at the env-suffixed name, but the PDF
-# extractor's deploy script (`scripts/deploy.sh`) still creates the
-# unsuffixed legacy name `ieee-cc-pdf-extractor` (Node-14 migration is
-# tracked separately). Until that catches up, override
-# `PDF_EXTRACTOR_FUNCTION` on the orchestrator Lambda manually for the
-# bridge period, or rename the existing PDF Lambda to `-${ENV}` first.
 PDF_EXTRACTOR_FN="ieee-cc-pdf-extractor-${ENV}"
 VIDEO_TRANSCRIBER_FN="ieee-cc-video-transcriber-${ENV}"
 PPTX_EXTRACTOR_FN="ieee-rc-pptx-extractor-${ENV}"
@@ -251,17 +242,15 @@ log "  Lambda:  ${LAMBDA_FUNCTION_NAME} (512 MB, 15 min timeout)"
 log ""
 
 # Probe the env-suffixed PDF extractor and warn if it doesn't exist yet.
-# The legacy `scripts/deploy.sh` still creates an unsuffixed
-# `ieee-cc-pdf-extractor`; orchestrator deploys here will reference
-# `${PDF_EXTRACTOR_FN}` and fail with ResourceNotFoundException at first
-# PDF dispatch unless the bridge is handled.
+# Orchestrator references `${PDF_EXTRACTOR_FN}` and will fail with
+# ResourceNotFoundException at first PDF dispatch unless `scripts/deploy.sh
+# ${ENV}` has been run first to create the env-suffixed Lambda.
 if ! aws lambda get-function --function-name "${PDF_EXTRACTOR_FN}" \
         --region "${AWS_REGION}" >/dev/null 2>&1; then
     log "WARNING: Lambda '${PDF_EXTRACTOR_FN}' does not exist yet."
     log "         Orchestrator will fail at PDF dispatch with ResourceNotFoundException."
-    log "         Bridge until the PDF extractor migrates: either rename the legacy"
-    log "         'ieee-cc-pdf-extractor' to '${PDF_EXTRACTOR_FN}', or override"
-    log "         PDF_EXTRACTOR_FUNCTION on '${LAMBDA_FUNCTION_NAME}' to the legacy name."
+    log "         Run './scripts/deploy.sh ${ENV}' to create it, or override"
+    log "         PDF_EXTRACTOR_FUNCTION on '${LAMBDA_FUNCTION_NAME}' to a different name."
 fi
 
 log "  Invoke:"
