@@ -13,8 +13,8 @@
 #   - Existing webhook signing secret available at iplr/webhook-secret in
 #     Secrets Manager (shared with the AI orchestrator's webhook)
 #   - Existing SNS topic for webhook failures (WEBHOOK_FAILURES_SNS_TOPIC_ARN)
-#   - Existing SQS DLQ (`ieee-rc-processing-dlq` on dev,
-#     `ieee-rc-processing-dlq-${ENV}` elsewhere) for async invocation failures
+#   - Existing SQS DLQ `ieee-rc-processing-dlq-${ENV}` for async invocation
+#     failures (provisioned by setup-s3-triggers.sh / deploy-dlq-processor.sh)
 #
 # Drupal-side prerequisite (A4 — NOT done by this script):
 #   The Drupal s3fs IAM role needs secretsmanager:CreateSecret/PutSecretValue/
@@ -23,10 +23,19 @@
 #   OAuth tokens. Without this, end-to-end smoke tests will fail.
 #
 # Usage:
-#   ./scripts/deploy-wizard-transfer.sh <env>            # first-time setup + deploy
+#   ./scripts/deploy-wizard-transfer.sh <env>            # additive Lambda deploy (NO trigger retarget)
 #   ./scripts/deploy-wizard-transfer.sh <env> update     # rebuild + update code only
+#   ./scripts/deploy-wizard-transfer.sh <env> retarget   # Phase 4 cutover: point transfer-actions/ trigger at -${env}
 #
 #   <env> = dev | staging   (prod naming handled separately under CC3-851)
+#
+# Default `<env>` mode is INTENTIONALLY additive: it builds + creates the
+# env-suffixed Lambda, IAM role, ECR repo and async-failure DLQ wiring,
+# but does NOT touch the live S3 bucket-notification config — the legacy
+# unsuffixed Lambda keeps consuming `transfer-actions/*.json` events while
+# the new `-${env}` twin sits idle for direct-invoke validation (CC3-886
+# Phase 1 / Phase 3). The S3 trigger retarget is gated to the explicit
+# `retarget` mode (CC3-886 Phase 4.4) so the cutover is reviewable.
 #
 set -euo pipefail
 
@@ -34,8 +43,17 @@ ENV="${1:-}"
 case "${ENV}" in
     dev|staging) ;;
     *)
-        echo "Usage: $0 <env> [update]   # env = dev | staging" >&2
+        echo "Usage: $0 <env> [update|retarget]   # env = dev | staging" >&2
         echo "       (prod naming is part of CC3-851; not accepted here)" >&2
+        exit 1
+        ;;
+esac
+
+MODE="${2:-}"
+case "${MODE}" in
+    ""|update|retarget) ;;
+    *)
+        echo "Usage: $0 <env> [update|retarget]   # unknown mode: ${MODE}" >&2
         exit 1
         ;;
 esac
@@ -206,18 +224,50 @@ EOF
 # ---------------------------------------------------------------
 # 3. Create or update Lambda function
 # ---------------------------------------------------------------
-build_env_vars() {
-    # Single source of truth for the Lambda's env map, so create + update
-    # paths can't drift. Lambda's --environment replaces wholesale; new
-    # vars MUST be added here, not just to the create-function call.
-    local env_vars="LOG_LEVEL=INFO,STAGE=${ENV}"
-    if [[ -n "${DRUPAL_WEBHOOK_SECRET}" ]]; then
-        env_vars="${env_vars},DRUPAL_WEBHOOK_SECRET=${DRUPAL_WEBHOOK_SECRET}"
-    fi
-    if [[ -n "${WEBHOOK_FAILURES_SNS_TOPIC_ARN}" ]]; then
-        env_vars="${env_vars},WEBHOOK_FAILURES_SNS_TOPIC_ARN=${WEBHOOK_FAILURES_SNS_TOPIC_ARN}"
-    fi
-    printf '%s' "${env_vars}"
+# DRUPAL_WEBHOOK_SECRET is user-supplied and can contain `,` `=` `"` etc.,
+# which the inline `Variables={k1=v1,k2=v2}` form mis-tokenises and the AWS
+# CLI rejects (or worse, silently truncates). We serialise the env map to
+# a JSON temp file and pass `--environment file://...` instead so json.dumps
+# handles the escaping. Mirrors the pattern in deploy-dlq-processor.sh.
+write_env_json() {
+    # Args: $1 = output path
+    # Reads owned vars from this script's scope and the optional DRUPAL_WEBHOOK_SECRET
+    # / WEBHOOK_FAILURES_SNS_TOPIC_ARN environment passthroughs. Out-of-band
+    # vars set on the live Lambda are preserved by reading them first.
+    local out_file="$1"
+
+    local existing_file
+    existing_file=$(mktemp)
+    aws lambda get-function-configuration \
+        --function-name "${LAMBDA_FUNCTION_NAME}" \
+        --region "${AWS_REGION}" \
+        --query 'Environment.Variables' --output json 2>/dev/null > "${existing_file}" \
+    || echo "{}" > "${existing_file}"
+
+    EXISTING_FILE="${existing_file}" \
+    ENV="${ENV}" \
+    DRUPAL_WEBHOOK_SECRET="${DRUPAL_WEBHOOK_SECRET}" \
+    WEBHOOK_FAILURES_SNS_TOPIC_ARN="${WEBHOOK_FAILURES_SNS_TOPIC_ARN}" \
+    python3 - > "${out_file}" <<'PYEOF'
+import json, os
+
+with open(os.environ["EXISTING_FILE"]) as f:
+    existing = json.load(f) or {}
+
+owned = {
+    "LOG_LEVEL": "INFO",
+    "STAGE": os.environ["ENV"],
+}
+if os.environ.get("DRUPAL_WEBHOOK_SECRET"):
+    owned["DRUPAL_WEBHOOK_SECRET"] = os.environ["DRUPAL_WEBHOOK_SECRET"]
+if os.environ.get("WEBHOOK_FAILURES_SNS_TOPIC_ARN"):
+    owned["WEBHOOK_FAILURES_SNS_TOPIC_ARN"] = os.environ["WEBHOOK_FAILURES_SNS_TOPIC_ARN"]
+
+existing.update(owned)
+print(json.dumps({"Variables": existing}))
+PYEOF
+
+    rm -f "${existing_file}"
 }
 
 create_lambda() {
@@ -232,6 +282,10 @@ create_lambda() {
         log "Waiting for IAM role propagation..."
         aws iam wait role-exists --role-name "${LAMBDA_ROLE_NAME}"
 
+        local env_json_file
+        env_json_file=$(mktemp)
+        write_env_json "${env_json_file}"
+
         # 1024 MB / 900 s — needed for 10 GB worst case within Lambda's
         # 15-minute hard cap.
         aws lambda create-function \
@@ -243,7 +297,8 @@ create_lambda() {
             --memory-size 1024 \
             --timeout 900 \
             --architectures x86_64 \
-            --environment "Variables={$(build_env_vars)}"
+            --environment "file://${env_json_file}"
+        rm -f "${env_json_file}"
 
         aws lambda wait function-active-v2 \
             --function-name "${LAMBDA_FUNCTION_NAME}" \
@@ -265,11 +320,17 @@ update_lambda_code() {
 
     # Re-emit env vars on every deploy so config changes (STAGE swap,
     # webhook secret rotation, new optional vars) actually land on
-    # existing Lambdas — not just on first create.
+    # existing Lambdas — not just on first create. JSON-file form is used
+    # so DRUPAL_WEBHOOK_SECRET with special chars (`,` `=` `"`) survives.
+    local env_json_file
+    env_json_file=$(mktemp)
+    write_env_json "${env_json_file}"
+
     aws lambda update-function-configuration \
         --function-name "${LAMBDA_FUNCTION_NAME}" \
         --region "${AWS_REGION}" \
-        --environment "Variables={$(build_env_vars)}"
+        --environment "file://${env_json_file}"
+    rm -f "${env_json_file}"
 
     aws lambda wait function-updated-v2 \
         --function-name "${LAMBDA_FUNCTION_NAME}" \
@@ -371,7 +432,7 @@ PY
 # ---------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------
-if [[ "${2:-}" == "update" ]]; then
+if [[ "${MODE}" == "update" ]]; then
     log "Update mode (${ENV}) — rebuilding image and updating Lambda code only."
     build_and_push
     update_lambda_code
@@ -379,18 +440,37 @@ if [[ "${2:-}" == "update" ]]; then
     exit 0
 fi
 
-log "Full deployment starting (env=${ENV})..."
+if [[ "${MODE}" == "retarget" ]]; then
+    # Phase 4.4 cutover: explicitly retarget the transfer-actions/ S3
+    # bucket notification entry (Id=${NOTIFICATION_ID}) at the env-suffixed
+    # Lambda. Replaces the legacy unsuffixed entry. Lambda must already
+    # exist; this mode only touches the bucket notification.
+    log "Retarget mode (${ENV}) — pointing s3://${TRIGGER_BUCKET_NAME}/${TRIGGER_PREFIX}*${TRIGGER_SUFFIX} at ${LAMBDA_FUNCTION_NAME}"
+    if ! aws lambda get-function --function-name "${LAMBDA_FUNCTION_NAME}" \
+            --region "${AWS_REGION}" >/dev/null 2>&1; then
+        echo "ERROR: Lambda '${LAMBDA_FUNCTION_NAME}' does not exist." >&2
+        echo "       Run './scripts/deploy-wizard-transfer.sh ${ENV}' (no mode) first." >&2
+        exit 1
+    fi
+    configure_s3_trigger
+    log "Retarget complete."
+    exit 0
+fi
+
+log "Full deployment starting (env=${ENV}) — additive; S3 trigger NOT retargeted."
 create_ecr_repo
 create_lambda_role
 build_and_push
 create_lambda
 configure_dlq
-configure_s3_trigger
-log "Deployment complete."
+log "Deployment complete (additive)."
+log ""
+log "  To retarget the S3 bucket notification at the new Lambda (Phase 4.4):"
+log "    ./scripts/deploy-wizard-transfer.sh ${ENV} retarget"
 log ""
 log "  ECR:       ${ECR_URI}:${IMAGE_TAG}"
 log "  Lambda:    ${LAMBDA_FUNCTION_NAME} (1024 MB, 900s timeout)"
-log "  Trigger:   s3://${TRIGGER_BUCKET_NAME}/${TRIGGER_PREFIX}*${TRIGGER_SUFFIX}"
+log "  Trigger:   s3://${TRIGGER_BUCKET_NAME}/${TRIGGER_PREFIX}*${TRIGGER_SUFFIX} (NOT WIRED YET — run retarget mode)"
 log "  DLQ:       ${DLQ_QUEUE_ARN}"
 log ""
 log "Reminder: Drupal s3fs IAM role needs secretsmanager:CreateSecret/"
