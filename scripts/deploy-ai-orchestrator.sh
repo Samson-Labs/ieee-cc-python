@@ -286,10 +286,26 @@ update_lambda_code() {
             WEBHOOK_FAILURES_SNS_TOPIC_ARN: $webhook_sns
         }')
 
+    # --environment accepts either shorthand `Variables={k=v,k=v}` (no JSON,
+    # no quotes around values, can't safely express URLs with commas) OR a
+    # full JSON object via `file://`. Writing the JSON to a temp file is the
+    # safer pattern — handles arbitrary characters in env values without
+    # quoting/escaping pitfalls. The literal `Variables={"k":"v"}` form fails
+    # AWS CLI's argument parser ("Expected: '=', received: '\"'").
+    # mktemp pattern: GNU mktemp requires XXXXXX at the END of the template
+    # (an X-suffix like .json after it fails with "Invalid argument" on Linux).
+    # macOS BSD mktemp tolerates it but leaves literal XXXXXX in the name.
+    # Use trailing X's only — file content is what AWS reads, extension irrelevant.
+    # EXIT trap (not RETURN) because `set -e` exits the shell on a failed
+    # command without invoking RETURN — only EXIT fires reliably on early-out.
+    ENV_FILE=$(mktemp "${TMPDIR:-/tmp}/orchestrator-${ENV}-env.XXXXXX")
+    trap 'rm -f "${ENV_FILE}"' EXIT
+    printf '{"Variables": %s}' "${MERGED_ENV}" > "${ENV_FILE}"
+
     aws lambda update-function-configuration \
         --function-name "${LAMBDA_FUNCTION_NAME}" \
         --region "${AWS_REGION}" \
-        --environment "Variables=${MERGED_ENV}"
+        --environment "file://${ENV_FILE}"
 
     aws lambda wait function-updated-v2 \
         --function-name "${LAMBDA_FUNCTION_NAME}" \
