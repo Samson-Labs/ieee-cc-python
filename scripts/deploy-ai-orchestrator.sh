@@ -5,6 +5,7 @@
 # Prerequisites:
 #   - AWS CLI configured with profile "ieee-cc"
 #   - Docker running locally
+#   - jq (for env-var merge in update_lambda_code)
 #
 # Usage:
 #   ./scripts/deploy-ai-orchestrator.sh <env>            # first-time setup + deploy
@@ -46,6 +47,19 @@ PDF_EXTRACTOR_FN="ieee-cc-pdf-extractor-${ENV}"
 VIDEO_TRANSCRIBER_FN="ieee-cc-video-transcriber-${ENV}"
 PPTX_EXTRACTOR_FN="ieee-rc-pptx-extractor-${ENV}"
 BEDROCK_FN="ieee-cc-bedrock-inference-${ENV}"
+
+# Webhook-failure SNS topic + DLQ queue ARNs. Hoisted to top-level
+# (away from create_lambda_role) so both the IAM block AND the
+# Lambda env-var plumbing in create_lambda / update_lambda_code see
+# the same values without depending on function-call order. CC3-886
+# Phase 1 keeps these unsuffixed for dev (live resource is unsuffixed);
+# staging gets the strict suffix.
+WEBHOOK_FAILURES_TOPIC_ARN="arn:aws:sns:${AWS_REGION}:${AWS_ACCOUNT_ID}:ieee-rc-webhook-failures"
+DLQ_QUEUE_ARN="arn:aws:sqs:${AWS_REGION}:${AWS_ACCOUNT_ID}:ieee-rc-processing-dlq"
+if [[ "${ENV}" != "dev" ]]; then
+    WEBHOOK_FAILURES_TOPIC_ARN="${WEBHOOK_FAILURES_TOPIC_ARN}-${ENV}"
+    DLQ_QUEUE_ARN="${DLQ_QUEUE_ARN}-${ENV}"
+fi
 
 ECR_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO_NAME}"
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -109,16 +123,10 @@ create_lambda_role() {
         }]
     }'
 
-    # Webhook-failure SNS topic + DLQ queue ARNs — derived from env vars
-    # plumbed onto the Lambda (`WEBHOOK_FAILURES_SNS_TOPIC_ARN`,
-    # `DLQ_QUEUE_URL`). On dev the live resources are still unsuffixed
-    # (no `-dev`); on staging they get the env suffix.
-    WEBHOOK_FAILURES_TOPIC_ARN="arn:aws:sns:${AWS_REGION}:${AWS_ACCOUNT_ID}:ieee-rc-webhook-failures"
-    DLQ_QUEUE_ARN="arn:aws:sqs:${AWS_REGION}:${AWS_ACCOUNT_ID}:ieee-rc-processing-dlq"
-    if [[ "${ENV}" != "dev" ]]; then
-        WEBHOOK_FAILURES_TOPIC_ARN="${WEBHOOK_FAILURES_TOPIC_ARN}-${ENV}"
-        DLQ_QUEUE_ARN="${DLQ_QUEUE_ARN}-${ENV}"
-    fi
+    # WEBHOOK_FAILURES_TOPIC_ARN and DLQ_QUEUE_ARN are defined at the
+    # top of the script so both this function (IAM grants) and
+    # create_lambda / update_lambda_code (env-var plumbing) see the
+    # same values without depending on function-call order.
 
     INLINE_POLICY="{
         \"Version\": \"2012-10-17\",
@@ -219,7 +227,7 @@ create_lambda() {
             --memory-size 512 \
             --timeout 900 \
             --architectures x86_64 \
-            --environment "Variables={LOG_LEVEL=INFO,STAGE=${ENV},PDF_EXTRACTOR_FUNCTION=${PDF_EXTRACTOR_FN},VIDEO_TRANSCRIBER_FUNCTION=${VIDEO_TRANSCRIBER_FN},PPTX_EXTRACTOR_FUNCTION=${PPTX_EXTRACTOR_FN},BEDROCK_FUNCTION=${BEDROCK_FN}}"
+            --environment "Variables={LOG_LEVEL=INFO,STAGE=${ENV},PDF_EXTRACTOR_FUNCTION=${PDF_EXTRACTOR_FN},VIDEO_TRANSCRIBER_FUNCTION=${VIDEO_TRANSCRIBER_FN},PPTX_EXTRACTOR_FUNCTION=${PPTX_EXTRACTOR_FN},BEDROCK_FUNCTION=${BEDROCK_FN},WEBHOOK_FAILURES_SNS_TOPIC_ARN=${WEBHOOK_FAILURES_TOPIC_ARN}}"
 
         aws lambda wait function-active-v2 \
             --function-name "${LAMBDA_FUNCTION_NAME}" \
@@ -260,7 +268,7 @@ update_lambda_code() {
         --region "${AWS_REGION}" \
         --query 'Environment.Variables' \
         --output json)
-    MERGED_ENV=$(echo "${CURRENT_ENV}" | jq -c \
+    MERGED_ENV=$(printf '%s' "${CURRENT_ENV:-null}" | jq -c \
         --arg log_level "INFO" \
         --arg stage "${ENV}" \
         --arg pdf_fn "${PDF_EXTRACTOR_FN}" \
