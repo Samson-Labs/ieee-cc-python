@@ -292,8 +292,14 @@ update_lambda_code() {
     # safer pattern — handles arbitrary characters in env values without
     # quoting/escaping pitfalls. The literal `Variables={"k":"v"}` form fails
     # AWS CLI's argument parser ("Expected: '=', received: '\"'").
-    ENV_FILE=$(mktemp -t "orchestrator-${ENV}-env.XXXXXX.json")
-    trap 'rm -f "${ENV_FILE}"' RETURN
+    # mktemp pattern: GNU mktemp requires XXXXXX at the END of the template
+    # (an X-suffix like .json after it fails with "Invalid argument" on Linux).
+    # macOS BSD mktemp tolerates it but leaves literal XXXXXX in the name.
+    # Use trailing X's only — file content is what AWS reads, extension irrelevant.
+    # EXIT trap (not RETURN) because `set -e` exits the shell on a failed
+    # command without invoking RETURN — only EXIT fires reliably on early-out.
+    ENV_FILE=$(mktemp "${TMPDIR:-/tmp}/orchestrator-${ENV}-env.XXXXXX")
+    trap 'rm -f "${ENV_FILE}"' EXIT
     printf '{"Variables": %s}' "${MERGED_ENV}" > "${ENV_FILE}"
 
     aws lambda update-function-configuration \
