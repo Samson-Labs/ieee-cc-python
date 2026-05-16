@@ -238,6 +238,54 @@ update_lambda_code() {
     aws lambda wait function-updated-v2 \
         --function-name "${LAMBDA_FUNCTION_NAME}" \
         --region "${AWS_REGION}"
+
+    # Re-emit the env vars this script computes so config-driven changes
+    # actually land on existing Lambdas (CC3-975). update-function-code only
+    # ships the new container image; --environment Variables=... is a
+    # separate API call. WITHOUT this block, any change to the
+    # WEBHOOK_FAILURES_TOPIC_ARN derivation, extractor-FN naming, STAGE
+    # value, etc. deploys to fresh creates only and silently no-ops on
+    # every subsequent re-deploy.
+    #
+    # CRITICAL: --environment Variables=... REPLACES the env map wholesale
+    # — anything not in the JSON gets wiped. So we fetch the current map
+    # first, merge in only the keys this script owns, and write back. That
+    # preserves manually-set keys (DRUPAL_WEBHOOK_SECRET, DLQ_QUEUE_URL on
+    # dev, anything ad-hoc) which the script doesn't currently compute.
+    # When the script grows to compute one of those, add it to the merge
+    # set below — adding it here is the only place the value gets honored
+    # on re-deploys.
+    CURRENT_ENV=$(aws lambda get-function-configuration \
+        --function-name "${LAMBDA_FUNCTION_NAME}" \
+        --region "${AWS_REGION}" \
+        --query 'Environment.Variables' \
+        --output json)
+    MERGED_ENV=$(echo "${CURRENT_ENV}" | jq -c \
+        --arg log_level "INFO" \
+        --arg stage "${ENV}" \
+        --arg pdf_fn "${PDF_EXTRACTOR_FN}" \
+        --arg video_fn "${VIDEO_TRANSCRIBER_FN}" \
+        --arg pptx_fn "${PPTX_EXTRACTOR_FN}" \
+        --arg bedrock_fn "${BEDROCK_FN}" \
+        --arg webhook_sns "${WEBHOOK_FAILURES_TOPIC_ARN}" \
+        '. + {
+            LOG_LEVEL: $log_level,
+            STAGE: $stage,
+            PDF_EXTRACTOR_FUNCTION: $pdf_fn,
+            VIDEO_TRANSCRIBER_FUNCTION: $video_fn,
+            PPTX_EXTRACTOR_FUNCTION: $pptx_fn,
+            BEDROCK_FUNCTION: $bedrock_fn,
+            WEBHOOK_FAILURES_SNS_TOPIC_ARN: $webhook_sns
+        }')
+
+    aws lambda update-function-configuration \
+        --function-name "${LAMBDA_FUNCTION_NAME}" \
+        --region "${AWS_REGION}" \
+        --environment "Variables=${MERGED_ENV}"
+
+    aws lambda wait function-updated-v2 \
+        --function-name "${LAMBDA_FUNCTION_NAME}" \
+        --region "${AWS_REGION}"
 }
 
 # ---------------------------------------------------------------
