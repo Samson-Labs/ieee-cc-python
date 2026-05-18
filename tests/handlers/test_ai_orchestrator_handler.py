@@ -148,6 +148,54 @@ class TestEventBridgeInvocation:
 
 
 # ---------------------------------------------------------------
+# pending/metadata/ side-effect skip (CC3-995)
+# ---------------------------------------------------------------
+
+class TestPendingMetadataSkip:
+    """get-video-info Lambda writes side-effect JSONs under {ou}/pending/metadata/
+    that the */pending/* EventBridge rule can't easily exclude. The handler
+    short-circuits with a clean 200 instead of running the orchestrator."""
+
+    def test_eventbridge_metadata_path_skipped(self, mock_orchestrator):
+        result = handler(
+            _eventbridge_event(
+                "dev-ieee-conference-cloud-bulk-uploads",
+                "APS/pending/metadata/100.mp4.json",
+            ),
+            None,
+        )
+
+        assert result["statusCode"] == 200
+        assert result["body"]["action"] == "skipped"
+        assert result["body"]["key"] == "APS/pending/metadata/100.mp4.json"
+        mock_orchestrator.process.assert_not_called()
+
+    def test_s3_metadata_path_skipped(self, mock_orchestrator):
+        result = handler(
+            _s3_event(
+                "dev-ieee-conference-cloud-bulk-uploads",
+                "PES/pending/metadata/200.mp4.json",
+            ),
+            None,
+        )
+
+        assert result["statusCode"] == 200
+        assert result["body"]["action"] == "skipped"
+        mock_orchestrator.process.assert_not_called()
+
+    def test_legit_pending_media_still_processes(self, mock_orchestrator):
+        # Regression guard: don't accidentally over-skip. Files directly in
+        # {ou}/pending/ should still be dispatched.
+        result = handler(
+            _eventbridge_event("dev-bucket", "APS/pending/100.mp4"),
+            None,
+        )
+
+        assert result["statusCode"] == 200
+        mock_orchestrator.process.assert_called_once()
+
+
+# ---------------------------------------------------------------
 # Error Handling
 # ---------------------------------------------------------------
 

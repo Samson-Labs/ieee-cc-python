@@ -58,6 +58,31 @@ def handler(event: dict, context) -> dict:
         else:
             bucket_parsed, key_parsed = _parse_event(event)
             meta_parsed = None
+            # Short-circuit: bulk-uploads-transfer's get-video-info Lambda
+            # writes {ou}/pending/metadata/{filename}.json as a side effect
+            # of mp4 processing. The */pending/* EventBridge rule matches
+            # this side-effect, but the file isn't a pending media file we
+            # should process. Tightening the rule to exclude pending/metadata/
+            # was attempted but composite wildcard patterns exceed EB's
+            # complexity limit, so the defensive check lives here.
+            # CC3-995.
+            parts = key_parsed.split("/")
+            if len(parts) >= 3 and parts[2] == "metadata":
+                logger.info(
+                    "Skipping non-media event in pending/metadata/: s3://%s/%s "
+                    "(get-video-info Lambda byproduct, not a pending media file)",
+                    bucket_parsed,
+                    key_parsed,
+                )
+                return {
+                    "statusCode": 200,
+                    "body": {
+                        "action": "skipped",
+                        "reason": "key is in pending/metadata/ (Lambda byproduct, not media)",
+                        "bucket": bucket_parsed,
+                        "key": key_parsed,
+                    },
+                }
     except (KeyError, ValueError) as exc:
         logger.error("Bad request: %s", exc)
         return {"statusCode": 400, "body": {"error": str(exc)}}
