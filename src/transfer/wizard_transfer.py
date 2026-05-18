@@ -150,6 +150,21 @@ class WizardTransfer:
         try:
             bytes_transferred, etag = self._stream_to_s3(trigger, correlation)
         except _TerminalTransferError as exc:
+            # Make terminal failures grep-able in CloudWatch alongside the
+            # "Transfer start" line. Without this, a 400/404/timeout would
+            # only surface in the webhook payload and the next-line "Webhook
+            # sent" log — easy to miss when debugging from logs alone
+            # (CC3-993).
+            logger.error(
+                "%s Transfer FAILED: source_type=%s source_ref=%s "
+                "error_code=%s bytes_transferred=%d error=%s",
+                correlation,
+                trigger["source_type"],
+                trigger["source_ref"],
+                exc.error_code,
+                exc.bytes_transferred,
+                exc.message,
+            )
             webhook_delivered = self._send_callback(
                 trigger,
                 correlation,
