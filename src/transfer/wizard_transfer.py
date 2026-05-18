@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 from typing import IO, Literal, NotRequired, TypedDict
+from urllib.parse import urlsplit
 
 import boto3
 import requests
@@ -94,6 +95,25 @@ class TransferResult(TypedDict):
     webhook_delivered: bool
 
 
+def _safe_source_for_log(source_type: str, source_ref: str) -> str:
+    """Sanitize source_ref for logging.
+
+    URLs can carry credentials in userinfo or query strings (signed S3 URLs,
+    OAuth bearer tokens in path params, etc.); CloudWatch logs are retained
+    long-term so leaking them in an error log is a real exposure. Drop the
+    userinfo and query string for URL sources. Drive file IDs are opaque
+    identifiers and safe to log verbatim. The full trigger remains in S3
+    after a failed transfer for operator inspection if needed.
+    """
+    if source_type != "url":
+        return source_ref
+    try:
+        parts = urlsplit(source_ref)
+        return f"{parts.scheme}://{parts.hostname or ''}{parts.path}"
+    except Exception:
+        return "(unparseable URL)"
+
+
 class _CountingStream:
     """Wraps a file-like to count bytes read.
 
@@ -150,6 +170,26 @@ class WizardTransfer:
         try:
             bytes_transferred, etag = self._stream_to_s3(trigger, correlation)
         except _TerminalTransferError as exc:
+            # Make terminal failures grep-able in CloudWatch alongside the
+            # "Transfer start" line. Without this, a 400/404/timeout would
+            # only surface in the webhook payload and the next-line "Webhook
+            # sent" log — easy to miss when debugging from logs alone.
+            # Source is sanitized to drop query strings / userinfo; full
+            # trigger is preserved in S3 on failure for operator inspection.
+            # exc_info=True captures the stack trace + underlying cause
+            # (ClientError, RequestException) for root-cause analysis.
+            # CC3-993.
+            logger.error(
+                "%s Transfer FAILED: source_type=%s source=%s "
+                "error_code=%s bytes_transferred=%d error=%s",
+                correlation,
+                trigger["source_type"],
+                _safe_source_for_log(trigger["source_type"], trigger["source_ref"]),
+                exc.error_code,
+                exc.bytes_transferred,
+                exc.message,
+                exc_info=True,
+            )
             webhook_delivered = self._send_callback(
                 trigger,
                 correlation,
