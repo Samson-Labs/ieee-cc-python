@@ -307,11 +307,15 @@ class ImageOverlayGenerator:
 
         # Stage prefix: dev/staging buckets are isolated from prod by a
         # `dev-` / `staging-` prefix on the bucket name; prod has no prefix.
-        # Mirrors Node.js handler.js:26-36.
+        # `_apply_stage_prefix` is idempotent — Drupal's IPLR module also
+        # prefixes via `S3UtilityTrait::prefixBucket()`, so trigger payloads
+        # already arrive `dev-`/`staging-` qualified; applying the prefix
+        # blindly produced `dev-dev-...` NoSuchBucket errors (see CC3-870
+        # follow-up). Mirrors Node.js handler.js:26-36 with idempotency.
         prefix = _stage_prefix()
-        source_bucket = f"{prefix}{payload['sourceBucket']}"
+        source_bucket = _apply_stage_prefix(payload["sourceBucket"], prefix)
         source_name = payload["sourceName"]
-        dest_bucket = f"{prefix}{payload['destBucket']}"
+        dest_bucket = _apply_stage_prefix(payload["destBucket"], prefix)
         dest_name = payload["destName"]
         overlay_specs = payload["overlay"]
 
@@ -806,6 +810,36 @@ def _stage_prefix() -> str:
         f"Unrecognized STAGE={stage!r}; expected one of "
         f"{_STAGE_PREFIXED + _STAGE_NO_PREFIX}"
     )
+
+
+# Known stage prefixes — used by `_apply_stage_prefix` to detect when a
+# bucket name is already environment-qualified and skip a second prefix
+# application. Derived from `_STAGE_PREFIXED` so new stages (e.g. "qa")
+# only need to be added in one place. Mirrors `Samson-Labs/ieee-cc`'s
+# `S3UtilityTrait::prefixBucket()`, which is the upstream source of bucket
+# names in the legacy Drupal trigger payloads.
+_KNOWN_STAGE_PREFIXES = tuple(f"{s}-" for s in _STAGE_PREFIXED)
+
+
+def _apply_stage_prefix(bucket: str, prefix: str) -> str:
+    """Apply the current stage prefix to a bucket name, idempotently.
+
+    Returns `bucket` unchanged when it already starts with `prefix`
+    (which covers prod / unset STAGE where `prefix == ""`, since
+    `str.startswith("")` is always True) or with any other known stage
+    prefix (so a `staging-...` bucket reaching a `dev-` Lambda doesn't
+    get mangled to `dev-staging-...`). Otherwise prepends `prefix`.
+
+    The Drupal IPLR module (`Samson-Labs/ieee-cc`,
+    `web/modules/custom/ieee_product_load_request/src/Service/S3UtilityTrait.php`)
+    applies `dev-`/`staging-` prefixes via its own `prefixBucket()` helper,
+    so trigger JSON written by Drupal arrives with bucket names that are
+    already qualified. The blind-prefix variant produced `dev-dev-...` and
+    failed with NoSuchBucket — see the CC3-870 thread for the 2026-05-18 trace.
+    """
+    if bucket.startswith(prefix) or bucket.startswith(_KNOWN_STAGE_PREFIXES):
+        return bucket
+    return f"{prefix}{bucket}"
 
 
 def _safe_int(value, default: int, field: str) -> int:
