@@ -32,6 +32,7 @@ from src.generators.image_overlay_generator import (
     _parse_legacy_attributes,
     _safe_float,
     _safe_int,
+    _apply_stage_prefix,
     _stage_prefix,
     _wrap_and_truncate,
     _wrap_pixels,
@@ -718,6 +719,97 @@ class TestStagePrefix:
 
         put_kwargs = s3_mock.put_object.call_args[1]
         assert put_kwargs["Bucket"] == payload["destBucket"]
+
+
+class TestStagePrefixIdempotency:
+    """`_apply_stage_prefix` must not double-prefix already-qualified names.
+
+    Drupal's IPLR module already emits `dev-`/`staging-` prefixed bucket
+    names via `S3UtilityTrait::prefixBucket()`. Blind prefix application
+    in the legacy path produced `dev-dev-...` NoSuchBucket errors observed
+    in `/aws/lambda/ieee-rc-image-generator-dev` on 2026-05-18 — see the
+    CC3-870 thread for the trace. These tests pin the idempotent contract.
+    """
+
+    def test_unprefixed_dev_adds_prefix(self):
+        assert (
+            _apply_stage_prefix("ieee-conference-cloud-uploads", "dev-")
+            == "dev-ieee-conference-cloud-uploads"
+        )
+
+    def test_unprefixed_staging_adds_prefix(self):
+        assert (
+            _apply_stage_prefix("ieee-conference-cloud-uploads", "staging-")
+            == "staging-ieee-conference-cloud-uploads"
+        )
+
+    def test_already_dev_prefixed_returns_as_is(self):
+        # The exact scenario that broke on 2026-05-18.
+        assert (
+            _apply_stage_prefix("dev-ieee-conference-cloud-uploads", "dev-")
+            == "dev-ieee-conference-cloud-uploads"
+        )
+
+    def test_already_staging_prefixed_returns_as_is_under_staging(self):
+        assert (
+            _apply_stage_prefix("staging-ieee-conference-cloud-uploads", "staging-")
+            == "staging-ieee-conference-cloud-uploads"
+        )
+
+    def test_cross_stage_prefix_does_not_double_apply(self):
+        # A `staging-` prefixed bucket reaching a `dev-` Lambda is a
+        # misconfiguration but should still not produce `dev-staging-...`;
+        # let the downstream NoSuchBucket surface the real problem instead
+        # of masking it as a different mangled name.
+        assert (
+            _apply_stage_prefix("staging-ieee-conference-cloud-uploads", "dev-")
+            == "staging-ieee-conference-cloud-uploads"
+        )
+
+    def test_empty_prefix_returns_as_is(self):
+        # prod or unset STAGE → prefix == ""
+        assert (
+            _apply_stage_prefix("ieee-conference-cloud-uploads", "")
+            == "ieee-conference-cloud-uploads"
+        )
+        assert (
+            _apply_stage_prefix("dev-ieee-conference-cloud-uploads", "")
+            == "dev-ieee-conference-cloud-uploads"
+        )
+
+    def test_legacy_process_with_prefixed_payload_does_not_double_prefix(
+        self, monkeypatch
+    ):
+        """End-to-end: Drupal-style `dev-`-prefixed buckets in STAGE=dev
+        must produce single-prefix S3 calls, not `dev-dev-...`.
+
+        This is the regression test for the CC3-870 follow-up: prior to the
+        idempotent helper, this scenario produced two `dev-dev-...` bucket
+        names and the Lambda logged `S3 error (NoSuchBucket)`.
+        """
+        monkeypatch.setenv("STAGE", "dev")
+        s3_mock = MagicMock()
+        payload = _make_legacy_payload(
+            sourceBucket="dev-ieee-conference-cloud-uploads",
+            destBucket="dev-ieee-conference-cloud-bulk-uploads",
+        )
+        _mock_s3_for_legacy_trigger(s3_mock, payload)
+        gen = ImageOverlayGenerator(s3_client=s3_mock)
+
+        gen.process_trigger(bucket="trigger-bucket", key="actions/job.json")
+
+        # Source download hits the bucket as-is — no `dev-dev-` mangling.
+        source_calls = [
+            c
+            for c in s3_mock.get_object.call_args_list
+            if not c[1]["Key"].endswith(".json")
+        ]
+        assert len(source_calls) == 1
+        assert source_calls[0][1]["Bucket"] == "dev-ieee-conference-cloud-uploads"
+
+        # Upload hits the dest bucket as-is.
+        put_kwargs = s3_mock.put_object.call_args[1]
+        assert put_kwargs["Bucket"] == "dev-ieee-conference-cloud-bulk-uploads"
 
 
 class TestVerticalAnchoring:
