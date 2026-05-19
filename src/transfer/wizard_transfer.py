@@ -416,13 +416,15 @@ class WizardTransfer:
                 response.close()
                 raise _TerminalTransferError(
                     ERR_DRIVE_FORBIDDEN,
-                    f"Drive returned 403 Forbidden for file {trigger['source_ref']}; the user lacks download permission.",
+                    f"Drive returned 403 Forbidden for file {trigger['source_ref']}; "
+                    f"the user lacks download permission.",
                 )
             if response.status_code == 404:
                 response.close()
                 raise _TerminalTransferError(
                     ERR_DRIVE_NOT_FOUND,
-                    f"Drive returned 404 Not Found for file {trigger['source_ref']}; the file was removed or the id is wrong.",
+                    f"Drive returned 404 Not Found for file {trigger['source_ref']}; "
+                    f"the file was removed or the id is wrong.",
                 )
         elif response.status_code == 404:
             response.close()
