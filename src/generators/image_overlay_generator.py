@@ -814,27 +814,30 @@ def _stage_prefix() -> str:
 
 # Known stage prefixes — used by `_apply_stage_prefix` to detect when a
 # bucket name is already environment-qualified and skip a second prefix
-# application. Mirrors `Samson-Labs/ieee-cc`'s `S3UtilityTrait::prefixBucket()`
-# which is the upstream source of bucket names in the legacy Drupal trigger
-# payloads. Keep in sync if a new stage (e.g. "qa") is added.
-_KNOWN_STAGE_PREFIXES = ("dev-", "staging-")
+# application. Derived from `_STAGE_PREFIXED` so new stages (e.g. "qa")
+# only need to be added in one place. Mirrors `Samson-Labs/ieee-cc`'s
+# `S3UtilityTrait::prefixBucket()`, which is the upstream source of bucket
+# names in the legacy Drupal trigger payloads.
+_KNOWN_STAGE_PREFIXES = tuple(f"{s}-" for s in _STAGE_PREFIXED)
 
 
 def _apply_stage_prefix(bucket: str, prefix: str) -> str:
     """Apply the current stage prefix to a bucket name, idempotently.
 
-    Returns `bucket` unchanged when `prefix` is empty (prod / unset STAGE)
-    or when `bucket` already starts with a known stage prefix. Otherwise
-    prepends `prefix`.
+    Returns `bucket` unchanged when it already starts with `prefix`
+    (which covers prod / unset STAGE where `prefix == ""`, since
+    `str.startswith("")` is always True) or with any other known stage
+    prefix (so a `staging-...` bucket reaching a `dev-` Lambda doesn't
+    get mangled to `dev-staging-...`). Otherwise prepends `prefix`.
 
     The Drupal IPLR module (`Samson-Labs/ieee-cc`,
     `web/modules/custom/ieee_product_load_request/src/Service/S3UtilityTrait.php`)
-    applies `dev-`/`staging-` prefixes via its own `prefixBucket()` helper, so
-    trigger JSON written by Drupal arrives with bucket names that are already
-    qualified. The blind-prefix variant produced `dev-dev-...` and failed
-    with NoSuchBucket — see the CC3-870 thread for the 2026-05-18 trace.
+    applies `dev-`/`staging-` prefixes via its own `prefixBucket()` helper,
+    so trigger JSON written by Drupal arrives with bucket names that are
+    already qualified. The blind-prefix variant produced `dev-dev-...` and
+    failed with NoSuchBucket — see the CC3-870 thread for the 2026-05-18 trace.
     """
-    if not prefix or bucket.startswith(_KNOWN_STAGE_PREFIXES):
+    if bucket.startswith(prefix) or bucket.startswith(_KNOWN_STAGE_PREFIXES):
         return bucket
     return f"{prefix}{bucket}"
 
