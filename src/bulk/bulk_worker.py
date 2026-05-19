@@ -225,7 +225,7 @@ class BulkWorker:
         meta = {
             "item_id": str(item_id),
             "ou": ou,
-            "product_part_number": str(item.get("request_id", item_id)),
+            "product_part_number": str(item["product_part_number"]),
             "ai_enrichment_enabled": True,
             "callback_url": callback_url,
             "content": {
@@ -263,7 +263,7 @@ class BulkWorker:
         meta = {
             "item_id": str(item["item_id"]),
             "ou": item["resource_center"],
-            "product_part_number": str(item.get("request_id", item["item_id"])),
+            "product_part_number": str(item.get("product_part_number") or item["item_id"]),
             "ai_enrichment_enabled": True,
             "callback_url": callback_url,
             "input_text": item["input_text"],

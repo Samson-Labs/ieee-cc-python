@@ -17,7 +17,7 @@ def _make_item(
     media_type: str = "PDF",
     s3_key: str = "PES/archive/paper.pdf",
     resource_center: str = "PES",
-    request_id: int = 0,
+    product_part_number: str = "PESPAPER001",
     input_text: str | None = None,
     input_text_mode: str | None = None,
     requested_fields: list[str] | None = None,
@@ -25,8 +25,8 @@ def _make_item(
 ) -> dict:
     item = {
         "item_id": item_id,
-        "request_id": request_id,
         "resource_center": resource_center,
+        "product_part_number": product_part_number,
         "title": "Test Paper",
     }
     # Only include media_type for file-backed items (mirrors real payloads)
@@ -226,7 +226,7 @@ class TestReadbackVerification:
 class TestCreateMetaJson:
     def test_writes_correct_meta_key(self, worker):
         w, _, s3_mock, _ = worker
-        item = _make_item(item_id=42, request_id=7)
+        item = _make_item(item_id=42, product_part_number="PESVID042")
 
         key = w._create_meta_json("bucket", item, "https://example.com/webhook")
 
@@ -235,7 +235,7 @@ class TestCreateMetaJson:
         meta = json.loads(call_kwargs["Body"])
         assert meta["item_id"] == "42"
         assert meta["ou"] == "PES"
-        assert meta["product_part_number"] == "7"
+        assert meta["product_part_number"] == "PESVID042"
         assert meta["ai_enrichment_enabled"] is True
         assert meta["callback_url"] == "https://example.com/webhook"
         assert meta["content"]["media_type"] == "application/pdf"
@@ -249,6 +249,22 @@ class TestCreateMetaJson:
 
         meta = json.loads(s3_mock.put_object.call_args[1]["Body"])
         assert meta["content"]["media_type"] == "video/quicktime"
+
+    def test_ppn_not_synthesized_from_request_id(self, worker):
+        """CC3-1001 regression: meta.json must carry the real PPN from
+        the manifest, not a str(request_id) synthesis. When request_id
+        is present (Drupal's transitional additive payload), the worker
+        must still read product_part_number directly.
+        """
+        w, _, s3_mock, _ = worker
+        item = _make_item(item_id=42, product_part_number="SPSEDU20VID002")
+        item["request_id"] = 0  # transitional Drupal payload
+
+        w._create_meta_json("bucket", item, "https://example.com/webhook")
+
+        meta = json.loads(s3_mock.put_object.call_args[1]["Body"])
+        assert meta["product_part_number"] == "SPSEDU20VID002"
+        assert meta["product_part_number"] != "0"
 
 
 # --- Invoke orchestrator ---
@@ -526,7 +542,10 @@ class TestTextOnlyPath:
         w, lambda_mock, s3_mock, _ = worker
         lambda_mock.invoke.return_value = _orchestrator_success_response()
         s3_mock.get_object.return_value = _progress_response(completed=0, total=1)
-        item = _make_item(item_id=42, s3_key=None, input_text="Text.", request_id=7)
+        item = _make_item(
+            item_id=42, s3_key=None, input_text="Text.",
+            product_part_number="PESTEXT042",
+        )
         record = _make_sqs_record(item=item, total_items=1)
 
         w.process_item(record)
@@ -534,7 +553,7 @@ class TestTextOnlyPath:
         meta = json.loads(lambda_mock.invoke.call_args[1]["Payload"])["meta"]
         assert meta["item_id"] == "42"
         assert meta["ou"] == "PES"
-        assert meta["product_part_number"] == "7"
+        assert meta["product_part_number"] == "PESTEXT042"
         assert meta["ai_enrichment_enabled"] is True
         assert meta["content"]["media_type"] == "text/plain"
         assert meta["callback_url"] == "https://example.com/webhook"

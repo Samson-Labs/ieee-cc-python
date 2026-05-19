@@ -17,7 +17,7 @@ logger = get_json_logger(__name__)
 DEFAULT_BUCKET = os.environ.get("S3_BUCKET", "dev-ieee-conference-cloud-bulk-uploads")
 
 REQUIRED_MANIFEST_FIELDS = {"batch_id", "callback_url", "items"}
-ALWAYS_REQUIRED_ITEM_FIELDS = {"item_id", "request_id", "resource_center"}
+ALWAYS_REQUIRED_ITEM_FIELDS = {"item_id", "resource_center"}
 VALID_MEDIA_TYPES = {"PDF", "MP4", "MOV", "WEBM"}
 VALID_INPUT_TEXT_MODES = frozenset({"as_source", "as_abstract"})
 
@@ -115,13 +115,18 @@ class BulkProcessor:
             raise ValidationError("Manifest 'items' must be a non-empty list")
 
         # Item-validation contract:
-        #   ALWAYS REQUIRED:       {item_id, request_id, resource_center}
+        #   ALWAYS REQUIRED:       {item_id, resource_center}
         #   WHEN s3_key PRESENT:   media_type ∈ VALID_MEDIA_TYPES;
-        #                          source_bucket non-empty if provided
+        #                          source_bucket non-empty if provided;
+        #                          product_part_number non-empty string
         #   WHEN s3_key EMPTY:     input_text non-empty
         # Empty/absent values for context-dependent fields are tolerated
         # (Strategy A items emit input_text="" by design; text-only items
         # emit source_bucket="" because there's no source to fetch).
+        # product_part_number is the canonical S3-layout key for
+        # {ou}/processed/{PPN}.{ext}, {ou}/subtitles/{PPN}.vtt, etc.
+        # (CC3-1001: required to avoid last-write-wins collisions when
+        # bulk batches share a synthesized id).
         for i, item in enumerate(items):
             # Always-required fields
             item_missing = ALWAYS_REQUIRED_ITEM_FIELDS - set(item.keys())
@@ -162,6 +167,13 @@ class BulkProcessor:
                     raise ValidationError(
                         f"Item {i} has invalid media_type '{item['media_type']}'; "
                         f"expected one of {sorted(VALID_MEDIA_TYPES)}"
+                    )
+                ppn = item.get("product_part_number")
+                if not isinstance(ppn, str) or not ppn.strip():
+                    raise ValidationError(
+                        f"Item {i} has 's3_key' but missing or empty "
+                        f"'product_part_number' (required for canonical "
+                        f"S3 layout — see CC3-1001)"
                     )
 
             # source_bucket: validate type if the key is present (null
