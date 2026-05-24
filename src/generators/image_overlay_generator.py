@@ -918,23 +918,31 @@ def _normalize_family(family: str | None) -> str:
     return key or "opensans"
 
 
+# In-repo bundled fonts (also copied into the Lambda image at build time).
+# Looked up first so dev shells and CI runners — which don't have the
+# container's /usr/share/fonts tree — resolve the same .ttf as production
+# and the wrapping/anchoring tests stay deterministic.
+_BUNDLED_FONTS_DIR = os.path.join(os.path.dirname(__file__), "fonts")
+
 # Family → (bold path candidates, regular path candidates).
-# Each list is searched in order; first hit wins. Bundled fonts live under
-# /usr/share/fonts/truetype/<name>/ inside the Lambda image (see Dockerfile).
-# Cross-family fallbacks (e.g. Roboto's regular list ending in OpenSans-SemiBold)
-# are belt-and-braces in case the family-specific .ttf is missing from the
-# container — the bundled file at the head of the list is what runs in prod.
-# If even those fall through, _load_font ultimately returns Pillow's default
-# bitmap font.
+# Each list is searched in order; first hit wins. In-repo bundled paths come
+# first (work everywhere), followed by container paths populated by the
+# Lambda Dockerfile, followed by OS fallbacks. Cross-family fallbacks
+# (e.g. Roboto's regular list ending in OpenSans-SemiBold) are belt-and-
+# braces in case the family-specific .ttf is missing from the container.
+# If everything falls through, _load_font ultimately returns Pillow's
+# default bitmap font.
 _FONT_FAMILY_PATHS: dict[str, tuple[list[str], list[str]]] = {
     "opensans": (
         [
+            os.path.join(_BUNDLED_FONTS_DIR, "opensans", "OpenSans-Bold.ttf"),
             "/usr/share/fonts/truetype/opensans/OpenSans-Bold.ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
             "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
             "/System/Library/Fonts/Helvetica.ttc",
         ],
         [
+            os.path.join(_BUNDLED_FONTS_DIR, "opensans", "OpenSans-SemiBold.ttf"),
             "/usr/share/fonts/truetype/opensans/OpenSans-SemiBold.ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
             "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
@@ -943,21 +951,29 @@ _FONT_FAMILY_PATHS: dict[str, tuple[list[str], list[str]]] = {
     ),
     "roboto": (
         [
+            os.path.join(_BUNDLED_FONTS_DIR, "roboto", "Roboto-Bold.ttf"),
             "/usr/share/fonts/truetype/roboto/Roboto-Bold.ttf",
+            os.path.join(_BUNDLED_FONTS_DIR, "opensans", "OpenSans-Bold.ttf"),
             "/usr/share/fonts/truetype/opensans/OpenSans-Bold.ttf",  # fallback
         ],
         [
+            os.path.join(_BUNDLED_FONTS_DIR, "roboto", "Roboto-Regular.ttf"),
             "/usr/share/fonts/truetype/roboto/Roboto-Regular.ttf",
+            os.path.join(_BUNDLED_FONTS_DIR, "opensans", "OpenSans-SemiBold.ttf"),
             "/usr/share/fonts/truetype/opensans/OpenSans-SemiBold.ttf",  # fallback
         ],
     ),
     "courierprime": (
         [
+            os.path.join(_BUNDLED_FONTS_DIR, "courierprime", "CourierPrime-Bold.ttf"),
             "/usr/share/fonts/truetype/courierprime/CourierPrime-Bold.ttf",
+            os.path.join(_BUNDLED_FONTS_DIR, "opensans", "OpenSans-Bold.ttf"),
             "/usr/share/fonts/truetype/opensans/OpenSans-Bold.ttf",  # fallback
         ],
         [
+            os.path.join(_BUNDLED_FONTS_DIR, "courierprime", "CourierPrime-Regular.ttf"),
             "/usr/share/fonts/truetype/courierprime/CourierPrime-Regular.ttf",
+            os.path.join(_BUNDLED_FONTS_DIR, "opensans", "OpenSans-SemiBold.ttf"),
             "/usr/share/fonts/truetype/opensans/OpenSans-SemiBold.ttf",  # fallback
         ],
     ),
