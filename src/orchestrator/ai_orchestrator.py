@@ -73,13 +73,18 @@ WEBHOOK_SECRET_REF = os.environ.get("WEBHOOK_SECRET_REF", "iplr/webhook-secret")
 S3_READ_MAX_RETRIES = 3
 S3_READ_BACKOFF_BASE = 1  # seconds
 
-# Required fields in .meta.json (relaxed to accept Drupal's actual schema).
-# Fields like 'ou' and 'product_part_number' are derived from the S3 key
-# or meta content if not present at the top level.
+# Required fields in .meta.json. 'ou' is still derived from the S3 key or
+# meta content if absent at the top level (Drupal's actual schema is
+# tolerant there). 'product_part_number' is required and must be non-empty:
+# it is the canonical asset filename in publish-source (e.g. the VTT
+# destination {ou}/subtitles/{PPN}.vtt). Synthesizing it from
+# resource_center + item_id silently corrupts the S3 layout and the Drupal
+# webhook payload — see CC3-998.
 REQUIRED_META_FIELDS = {
     "item_id",
     "ai_enrichment_enabled",
     "content",
+    "product_part_number",
 }
 REQUIRED_CONTENT_FIELDS = {"media_type"}
 
@@ -263,10 +268,9 @@ class AIOrchestrator:
         # Derive fields that may not be in .meta.json top level.
         meta_item_id = str(meta["item_id"])
         meta_ou = meta.get("ou", meta["content"].get("resource_center", ou))
-        product_part_number = meta.get(
-            "product_part_number",
-            meta["content"].get("resource_center", meta_ou) + "_" + str(meta_item_id),
-        )
+        # product_part_number is required and non-empty (validated above);
+        # never synthesize — see CC3-998.
+        product_part_number = str(meta["product_part_number"])
 
         # Step 2: Route based on ai_enrichment_enabled
         if not meta["ai_enrichment_enabled"]:
@@ -522,6 +526,17 @@ class AIOrchestrator:
         if missing_content:
             raise ValueError(
                 f"Missing required content fields: {sorted(missing_content)}"
+            )
+
+        # product_part_number is the canonical S3-layout key
+        # ({ou}/subtitles/{PPN}.vtt, webhook payload). Empty/non-string
+        # silently corrupts the layout when downstream code falls back to
+        # a synthesized value — reject explicitly. See CC3-998.
+        ppn = meta["product_part_number"]
+        if not isinstance(ppn, str) or not ppn.strip():
+            raise ValueError(
+                "'product_part_number' must be a non-empty string "
+                "(canonical S3-layout key — see CC3-998)"
             )
 
     @staticmethod

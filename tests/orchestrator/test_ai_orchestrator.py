@@ -140,6 +140,42 @@ class TestValidateMeta:
         # Should not raise
         AIOrchestrator._validate_meta(meta)
 
+    def test_missing_product_part_number_raises(self):
+        # CC3-998: PPN is required at the top level. The orchestrator
+        # used to fabricate `{resource_center}_{item_id}` when it was
+        # absent; that fabricated value silently flowed into the VTT
+        # destination key and the Drupal webhook payload.
+        meta = _make_meta()
+        del meta["product_part_number"]
+        with pytest.raises(ValueError, match="Missing required .meta.json"):
+            AIOrchestrator._validate_meta(meta)
+
+    def test_empty_product_part_number_raises(self):
+        # CC3-998: empty string slipped past the missing-keys check and
+        # still triggered the fabrication fallback. Must be rejected.
+        meta = _make_meta()
+        meta["product_part_number"] = ""
+        with pytest.raises(ValueError, match="must be a non-empty string"):
+            AIOrchestrator._validate_meta(meta)
+
+    def test_whitespace_only_product_part_number_raises(self):
+        meta = _make_meta()
+        meta["product_part_number"] = "   "
+        with pytest.raises(ValueError, match="must be a non-empty string"):
+            AIOrchestrator._validate_meta(meta)
+
+    def test_non_string_product_part_number_raises(self):
+        # Drupal emits PPN as a string; defend against ints / None
+        # leaking through (would otherwise crash `.strip()` downstream).
+        meta = _make_meta()
+        meta["product_part_number"] = 0
+        with pytest.raises(ValueError, match="must be a non-empty string"):
+            AIOrchestrator._validate_meta(meta)
+
+        meta["product_part_number"] = None
+        with pytest.raises(ValueError, match="must be a non-empty string"):
+            AIOrchestrator._validate_meta(meta)
+
 
 # ---------------------------------------------------------------
 # Meta JSON Reading
@@ -554,6 +590,44 @@ class TestWebhook:
         # Webhook should include vtt_s3_key
         payload = mock_send.call_args[0][2]
         assert payload["vtt_s3_key"] == "PES/subtitles/STD-12345.vtt"
+
+    @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
+    def test_explicit_ppn_used_verbatim_for_vtt_and_webhook(self, mock_send, orchestrator):
+        # CC3-998 regression: orchestrator must use the literal PPN from
+        # meta — never synthesize `{resource_center}_{item_id}`. Use a
+        # PPN distinct from both so a regression to the old fabrication
+        # branch would be visible.
+        orch, s3, lam = orchestrator
+        meta = _make_meta(ai_enabled=True, media_type="video/mp4", callback_url="https://drupal.example.com/hook")
+        meta["product_part_number"] = "APS_CONFERENCES_2020-AP-SYMPOSIUM_TEES_05162026"
+        meta["content"]["filename"] = "lecture.mp4"
+        s3.get_object.return_value = _s3_get_object_response(meta)
+
+        transcription_body = {
+            "transcript": "text", "duration": "00:05:00",
+            "duration_seconds": 300, "speaker_count": 1,
+            "vtt_s3_key": "transcribe-output/job.vtt",
+            "extraction_method": "transcribe",
+        }
+        bedrock_body = {"abstract": "a", "keywords": [], "learning_level": "Expert"}
+        lam.invoke.side_effect = [
+            _lambda_invoke_response(200, transcription_body),
+            _lambda_invoke_response(200, bedrock_body),
+        ]
+
+        orch.process("bucket", "PES/pending/STD-12345.mp4")
+
+        expected_vtt = "PES/subtitles/APS_CONFERENCES_2020-AP-SYMPOSIUM_TEES_05162026.vtt"
+        s3.copy_object.assert_any_call(
+            Bucket="bucket",
+            CopySource={"Bucket": "bucket", "Key": "transcribe-output/job.vtt"},
+            Key=expected_vtt,
+        )
+        payload = mock_send.call_args[0][2]
+        assert payload["product_part_number"] == "APS_CONFERENCES_2020-AP-SYMPOSIUM_TEES_05162026"
+        assert payload["vtt_s3_key"] == expected_vtt
+        # Negative assertion: the synthesized form must not appear.
+        assert "PES_STD-12345" not in payload["vtt_s3_key"]
 
     @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
     def test_video_no_vtt_skips_copy(self, mock_send, orchestrator):
