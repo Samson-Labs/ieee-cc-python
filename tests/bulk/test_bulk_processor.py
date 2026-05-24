@@ -15,7 +15,7 @@ def _valid_manifest(item_count: int = 2) -> dict:
     items = [
         {
             "item_id": 100 + i,
-            "request_id": i,
+            "product_part_number": f"PESPAPER{i:03d}",
             "s3_key": f"PES/archive/paper-{i}.pdf",
             "media_type": "PDF",
             "resource_center": "PES",
@@ -110,7 +110,6 @@ def _text_only_manifest():
         "items": [
             {
                 "item_id": 200,
-                "request_id": 1,
                 "resource_center": "PES",
                 "input_text": "User-provided abstract text.",
                 "input_text_mode": "as_abstract",
@@ -140,7 +139,7 @@ class TestBackfillValidation:
             "callback_url": "https://example.com/webhook",
             "items": [{
                 "item_id": 300,
-                "request_id": 2,
+                "product_part_number": "PESHYBRID300",
                 "s3_key": "PES/archive/paper.pdf",
                 "media_type": "PDF",
                 "resource_center": "PES",
@@ -206,6 +205,95 @@ class TestBackfillValidation:
         assert result["published_count"] == 3
 
 
+# --- CC3-1001: PPN required for file items, request_id no longer required ---
+
+
+class TestCC3_1001_PpnRequired:
+    """File-bearing items must carry a real product_part_number so the
+    {ou}/processed/{PPN}.{ext}, {ou}/subtitles/{PPN}.vtt, and metadata
+    paths don't collide across a batch. request_id is no longer required
+    on any item (bulk-backfill items don't point at a real IPLR request).
+    """
+
+    def test_file_item_without_ppn_rejected(self, processor):
+        proc, s3_mock, _, _ = processor
+        manifest = _valid_manifest()
+        del manifest["items"][0]["product_part_number"]
+        s3_mock.get_object.return_value = _s3_manifest_response(manifest)
+
+        with pytest.raises(ValidationError, match="product_part_number"):
+            proc.process_manifest("bucket", "test")
+
+    def test_file_item_with_empty_ppn_rejected(self, processor):
+        proc, s3_mock, _, _ = processor
+        manifest = _valid_manifest()
+        manifest["items"][0]["product_part_number"] = "   "
+        s3_mock.get_object.return_value = _s3_manifest_response(manifest)
+
+        with pytest.raises(ValidationError, match="product_part_number"):
+            proc.process_manifest("bucket", "test")
+
+    def test_file_item_with_non_string_ppn_rejected(self, processor):
+        proc, s3_mock, _, _ = processor
+        manifest = _valid_manifest()
+        manifest["items"][0]["product_part_number"] = 0
+        s3_mock.get_object.return_value = _s3_manifest_response(manifest)
+
+        with pytest.raises(ValidationError, match="product_part_number"):
+            proc.process_manifest("bucket", "test")
+
+    def test_text_only_item_without_ppn_accepted(self, processor):
+        """Text-only items don't have a canonical S3 layout to collide on,
+        so PPN is not required there.
+        """
+        proc, s3_mock, sqs_mock, _ = processor
+        manifest = _text_only_manifest()
+        # _text_only_manifest already omits product_part_number
+        s3_mock.get_object.return_value = _s3_manifest_response(manifest)
+        s3_mock.exceptions.NoSuchKey = type("NoSuchKey", (Exception,), {})
+
+        with patch.dict("os.environ", {"BULK_QUEUE_URL": "https://sqs/q"}):
+            result = proc.process_manifest("bucket", "backfill-001")
+
+        assert result["published_count"] == 1
+
+    def test_request_id_no_longer_required_on_file_item(self, processor):
+        """Drupal can drop the legacy request_id=>0 placeholder once this
+        ships. The validator must accept file items that omit it entirely.
+        """
+        proc, s3_mock, sqs_mock, _ = processor
+        manifest = _valid_manifest()
+        for item in manifest["items"]:
+            item.pop("request_id", None)
+        s3_mock.get_object.return_value = _s3_manifest_response(manifest)
+        s3_mock.exceptions.NoSuchKey = type("NoSuchKey", (Exception,), {})
+
+        with patch.dict("os.environ", {"BULK_QUEUE_URL": "https://sqs/q"}):
+            with patch("src.bulk.bulk_processor.time.sleep"):
+                result = proc.process_manifest("bucket", "bulk-test-001")
+
+        assert result["published_count"] == 2
+
+    def test_request_id_zero_still_tolerated_on_file_item(self, processor):
+        """Strictly additive deploy: Drupal's amended PR #755 keeps
+        request_id=>0 alongside the new product_part_number. The validator
+        must continue to accept items that carry both, so backend can ship
+        without coordinating Drupal deploy order.
+        """
+        proc, s3_mock, sqs_mock, _ = processor
+        manifest = _valid_manifest()
+        for item in manifest["items"]:
+            item["request_id"] = 0
+        s3_mock.get_object.return_value = _s3_manifest_response(manifest)
+        s3_mock.exceptions.NoSuchKey = type("NoSuchKey", (Exception,), {})
+
+        with patch.dict("os.environ", {"BULK_QUEUE_URL": "https://sqs/q"}):
+            with patch("src.bulk.bulk_processor.time.sleep"):
+                result = proc.process_manifest("bucket", "bulk-test-001")
+
+        assert result["published_count"] == 2
+
+
 def _strategy_a_manifest():
     """Strategy A item: file-bearing, input_text empty by design."""
     return {
@@ -213,7 +301,7 @@ def _strategy_a_manifest():
         "callback_url": "https://example.com/webhook",
         "items": [{
             "item_id": 400,
-            "request_id": 0,
+            "product_part_number": "MTTIMSWEB0010",
             "resource_center": "MTT",
             "s3_key": "video/private/MTTIMSWEB0010/MTTIMSWEB0010.mp4",
             "media_type": "MP4",
@@ -344,8 +432,8 @@ class TestCostEstimation:
 
     def test_mixed_batch(self):
         items = [
-            {"item_id": 1, "media_type": "PDF", "s3_key": "a", "request_id": 0, "resource_center": "PES"},
-            {"item_id": 2, "media_type": "MP4", "s3_key": "b", "request_id": 0, "resource_center": "PES"},
+            {"item_id": 1, "media_type": "PDF", "s3_key": "a", "product_part_number": "PES001", "resource_center": "PES"},
+            {"item_id": 2, "media_type": "MP4", "s3_key": "b", "product_part_number": "PES002", "resource_center": "PES"},
         ]
         estimate = BulkProcessor._estimate_cost(items)
 
@@ -354,8 +442,8 @@ class TestCostEstimation:
 
     def test_text_only_cost(self):
         items = [
-            {"item_id": 1, "request_id": 0, "resource_center": "PES", "input_text": "text"},
-            {"item_id": 2, "request_id": 0, "resource_center": "PES", "input_text": "text"},
+            {"item_id": 1, "resource_center": "PES", "input_text": "text"},
+            {"item_id": 2, "resource_center": "PES", "input_text": "text"},
         ]
         estimate = BulkProcessor._estimate_cost(items)
 
