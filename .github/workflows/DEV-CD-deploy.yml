@@ -6,6 +6,7 @@ on:
       pdf_extractor_tag:
         description: "Image tag for pdf-extractor (ieee-cc-pdf-extractor ECR)"
         required: false
+        default: "latest"
         type: string
       deploy_pdf_extractor:
         description: "Deploy pdf-extractor?"
@@ -17,6 +18,7 @@ on:
       image_overlay_tag:
         description: "Image tag for image-overlay (ieee-rc-image-generator ECR)"
         required: false
+        default: "latest"
         type: string
       deploy_image_overlay:
         description: "Deploy image-overlay?"
@@ -28,6 +30,7 @@ on:
       bedrock_tag:
         description: "Image tag for bedrock-inference (ieee-cc-bedrock-inference ECR)"
         required: false
+        default: "latest"
         type: string
       deploy_bedrock:
         description: "Deploy bedrock-inference?"
@@ -39,6 +42,7 @@ on:
       video_transcriber_tag:
         description: "Image tag for video-transcriber (ieee-cc-video-transcriber ECR)"
         required: false
+        default: "latest"
         type: string
       deploy_video_transcriber:
         description: "Deploy video-transcriber?"
@@ -50,6 +54,7 @@ on:
       ai_orchestrator_tag:
         description: "Image tag for ai-orchestrator (ieee-rc-ai-orchestrator ECR)"
         required: false
+        default: "latest"
         type: string
       deploy_ai_orchestrator:
         description: "Deploy ai-orchestrator?"
@@ -61,6 +66,7 @@ on:
       dlq_processor_tag:
         description: "Image tag for dlq-processor (ieee-rc-dlq-processor ECR)"
         required: false
+        default: "latest"
         type: string
       deploy_dlq_processor:
         description: "Deploy dlq-processor?"
@@ -72,6 +78,7 @@ on:
       bulk_processor_tag:
         description: "Image tag for bulk-processor (ieee-rc-bulk-processor ECR)"
         required: false
+        default: "latest"
         type: string
       deploy_bulk_processor:
         description: "Deploy bulk-processor?"
@@ -83,6 +90,7 @@ on:
       bulk_worker_tag:
         description: "Image tag for bulk-worker (ieee-rc-bulk-worker ECR)"
         required: false
+        default: "latest"
         type: string
       deploy_bulk_worker:
         description: "Deploy bulk-worker?"
@@ -94,6 +102,7 @@ on:
       wizard_transfer_tag:
         description: "Image tag for wizard-transfer (ieee-rc-wizard-transfer ECR)"
         required: false
+        default: "latest"
         type: string
       deploy_wizard_transfer:
         description: "Deploy wizard-transfer?"
@@ -105,6 +114,7 @@ on:
       pptx_extractor_tag:
         description: "Image tag for pptx-extractor (ieee-rc-pptx-extractor ECR)"
         required: false
+        default: "latest"
         type: string
       deploy_pptx_extractor:
         description: "Deploy pptx-extractor?"
@@ -127,8 +137,6 @@ jobs:
       AWS_REGION: "us-east-1"
       AWS_DEFAULT_REGION: "us-east-1"
       ACCOUNT_ID: "141770997341"
-      ENV_SUFFIX: "-dev"
-
       ECR_PDF_EXTRACTOR:     "ieee-cc-pdf-extractor"
       ECR_IMAGE_OVERLAY:     "ieee-rc-image-generator"
       ECR_BEDROCK:           "ieee-cc-bedrock-inference"
@@ -165,8 +173,6 @@ jobs:
       - name: Start summary
         run: |
           set -euo pipefail
-
-          base="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
 
           {
             echo "## DEV - Lambda Deployment"
