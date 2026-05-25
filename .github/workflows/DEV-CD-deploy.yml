@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       pdf_extractor_tag:
-        description: "Image tag for pdf-extractor (ieee-cc-pdf-extractor ECR)"
+        description: "Image tag for pdf-extractor in ieee-cc-pdf-extractor (e.g. a1b2c3d or latest)"
         required: false
         default: "latest"
         type: string
@@ -16,7 +16,7 @@ on:
         options: ["yes", "no"]
 
       image_overlay_tag:
-        description: "Image tag for image-overlay (ieee-rc-image-generator ECR)"
+        description: "Image tag for image-overlay in ieee-rc-image-generator (e.g. a1b2c3d or latest)"
         required: false
         default: "latest"
         type: string
@@ -28,7 +28,7 @@ on:
         options: ["yes", "no"]
 
       bedrock_tag:
-        description: "Image tag for bedrock-inference (ieee-cc-bedrock-inference ECR)"
+        description: "Image tag for bedrock-inference in ieee-cc-bedrock-inference (e.g. a1b2c3d or latest)"
         required: false
         default: "latest"
         type: string
@@ -40,7 +40,7 @@ on:
         options: ["yes", "no"]
 
       video_transcriber_tag:
-        description: "Image tag for video-transcriber (ieee-cc-video-transcriber ECR)"
+        description: "Image tag for video-transcriber in ieee-cc-video-transcriber (e.g. a1b2c3d or latest)"
         required: false
         default: "latest"
         type: string
@@ -52,7 +52,7 @@ on:
         options: ["yes", "no"]
 
       ai_orchestrator_tag:
-        description: "Image tag for ai-orchestrator (ieee-rc-ai-orchestrator ECR)"
+        description: "Image tag for ai-orchestrator in ieee-rc-ai-orchestrator (e.g. a1b2c3d or latest)"
         required: false
         default: "latest"
         type: string
@@ -64,7 +64,7 @@ on:
         options: ["yes", "no"]
 
       dlq_processor_tag:
-        description: "Image tag for dlq-processor (ieee-rc-dlq-processor ECR)"
+        description: "Image tag for dlq-processor in ieee-rc-dlq-processor (e.g. a1b2c3d or latest)"
         required: false
         default: "latest"
         type: string
@@ -76,7 +76,7 @@ on:
         options: ["yes", "no"]
 
       bulk_processor_tag:
-        description: "Image tag for bulk-processor (ieee-rc-bulk-processor ECR)"
+        description: "Image tag for bulk-processor in ieee-rc-bulk-processor (e.g. a1b2c3d or latest)"
         required: false
         default: "latest"
         type: string
@@ -88,7 +88,7 @@ on:
         options: ["yes", "no"]
 
       bulk_worker_tag:
-        description: "Image tag for bulk-worker (ieee-rc-bulk-worker ECR)"
+        description: "Image tag for bulk-worker in ieee-rc-bulk-worker (e.g. a1b2c3d or latest)"
         required: false
         default: "latest"
         type: string
@@ -100,7 +100,7 @@ on:
         options: ["yes", "no"]
 
       wizard_transfer_tag:
-        description: "Image tag for wizard-transfer (ieee-rc-wizard-transfer ECR)"
+        description: "Image tag for wizard-transfer in ieee-rc-wizard-transfer (e.g. a1b2c3d or latest)"
         required: false
         default: "latest"
         type: string
@@ -112,7 +112,7 @@ on:
         options: ["yes", "no"]
 
       pptx_extractor_tag:
-        description: "Image tag for pptx-extractor (ieee-rc-pptx-extractor ECR)"
+        description: "Image tag for pptx-extractor in ieee-rc-pptx-extractor (e.g. a1b2c3d or latest)"
         required: false
         default: "latest"
         type: string
