@@ -1,0 +1,273 @@
+name: DEV - CD Deploy to Lambda
+
+on:
+  workflow_dispatch:
+    inputs:
+      pdf_extractor_tag:
+        description: "Image tag for pdf-extractor (ieee-cc-pdf-extractor ECR)"
+        required: false
+        type: string
+      deploy_pdf_extractor:
+        description: "Deploy pdf-extractor?"
+        required: true
+        default: "yes"
+        type: choice
+        options: ["yes", "no"]
+
+      image_overlay_tag:
+        description: "Image tag for image-overlay (ieee-rc-image-generator ECR)"
+        required: false
+        type: string
+      deploy_image_overlay:
+        description: "Deploy image-overlay?"
+        required: true
+        default: "yes"
+        type: choice
+        options: ["yes", "no"]
+
+      bedrock_tag:
+        description: "Image tag for bedrock-inference (ieee-cc-bedrock-inference ECR)"
+        required: false
+        type: string
+      deploy_bedrock:
+        description: "Deploy bedrock-inference?"
+        required: true
+        default: "yes"
+        type: choice
+        options: ["yes", "no"]
+
+      video_transcriber_tag:
+        description: "Image tag for video-transcriber (ieee-cc-video-transcriber ECR)"
+        required: false
+        type: string
+      deploy_video_transcriber:
+        description: "Deploy video-transcriber?"
+        required: true
+        default: "yes"
+        type: choice
+        options: ["yes", "no"]
+
+      ai_orchestrator_tag:
+        description: "Image tag for ai-orchestrator (ieee-rc-ai-orchestrator ECR)"
+        required: false
+        type: string
+      deploy_ai_orchestrator:
+        description: "Deploy ai-orchestrator?"
+        required: true
+        default: "yes"
+        type: choice
+        options: ["yes", "no"]
+
+      dlq_processor_tag:
+        description: "Image tag for dlq-processor (ieee-rc-dlq-processor ECR)"
+        required: false
+        type: string
+      deploy_dlq_processor:
+        description: "Deploy dlq-processor?"
+        required: true
+        default: "yes"
+        type: choice
+        options: ["yes", "no"]
+
+      bulk_processor_tag:
+        description: "Image tag for bulk-processor (ieee-rc-bulk-processor ECR)"
+        required: false
+        type: string
+      deploy_bulk_processor:
+        description: "Deploy bulk-processor?"
+        required: true
+        default: "yes"
+        type: choice
+        options: ["yes", "no"]
+
+      bulk_worker_tag:
+        description: "Image tag for bulk-worker (ieee-rc-bulk-worker ECR)"
+        required: false
+        type: string
+      deploy_bulk_worker:
+        description: "Deploy bulk-worker?"
+        required: true
+        default: "yes"
+        type: choice
+        options: ["yes", "no"]
+
+      wizard_transfer_tag:
+        description: "Image tag for wizard-transfer (ieee-rc-wizard-transfer ECR)"
+        required: false
+        type: string
+      deploy_wizard_transfer:
+        description: "Deploy wizard-transfer?"
+        required: true
+        default: "yes"
+        type: choice
+        options: ["yes", "no"]
+
+      pptx_extractor_tag:
+        description: "Image tag for pptx-extractor (ieee-rc-pptx-extractor ECR)"
+        required: false
+        type: string
+      deploy_pptx_extractor:
+        description: "Deploy pptx-extractor?"
+        required: true
+        default: "yes"
+        type: choice
+        options: ["yes", "no"]
+
+concurrency:
+  group: cd-deploy-dev
+  cancel-in-progress: false  # never cancel an in-flight deploy
+
+jobs:
+  deploy:
+    name: Deploy Lambda functions (dev)
+    runs-on: [self-hosted, cc3]
+    if: github.event_name == 'workflow_dispatch'
+
+    env:
+      AWS_REGION: "us-east-1"
+      AWS_DEFAULT_REGION: "us-east-1"
+      ACCOUNT_ID: "141770997341"
+      ENV_SUFFIX: "-dev"
+
+      ECR_PDF_EXTRACTOR:     "ieee-cc-pdf-extractor"
+      ECR_IMAGE_OVERLAY:     "ieee-rc-image-generator"
+      ECR_BEDROCK:           "ieee-cc-bedrock-inference"
+      ECR_VIDEO_TRANSCRIBER: "ieee-cc-video-transcriber"
+      ECR_AI_ORCHESTRATOR:   "ieee-rc-ai-orchestrator"
+      ECR_DLQ_PROCESSOR:     "ieee-rc-dlq-processor"
+      ECR_BULK_PROCESSOR:    "ieee-rc-bulk-processor"
+      ECR_BULK_WORKER:       "ieee-rc-bulk-worker"
+      ECR_WIZARD_TRANSFER:   "ieee-rc-wizard-transfer"
+      ECR_PPTX_EXTRACTOR:    "ieee-rc-pptx-extractor"
+
+      PDF_EXTRACTOR_TAG:      ${{ github.event.inputs.pdf_extractor_tag }}
+      PDF_EXTRACTOR_FLAG:     ${{ github.event.inputs.deploy_pdf_extractor }}
+      IMAGE_OVERLAY_TAG:      ${{ github.event.inputs.image_overlay_tag }}
+      IMAGE_OVERLAY_FLAG:     ${{ github.event.inputs.deploy_image_overlay }}
+      BEDROCK_TAG:            ${{ github.event.inputs.bedrock_tag }}
+      BEDROCK_FLAG:           ${{ github.event.inputs.deploy_bedrock }}
+      VIDEO_TRANSCRIBER_TAG:  ${{ github.event.inputs.video_transcriber_tag }}
+      VIDEO_TRANSCRIBER_FLAG: ${{ github.event.inputs.deploy_video_transcriber }}
+      AI_ORCHESTRATOR_TAG:    ${{ github.event.inputs.ai_orchestrator_tag }}
+      AI_ORCHESTRATOR_FLAG:   ${{ github.event.inputs.deploy_ai_orchestrator }}
+      DLQ_PROCESSOR_TAG:      ${{ github.event.inputs.dlq_processor_tag }}
+      DLQ_PROCESSOR_FLAG:     ${{ github.event.inputs.deploy_dlq_processor }}
+      BULK_PROCESSOR_TAG:     ${{ github.event.inputs.bulk_processor_tag }}
+      BULK_PROCESSOR_FLAG:    ${{ github.event.inputs.deploy_bulk_processor }}
+      BULK_WORKER_TAG:        ${{ github.event.inputs.bulk_worker_tag }}
+      BULK_WORKER_FLAG:       ${{ github.event.inputs.deploy_bulk_worker }}
+      WIZARD_TRANSFER_TAG:    ${{ github.event.inputs.wizard_transfer_tag }}
+      WIZARD_TRANSFER_FLAG:   ${{ github.event.inputs.deploy_wizard_transfer }}
+      PPTX_EXTRACTOR_TAG:     ${{ github.event.inputs.pptx_extractor_tag }}
+      PPTX_EXTRACTOR_FLAG:    ${{ github.event.inputs.deploy_pptx_extractor }}
+
+    steps:
+      - name: Start summary
+        run: |
+          set -euo pipefail
+
+          base="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+
+          {
+            echo "## DEV - Lambda Deployment"
+            echo ""
+            echo "**Branch**: \`${GITHUB_REF_NAME}\`  |  **Actor**: \`${{ github.actor }}\`  |  **Env**: \`dev\`"
+            echo ""
+            echo "### Inputs"
+            echo "| Lambda | Deploy? | Tag | Lambda function |"
+            echo "|--------|---------|-----|-----------------|"
+            echo "| pdf-extractor | \`${PDF_EXTRACTOR_FLAG}\` | \`${PDF_EXTRACTOR_TAG:-<none>}\` | \`ieee-cc-pdf-extractor-dev\` |"
+            echo "| image-overlay | \`${IMAGE_OVERLAY_FLAG}\` | \`${IMAGE_OVERLAY_TAG:-<none>}\` | \`ieee-rc-image-generator-dev\` |"
+            echo "| bedrock-inference | \`${BEDROCK_FLAG}\` | \`${BEDROCK_TAG:-<none>}\` | \`ieee-cc-bedrock-inference-dev\` |"
+            echo "| video-transcriber | \`${VIDEO_TRANSCRIBER_FLAG}\` | \`${VIDEO_TRANSCRIBER_TAG:-<none>}\` | \`ieee-cc-video-transcriber-dev\` |"
+            echo "| ai-orchestrator | \`${AI_ORCHESTRATOR_FLAG}\` | \`${AI_ORCHESTRATOR_TAG:-<none>}\` | \`ieee-rc-ai-orchestrator-dev\` |"
+            echo "| dlq-processor | \`${DLQ_PROCESSOR_FLAG}\` | \`${DLQ_PROCESSOR_TAG:-<none>}\` | \`ieee-rc-dlq-processor-dev\` |"
+            echo "| bulk-processor | \`${BULK_PROCESSOR_FLAG}\` | \`${BULK_PROCESSOR_TAG:-<none>}\` | \`ieee-rc-bulk-processor-dev\` |"
+            echo "| bulk-worker | \`${BULK_WORKER_FLAG}\` | \`${BULK_WORKER_TAG:-<none>}\` | \`ieee-rc-bulk-worker-dev\` |"
+            echo "| wizard-transfer | \`${WIZARD_TRANSFER_FLAG}\` | \`${WIZARD_TRANSFER_TAG:-<none>}\` | \`ieee-rc-wizard-transfer-dev\` |"
+            echo "| pptx-extractor | \`${PPTX_EXTRACTOR_FLAG}\` | \`${PPTX_EXTRACTOR_TAG:-<none>}\` | \`ieee-rc-pptx-extractor-dev\` |"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Show AWS identity
+        run: |
+          set -euo pipefail
+          aws sts get-caller-identity
+
+      - name: Deploy Lambda functions
+        id: deploy
+        run: |
+          set -euo pipefail
+
+          RESULTS_FILE="deploy_results.txt"
+          : > "$RESULTS_FILE"
+
+          BASE_URI="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+
+          deploy_lambda() {
+            local ECR_REPO="$1"
+            local LAMBDA_NAME="$2"
+            local TAG="$3"
+            local FLAG="$4"
+            local LABEL="$5"
+
+            if [[ "${FLAG}" == "no" ]]; then
+              echo "${LABEL} -> SKIPPED (flag=no)" | tee -a "$RESULTS_FILE"
+              return
+            fi
+
+            if [[ -z "${TAG:-}" ]]; then
+              echo "ERROR: deploy flag is yes for ${LABEL} but tag is empty." >&2
+              exit 1
+            fi
+
+            local IMAGE_URI="${BASE_URI}/${ECR_REPO}:${TAG}"
+            echo "Deploying ${IMAGE_URI} → ${LAMBDA_NAME}"
+
+            aws lambda update-function-code \
+              --function-name "${LAMBDA_NAME}" \
+              --region "${AWS_REGION}" \
+              --image-uri "${IMAGE_URI}"
+
+            echo "${LABEL} -> OK (tag=${TAG})" | tee -a "$RESULTS_FILE"
+          }
+
+          deploy_lambda "${ECR_PDF_EXTRACTOR}"     "ieee-cc-pdf-extractor-dev"     "${PDF_EXTRACTOR_TAG:-}"     "${PDF_EXTRACTOR_FLAG}"     "pdf-extractor"
+          deploy_lambda "${ECR_IMAGE_OVERLAY}"     "ieee-rc-image-generator-dev"   "${IMAGE_OVERLAY_TAG:-}"     "${IMAGE_OVERLAY_FLAG}"     "image-overlay"
+          deploy_lambda "${ECR_BEDROCK}"           "ieee-cc-bedrock-inference-dev" "${BEDROCK_TAG:-}"           "${BEDROCK_FLAG}"           "bedrock-inference"
+          deploy_lambda "${ECR_VIDEO_TRANSCRIBER}" "ieee-cc-video-transcriber-dev" "${VIDEO_TRANSCRIBER_TAG:-}" "${VIDEO_TRANSCRIBER_FLAG}" "video-transcriber"
+          deploy_lambda "${ECR_AI_ORCHESTRATOR}"   "ieee-rc-ai-orchestrator-dev"   "${AI_ORCHESTRATOR_TAG:-}"   "${AI_ORCHESTRATOR_FLAG}"   "ai-orchestrator"
+          deploy_lambda "${ECR_DLQ_PROCESSOR}"     "ieee-rc-dlq-processor-dev"     "${DLQ_PROCESSOR_TAG:-}"     "${DLQ_PROCESSOR_FLAG}"     "dlq-processor"
+          deploy_lambda "${ECR_BULK_PROCESSOR}"    "ieee-rc-bulk-processor-dev"    "${BULK_PROCESSOR_TAG:-}"    "${BULK_PROCESSOR_FLAG}"    "bulk-processor"
+          deploy_lambda "${ECR_BULK_WORKER}"       "ieee-rc-bulk-worker-dev"       "${BULK_WORKER_TAG:-}"       "${BULK_WORKER_FLAG}"       "bulk-worker"
+          deploy_lambda "${ECR_WIZARD_TRANSFER}"   "ieee-rc-wizard-transfer-dev"   "${WIZARD_TRANSFER_TAG:-}"   "${WIZARD_TRANSFER_FLAG}"   "wizard-transfer"
+          deploy_lambda "${ECR_PPTX_EXTRACTOR}"    "ieee-rc-pptx-extractor-dev"    "${PPTX_EXTRACTOR_TAG:-}"    "${PPTX_EXTRACTOR_FLAG}"    "pptx-extractor"
+
+          echo "RESULTS_FILE=${RESULTS_FILE}" >> "$GITHUB_ENV"
+
+      - name: Write deployment summary
+        if: always()
+        run: |
+          set -euo pipefail
+
+          RESULTS_FILE="${RESULTS_FILE:-deploy_results.txt}"
+
+          {
+            echo "### Deployment Results"
+            echo ""
+            echo "| Lambda | Result |"
+            echo "|--------|--------|"
+
+            if [[ -f "${RESULTS_FILE}" ]]; then
+              while IFS= read -r line; do
+                LABEL=$(echo "${line}" | cut -d' ' -f1)
+                STATUS=$(echo "${line}" | cut -d'>' -f2- | xargs)
+                echo "| \`${LABEL}\` | ${STATUS} |"
+              done < "${RESULTS_FILE}"
+            else
+              echo "| (none) | no results file found |"
+            fi
+
+            echo ""
+            echo "> Deployment finished. Check the [Lambda console](https://us-east-1.console.aws.amazon.com/lambda/home?region=us-east-1#/functions) to verify."
+          } >> "$GITHUB_STEP_SUMMARY"

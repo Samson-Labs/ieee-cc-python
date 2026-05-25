@@ -112,6 +112,16 @@ jobs:
             dockerfile: src/bulk/Dockerfile.worker
             src_path: src/bulk
 
+          - name: wizard-transfer
+            ecr_repo: ieee-rc-wizard-transfer
+            dockerfile: src/transfer/Dockerfile
+            src_path: src/transfer
+
+          - name: pptx-extractor
+            ecr_repo: ieee-rc-pptx-extractor
+            dockerfile: src/extractors/PPTXExtractorDockerfile
+            src_path: src/extractors
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -229,10 +239,12 @@ jobs:
             echo "| dlq-processor | \`ieee-rc-dlq-processor\` | \`${IMAGE_TAG}\` | \`${BASE_URI}/ieee-rc-dlq-processor:${IMAGE_TAG}\` |"
             echo "| bulk-processor | \`ieee-rc-bulk-processor\` | \`${IMAGE_TAG}\` | \`${BASE_URI}/ieee-rc-bulk-processor:${IMAGE_TAG}\` |"
             echo "| bulk-worker | \`ieee-rc-bulk-worker\` | \`${IMAGE_TAG}\` | \`${BASE_URI}/ieee-rc-bulk-worker:${IMAGE_TAG}\` |"
+            echo "| wizard-transfer | \`ieee-rc-wizard-transfer\` | \`${IMAGE_TAG}\` | \`${BASE_URI}/ieee-rc-wizard-transfer:${IMAGE_TAG}\` |"
+            echo "| pptx-extractor | \`ieee-rc-pptx-extractor\` | \`${IMAGE_TAG}\` | \`${BASE_URI}/ieee-rc-pptx-extractor:${IMAGE_TAG}\` |"
             echo ""
             echo "## Next Steps — CD Deploy"
             echo ""
-            echo "Open the [CD - Deploy to Lambda](${CD_URL}) workflow and use the tag \`${IMAGE_TAG}\` for each Lambda you want to deploy."
+            echo "Open the [DEV-CD-deploy](${REPO_URL}/actions/workflows/DEV-CD-deploy.yml), [STAGING-CD-deploy](${REPO_URL}/actions/workflows/STAGING-CD-deploy.yml), or [PROD-CD-deploy](${REPO_URL}/actions/workflows/PROD-CD-deploy.yml) workflow and use the tag \`${IMAGE_TAG}\` for each Lambda you want to deploy."
             echo ""
             echo "| Input field | Value to enter |"
             echo "|-------------|----------------|"
@@ -244,4 +256,6 @@ jobs:
             echo "| dlq_processor_tag | \`${IMAGE_TAG}\` |"
             echo "| bulk_processor_tag | \`${IMAGE_TAG}\` |"
             echo "| bulk_worker_tag | \`${IMAGE_TAG}\` |"
+            echo "| wizard_transfer_tag | \`${IMAGE_TAG}\` |"
+            echo "| pptx_extractor_tag | \`${IMAGE_TAG}\` |"
           } >> "$GITHUB_STEP_SUMMARY"
