@@ -96,19 +96,24 @@ def handler(event: dict, context) -> dict:
         )
     except ValueError as exc:
         logger.error("Validation error: %s", exc)
+        # CC3-1049: notify Drupal so a known item isn't left stuck in awaiting_*.
+        _orchestrator.send_failure_webhook(exc)
         return {"statusCode": 400, "body": {"error": str(exc)}}
     except ClientError as exc:
         code = exc.response["Error"]["Code"]
         msg = exc.response["Error"]["Message"]
         logger.error("AWS error (%s): %s", code, msg)
+        _orchestrator.send_failure_webhook(exc)
         _publish_to_dlq(event, exc, request_id, retry_count)
         return {"statusCode": 500, "body": {"error": f"{code}: {msg}"}}
     except RuntimeError as exc:
         logger.error("Processing error: %s", exc)
+        _orchestrator.send_failure_webhook(exc)
         _publish_to_dlq(event, exc, request_id, retry_count)
         return {"statusCode": 500, "body": {"error": str(exc)}}
     except Exception as exc:
         logger.exception("Unexpected error")
+        _orchestrator.send_failure_webhook(exc)
         _publish_to_dlq(event, exc, request_id, retry_count)
         return {
             "statusCode": 500,

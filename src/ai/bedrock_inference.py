@@ -36,6 +36,11 @@ BACKOFF_BASE = 1  # seconds: 1, 2, 4
 # Tool-use conversation loop limit
 MAX_TOOL_ITERATIONS = 5
 MIN_THESAURUS_KEYWORDS = 8
+# Hard upper bound on keyword count. The prompt asks for 8–12 (the target), but
+# validation is lenient (CC3-1049): we truncate above MAX_KEYWORDS and accept a
+# low count rather than 422-ing the whole item — a low keyword count is a quality
+# nit, not a reason to abandon enrichment and strand the load in awaiting_*.
+MAX_KEYWORDS = 12
 
 VALID_LEARNING_LEVELS = frozenset([
     "Foundational",
@@ -336,6 +341,17 @@ class BedrockInference:
                     )
                 parsed["keywords"] = thesaurus_kws
 
+        # Clamp to the hard max so an over-eager model can't fail validation
+        # (CC3-1049). A low count is intentionally NOT padded — _validate_keywords
+        # accepts it and the load proceeds with whatever the model produced.
+        if "keywords" in effective_fields and isinstance(parsed.get("keywords"), list):
+            if len(parsed["keywords"]) > MAX_KEYWORDS:
+                logger.info(
+                    "Truncating keywords %d → %d (max)",
+                    len(parsed["keywords"]), MAX_KEYWORDS,
+                )
+                parsed["keywords"] = parsed["keywords"][:MAX_KEYWORDS]
+
         # Validate after normalization/filtering so keyword count reflects final state
         self._validate_result(parsed, effective_fields)
 
@@ -546,12 +562,15 @@ class BedrockInference:
         keywords = result["keywords"]
         if not isinstance(keywords, list):
             raise ValueError("keywords must be an array")
-        if not (8 <= len(keywords) <= 12):
-            raise ValueError(
-                f"keywords must have 8–12 items, got {len(keywords)}"
-            )
         if not all(isinstance(k, str) and k.strip() for k in keywords):
             raise ValueError("All keywords must be non-empty strings")
+        # CC3-1049: keyword COUNT is non-fatal. The model occasionally returns
+        # fewer than the prompt's 8–12 target (or thesaurus normalization
+        # dedupes below it); rejecting the whole item over that stranded real
+        # loads in awaiting_*. The upper bound is clamped upstream
+        # (see generate_metadata); here we only require at least one keyword.
+        if not keywords:
+            raise ValueError("keywords must have at least one item")
 
     @staticmethod
     def _validate_learning_level(result: dict) -> None:

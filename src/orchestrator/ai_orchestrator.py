@@ -172,6 +172,11 @@ class AIOrchestrator:
         self._webhook_sender = WebhookSender(sns_client=sns_client)
         self._cloudwatch = cloudwatch_client
         self._secrets = secrets_client or boto3.client("secretsmanager")
+        # Per-invocation context for failure reporting (CC3-1049). Populated in
+        # process() once the item identity is known; read by
+        # send_failure_webhook() from the handler's except blocks. Safe as
+        # instance state because a Lambda container handles one event at a time.
+        self._failure_ctx: dict | None = None
 
     def _resolve_webhook_secret(self, correlation: str) -> str:
         """Resolve the HMAC signing secret used to sign Drupal webhooks.
@@ -209,6 +214,54 @@ class AIOrchestrator:
             )
         return env_secret
 
+    def send_failure_webhook(self, exc: Exception) -> None:
+        """Tell Drupal a processing failure occurred (CC3-1049).
+
+        Called from the handler's except blocks. Lets Drupal move the item to
+        pending_review for manual entry instead of leaving it stuck in
+        awaiting_* until the cron janitor (or forever, if that janitor is also
+        broken — which is exactly how the original stalls accumulated).
+
+        Best-effort: no-op if we never reached a known item, and never raises
+        (it must not mask the original error the handler is reporting).
+        """
+        ctx = self._failure_ctx
+        # Clear immediately so a single failure can't be reported twice.
+        self._failure_ctx = None
+        if not ctx or not ctx.get("callback_url"):
+            return
+        try:
+            payload = {
+                "request_id": ctx["request_id"],
+                "item_id": ctx["item_id"],
+                "status": "failure",
+                "error": str(exc),
+                "product_part_number": ctx.get("product_part_number", ""),
+                "ou": ctx.get("ou", ""),
+                "completed_at": datetime.now(timezone.utc)
+                .isoformat()
+                .replace("+00:00", "Z"),
+            }
+            secret = self._resolve_webhook_secret(ctx["correlation"])
+            self._webhook_sender.send(
+                ctx["callback_url"],
+                secret,
+                payload,
+                ctx["correlation"],
+                response_validator=_drupal_ack_validator,
+            )
+            logger.info(
+                "%s Sent failure webhook to Drupal: %s",
+                ctx["correlation"],
+                str(exc)[:200],
+            )
+        except Exception:
+            logger.warning(
+                "%s Failed to send failure webhook",
+                ctx.get("correlation", ""),
+                exc_info=True,
+            )
+
     def process(
         self,
         bucket: str,
@@ -230,6 +283,9 @@ class AIOrchestrator:
         """
         start = time.time()
         has_file = key is not None
+        # Reset failure context each invocation (container reuse); populated
+        # below once the item identity is known (CC3-1049).
+        self._failure_ctx = None
 
         # Step 1: Obtain and validate meta
         if meta is not None:
@@ -271,6 +327,20 @@ class AIOrchestrator:
         # product_part_number is required and non-empty (validated above);
         # never synthesize — see CC3-998.
         product_part_number = str(meta["product_part_number"])
+
+        # Capture failure context so a downstream processing error (e.g. the
+        # Bedrock keyword-validation 422) reports back to Drupal instead of
+        # silently abandoning the item in awaiting_* (CC3-1049). The success
+        # webhook (Step 5) reuses callback_url from here.
+        callback_url = meta.get("callback_url") or meta.get("webhook_url")
+        self._failure_ctx = {
+            "callback_url": callback_url,
+            "request_id": meta.get("request_id") or request_id,
+            "item_id": meta_item_id,
+            "product_part_number": product_part_number,
+            "ou": meta_ou,
+            "correlation": correlation,
+        }
 
         # Step 2: Route based on ai_enrichment_enabled
         if not meta["ai_enrichment_enabled"]:
@@ -381,8 +451,7 @@ class AIOrchestrator:
                         exc_info=True,
                     )
 
-        # Step 5: Send webhook to Drupal
-        callback_url = meta.get("callback_url") or meta.get("webhook_url")
+        # Step 5: Send webhook to Drupal (callback_url captured above).
         webhook_sent = False
         if callback_url:
             # Determine signal based on text source

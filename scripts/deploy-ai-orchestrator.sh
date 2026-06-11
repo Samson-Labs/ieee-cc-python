@@ -52,13 +52,17 @@ BEDROCK_FN="ieee-cc-bedrock-inference-${ENV}"
 # (away from create_lambda_role) so both the IAM block AND the
 # Lambda env-var plumbing in create_lambda / update_lambda_code see
 # the same values without depending on function-call order. CC3-886
-# Phase 1 keeps these unsuffixed for dev (live resource is unsuffixed);
-# staging gets the strict suffix.
+# The webhook-failures SNS topic only exists unsuffixed in dev (CC3-886
+# Phase 1); staging/live get the strict suffix.
 WEBHOOK_FAILURES_TOPIC_ARN="arn:aws:sns:${AWS_REGION}:${AWS_ACCOUNT_ID}:ieee-rc-webhook-failures"
-DLQ_QUEUE_ARN="arn:aws:sqs:${AWS_REGION}:${AWS_ACCOUNT_ID}:ieee-rc-processing-dlq"
+# CC3-1049: the DLQ uses the strict `-${ENV}` suffix in EVERY env. The dev
+# orchestrator's runtime DLQ_QUEUE_URL points at ieee-rc-processing-dlq-dev, so
+# the IAM grant MUST target that same queue — otherwise sqs:SendMessage gets
+# AccessDenied and every processing failure is silently dropped (no DLQ entry,
+# no retry, no alert), which is exactly how the original stalls went unnoticed.
+DLQ_QUEUE_ARN="arn:aws:sqs:${AWS_REGION}:${AWS_ACCOUNT_ID}:ieee-rc-processing-dlq-${ENV}"
 if [[ "${ENV}" != "dev" ]]; then
     WEBHOOK_FAILURES_TOPIC_ARN="${WEBHOOK_FAILURES_TOPIC_ARN}-${ENV}"
-    DLQ_QUEUE_ARN="${DLQ_QUEUE_ARN}-${ENV}"
 fi
 
 ECR_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO_NAME}"
