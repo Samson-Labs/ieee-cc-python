@@ -469,11 +469,25 @@ class AIOrchestrator:
                 actual_fields.discard("abstract")
             generated_fields = sorted(actual_fields)
 
+            # CC3-1049: state the enrichment OUTCOME explicitly so Drupal no
+            # longer has to infer "empty, and why" from data-emptiness plus the
+            # extractor's extraction_method — the brittle inference behind the
+            # CC3-952 regression. 'enriched' when Bedrock produced data;
+            # otherwise classify why it didn't.
+            if bedrock_result:
+                enrichment_status = "enriched"
+            else:
+                enrichment_status = {
+                    "ocr": "scanned_pdf",
+                    "failed": "extraction_failed",
+                }.get(extraction_result.get("extraction_method", ""), "no_content")
+
             payload = {
                 "request_id": meta.get("request_id") or request_id,
                 "item_id": meta_item_id,
                 "status": "success",
                 "signal": signal,
+                "enrichment_status": enrichment_status,
                 "product_part_number": product_part_number,
                 "ou": meta_ou,
                 "completed_at": datetime.now(timezone.utc)

@@ -520,8 +520,30 @@ class TestWebhook:
         assert payload["request_id"] == 42
         assert payload["ou"] == "PES"
         assert payload["status"] == "success"
+        # CC3-1049: explicit outcome — Bedrock produced data here.
+        assert payload["enrichment_status"] == "enriched"
         assert "data" in payload
         assert "completed_at" in payload
+
+    @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
+    def test_scanned_pdf_reports_enrichment_status(self, mock_send, orchestrator):
+        # CC3-1049: a scanned PDF (no text, extraction_method 'ocr') skips
+        # Bedrock; the webhook now states enrichment_status explicitly so Drupal
+        # doesn't have to infer it from empty data + extraction_method.
+        orch, s3, lam = orchestrator
+        meta = _make_meta(ai_enabled=True, callback_url="https://drupal.example.com/hook")
+        s3.get_object.return_value = _s3_get_object_response(meta)
+        lam.invoke.return_value = _lambda_invoke_response(
+            200, {"text": "", "page_count": 3, "extraction_method": "ocr"}
+        )
+
+        result = orch.process("bucket", "PES/pending/STD-12345.pdf")
+
+        assert result["action"] == "enriched"
+        payload = mock_send.call_args[0][2]
+        assert payload["enrichment_status"] == "scanned_pdf"
+        assert payload["data"] == {}
+        assert payload["extraction"]["extraction_method"] == "ocr"
 
     @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=False)
     def test_failure_webhook_sent_on_processing_error(self, mock_send, orchestrator):

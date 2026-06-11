@@ -540,22 +540,20 @@ class BedrockInference:
     @staticmethod
     def _validate_abstract(result: dict) -> None:
         abstract = result["abstract"]
-        if not isinstance(abstract, str) or "\n\n" not in abstract:
-            raise ValueError(
-                "abstract must be a string with two paragraphs separated by \\n\\n"
-            )
+        if not isinstance(abstract, str) or not abstract.strip():
+            raise ValueError("abstract must be a non-empty string")
+        # CC3-1049: the 2-paragraph / 50–150-word shape is the TARGET (enforced
+        # via the prompt), not a hard gate. Rejecting the whole item over an
+        # off-format abstract stranded loads; accept it and let the reviewer
+        # tidy it in AI Review (the item lands in pending_review regardless).
+        # Log when it's off-target so quality regressions stay visible.
         paragraphs = [p.strip() for p in abstract.split("\n\n") if p.strip()]
-        if len(paragraphs) != 2:
-            raise ValueError(
-                f"abstract must contain exactly two paragraphs, got {len(paragraphs)}"
+        word_counts = [len(p.split()) for p in paragraphs]
+        if len(paragraphs) != 2 or any(wc < 50 or wc > 150 for wc in word_counts):
+            logger.warning(
+                "abstract is off-target (%d paragraph(s), word counts %s); accepting anyway",
+                len(paragraphs), word_counts,
             )
-        for i, para in enumerate(paragraphs):
-            word_count = len(para.split())
-            if word_count < 50 or word_count > 150:
-                raise ValueError(
-                    f"abstract paragraph {i + 1} has {word_count} words "
-                    f"(expected 50–150)"
-                )
 
     @staticmethod
     def _validate_keywords(result: dict) -> None:
