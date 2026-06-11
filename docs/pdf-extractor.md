@@ -57,9 +57,27 @@ Vocabulary matches Drupal's `WebhookController` contract (CC3-952): `{transcribe
 
 | Method | Meaning |
 |--------|---------|
-| `extract_text` | Text was successfully extracted from the PDF |
-| `ocr` | PDF appears scanned (no text layer). Empty text returned with a warning. OCR is not performed. |
+| `extract_text` | Text was successfully extracted from the PDF — either from the native text layer, or (when OCR is enabled) recovered from a scanned PDF via Textract. |
+| `ocr` | PDF appears scanned (no text layer) **and** no text was recovered — OCR disabled, or OCR ran but found nothing. Empty text returned with a warning; Drupal routes the item to manual entry. |
 | `failed` | PDF could not be processed (encrypted, corrupted, or unreadable) |
+
+### Scanned-PDF OCR fallback (CC3-1049, opt-in)
+
+When a PDF has no extractable text layer, an optional AWS Textract pass can
+recover the text so it still flows through Bedrock enrichment instead of
+requiring manual entry. Recovered text is returned as `extraction_method:
+"extract_text"` (it is, semantically, extracted text), so the orchestrator and
+Drupal contract are unchanged.
+
+| Env var | Default | Purpose |
+|---------|---------|---------|
+| `ENABLE_SCANNED_PDF_OCR` | _(off)_ | Set to `1`/`true` to enable the Textract fallback. |
+| `MAX_OCR_PAGES` | `20` | Page cap — only the first N pages are OCR'd, bounding cost/latency on large scans. |
+
+Cost ≈ **$1.50 / 1,000 pages** (Textract `DetectDocumentText`). The Lambda role
+needs `textract:DetectDocumentText` (added in `scripts/deploy.sh`). If Textract
+errors or finds nothing, the extractor degrades to the empty/`ocr` path — it
+never raises.
 
 ## Text Processing Pipeline
 
@@ -75,7 +93,7 @@ Vocabulary matches Drupal's `WebhookController` contract (CC3-952): `{transcribe
 |----------|----------|
 | Corrupted/unreadable PDF | Returns `extraction_method: "failed"`, empty text, `page_count: 0` |
 | Encrypted PDF | Returns `extraction_method: "failed"`, empty text, page count preserved |
-| Scanned PDF (no text layer) | Returns `extraction_method: "ocr"`, empty text, page count preserved, warning logged |
+| Scanned PDF (no text layer) | OCR off (default): `extraction_method: "ocr"`, empty text, warning logged. OCR on (`ENABLE_SCANNED_PDF_OCR`): Textract recovers text → `extraction_method: "extract_text"`; falls back to `ocr` if Textract finds nothing or errors |
 | Successful text extraction | Returns `extraction_method: "extract_text"`, full text, `page_count: N` |
 | PDF exceeding 180k chars | Text truncated, info logged |
 
@@ -90,4 +108,4 @@ Vocabulary matches Drupal's `WebhookController` contract (CC3-952): `{transcribe
 python -m pytest tests/extractors/test_pdf_extractor.py -v
 ```
 
-21 tests covering: normal PDF, scanned PDF, encrypted PDF, corrupted PDF, large PDF truncation, multi-column PDF, Unicode text, blank PDF, S3 errors (404, 403, 500, timeout), S3 integration with metadata write, and text cleaning utilities.
+Tests cover: normal PDF, scanned PDF, scanned-PDF Textract OCR fallback (enabled/disabled, page cap, empty-result and Textract-error fallbacks), encrypted PDF, corrupted PDF, large PDF truncation, multi-column PDF, Unicode text, blank PDF, S3 errors (404, 403, 500, timeout), S3 integration with metadata write, and text cleaning utilities.

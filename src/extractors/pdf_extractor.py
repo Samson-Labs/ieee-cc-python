@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from datetime import datetime, timezone
 from typing import TypedDict
@@ -20,6 +21,33 @@ logger = logging.getLogger(__name__)
 
 MAX_TEXT_LENGTH = 180_000
 HEADER_FOOTER_MARGIN_RATIO = 0.08  # top/bottom 8% of page treated as header/footer zone
+
+# CC3-1049: optional OCR fallback for scanned/image-only PDFs (no text layer).
+# When enabled, the first MAX_OCR_PAGES pages are rasterized and sent to AWS
+# Textract; the recovered text is returned as a normal "extract_text" result so
+# the orchestrator runs Bedrock exactly as it would for a born-digital PDF.
+# Default OFF — turn on per environment after validating OCR quality + cost on
+# real scans. Cost ≈ $1.50 / 1,000 pages (Textract DetectDocumentText); the page
+# cap bounds the worst case (e.g. a 500-page scanned book).
+OCR_RENDER_DPI = 200  # good legibility for OCR without oversized images
+
+
+def _ocr_enabled() -> bool:
+    """Whether the scanned-PDF OCR fallback is enabled (env flag, default off)."""
+    return os.environ.get("ENABLE_SCANNED_PDF_OCR", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _max_ocr_pages() -> int:
+    """Page cap for OCR — bounds cost/latency on very large scans."""
+    try:
+        return max(1, int(os.environ.get("MAX_OCR_PAGES", "20")))
+    except (TypeError, ValueError):
+        return 20
 
 
 class ExtractionResult(TypedDict):
@@ -36,8 +64,11 @@ class PDFExtractor:
         result = extractor.extract(bucket, key, ou, product_part_number)
     """
 
-    def __init__(self, s3_client=None):
+    def __init__(self, s3_client=None, textract_client=None):
         self._s3 = s3_client or boto3.client("s3")
+        # Created lazily on first OCR use (see _get_textract) so non-scanned
+        # extractions — and tests — never need a Textract client.
+        self._textract = textract_client
 
     def extract(
         self,
@@ -116,11 +147,36 @@ class PDFExtractor:
             total_chars += len(page_text)
 
         if not has_text:
-            logger.warning(
-                "PDF appears to be scanned (no extractable text on %d pages). "
-                "OCR is not performed; returning empty text.",
-                page_count,
-            )
+            # CC3-1049: scanned/image-only PDF (no text layer). When OCR is
+            # enabled, recover text via Textract and return it as a normal
+            # "extract_text" result so the orchestrator runs Bedrock unchanged.
+            if _ocr_enabled():
+                ocr_text = self._ocr_scanned(doc)
+                if ocr_text.strip():
+                    cleaned = _clean_text(ocr_text)
+                    if len(cleaned) > MAX_TEXT_LENGTH:
+                        cleaned = cleaned[:MAX_TEXT_LENGTH]
+                    logger.info(
+                        "Textract OCR recovered %d chars from scanned PDF (%d pages).",
+                        len(cleaned),
+                        page_count,
+                    )
+                    return ExtractionResult(
+                        text=cleaned,
+                        page_count=page_count,
+                        extraction_method="extract_text",
+                    )
+                logger.warning(
+                    "Scanned PDF (%d pages): Textract OCR returned no usable text; "
+                    "falling back to manual entry.",
+                    page_count,
+                )
+            else:
+                logger.warning(
+                    "PDF appears to be scanned (no extractable text on %d pages). "
+                    "OCR disabled (ENABLE_SCANNED_PDF_OCR off); returning empty text.",
+                    page_count,
+                )
             return ExtractionResult(
                 text="", page_count=page_count, extraction_method="ocr"
             )
@@ -155,6 +211,48 @@ class PDFExtractor:
 
         text = page.get_text("text", clip=content_rect)
         return text
+
+    def _get_textract(self):
+        """Lazily create the Textract client (only when OCR actually runs)."""
+        if self._textract is None:
+            self._textract = boto3.client("textract", region_name="us-east-1")
+        return self._textract
+
+    def _ocr_scanned(self, doc: fitz.Document) -> str:
+        """OCR the first MAX_OCR_PAGES pages of a scanned PDF via AWS Textract.
+
+        Rasterizes each page and calls the synchronous DetectDocumentText API
+        (no S3 round-trip; one call per page, so the page cap directly bounds
+        cost). Returns the recovered text, or "" if Textract finds nothing or
+        errors — callers then fall back to the empty/manual path. Never raises.
+        """
+        total = len(doc)
+        limit = min(total, _max_ocr_pages())
+        if total > limit:
+            logger.info(
+                "Scanned PDF has %d pages; OCR-ing the first %d (MAX_OCR_PAGES).",
+                total,
+                limit,
+            )
+        client = self._get_textract()
+        zoom = OCR_RENDER_DPI / 72.0
+        matrix = fitz.Matrix(zoom, zoom)
+        pages_text: list[str] = []
+        for i in range(limit):
+            try:
+                pix = doc[i].get_pixmap(matrix=matrix)
+                png = pix.tobytes("png")
+                resp = client.detect_document_text(Document={"Bytes": png})
+                lines = [
+                    block["Text"]
+                    for block in resp.get("Blocks", [])
+                    if block.get("BlockType") == "LINE" and block.get("Text")
+                ]
+                if lines:
+                    pages_text.append("\n".join(lines))
+            except Exception:
+                logger.exception("Textract OCR failed on page %d; skipping.", i + 1)
+        return "\n\n".join(pages_text)
 
     def _write_metadata(
         self,

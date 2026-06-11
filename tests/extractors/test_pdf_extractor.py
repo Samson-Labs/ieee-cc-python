@@ -184,6 +184,81 @@ class TestScannedPDF:
             assert "scanned" in mock_logger.warning.call_args[0][0].lower()
 
 
+class TestScannedPDFOCR:
+    """CC3-1049: optional Textract OCR fallback for scanned PDFs (flag-gated)."""
+
+    def test_ocr_disabled_by_default(self, scanned_pdf: bytes):
+        textract = MagicMock()
+        extractor = PDFExtractor(s3_client=MagicMock(), textract_client=textract)
+
+        result = extractor.extract_from_bytes(scanned_pdf)
+
+        assert result["extraction_method"] == "ocr"
+        assert result["text"] == ""
+        textract.detect_document_text.assert_not_called()
+
+    def test_ocr_recovers_text_when_enabled(self, monkeypatch, scanned_pdf: bytes):
+        monkeypatch.setenv("ENABLE_SCANNED_PDF_OCR", "1")
+        textract = MagicMock()
+        textract.detect_document_text.return_value = {
+            "Blocks": [
+                {"BlockType": "LINE", "Text": "Recovered heading"},
+                {"BlockType": "LINE", "Text": "Recovered body line"},
+                {"BlockType": "WORD", "Text": "ignored-word"},
+            ]
+        }
+        extractor = PDFExtractor(s3_client=MagicMock(), textract_client=textract)
+
+        result = extractor.extract_from_bytes(scanned_pdf)
+
+        # OCR text surfaces as a normal extract_text result so the orchestrator
+        # runs Bedrock exactly as it would for a born-digital PDF.
+        assert result["extraction_method"] == "extract_text"
+        assert "Recovered heading" in result["text"]
+        assert "Recovered body line" in result["text"]
+        assert "ignored-word" not in result["text"]  # only LINE blocks used
+        assert result["page_count"] == 3
+        assert textract.detect_document_text.call_count == 3  # one call per page
+
+    def test_ocr_respects_page_cap(self, monkeypatch):
+        monkeypatch.setenv("ENABLE_SCANNED_PDF_OCR", "1")
+        monkeypatch.setenv("MAX_OCR_PAGES", "2")
+        textract = MagicMock()
+        textract.detect_document_text.return_value = {
+            "Blocks": [{"BlockType": "LINE", "Text": "page text"}]
+        }
+        extractor = PDFExtractor(s3_client=MagicMock(), textract_client=textract)
+
+        result = extractor.extract_from_bytes(_make_scanned_pdf(5))
+
+        assert result["extraction_method"] == "extract_text"
+        assert result["page_count"] == 5
+        assert textract.detect_document_text.call_count == 2  # capped
+
+    def test_ocr_empty_result_falls_back_to_manual(self, monkeypatch, scanned_pdf: bytes):
+        monkeypatch.setenv("ENABLE_SCANNED_PDF_OCR", "1")
+        textract = MagicMock()
+        textract.detect_document_text.return_value = {"Blocks": []}
+        extractor = PDFExtractor(s3_client=MagicMock(), textract_client=textract)
+
+        result = extractor.extract_from_bytes(scanned_pdf)
+
+        assert result["extraction_method"] == "ocr"
+        assert result["text"] == ""
+
+    def test_ocr_textract_error_falls_back(self, monkeypatch, scanned_pdf: bytes):
+        monkeypatch.setenv("ENABLE_SCANNED_PDF_OCR", "1")
+        textract = MagicMock()
+        textract.detect_document_text.side_effect = RuntimeError("Textract down")
+        extractor = PDFExtractor(s3_client=MagicMock(), textract_client=textract)
+
+        # Must not raise — degrades to the empty/manual path.
+        result = extractor.extract_from_bytes(scanned_pdf)
+
+        assert result["extraction_method"] == "ocr"
+        assert result["text"] == ""
+
+
 class TestEncryptedPDF:
     def test_returns_failed(self, extractor: PDFExtractor, encrypted_pdf: bytes):
         result = extractor.extract_from_bytes(encrypted_pdf)
