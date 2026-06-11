@@ -63,11 +63,19 @@ Vocabulary matches Drupal's `WebhookController` contract (CC3-952): `{transcribe
 
 ### Scanned-PDF OCR fallback (CC3-1049, opt-in)
 
-When a PDF has no extractable text layer, an optional AWS Textract pass can
-recover the text so it still flows through Bedrock enrichment instead of
+When a PDF lacks a substantial native text layer, an optional AWS Textract pass
+can recover the text so it still flows through Bedrock enrichment instead of
 requiring manual entry. Recovered text is returned as `extraction_method:
 "extract_text"` (it is, semantically, extracted text), so the orchestrator and
 Drupal contract are unchanged.
+
+"Scanned" is detected as: **no page** carries ≥ `NATIVE_TEXT_SUFFICIENT` (100)
+native characters **and** the pages are either textless or **image-dominated**
+(a raster image covering ≥ 50% of the page). This catches both pure image-only
+PDFs *and* scans with a tiny digital overlay — e.g. a `SAMPLE LETTER` heading
+stamped over an otherwise-scanned letter, which a naive "any text → not scanned"
+check would extract almost nothing from. A genuinely sparse text PDF with no
+images (e.g. a title slide) keeps its native text and is **not** OCR'd.
 
 | Env var | Default | Purpose |
 |---------|---------|---------|

@@ -30,6 +30,13 @@ HEADER_FOOTER_MARGIN_RATIO = 0.08  # top/bottom 8% of page treated as header/foo
 # real scans. Cost ≈ $1.50 / 1,000 pages (Textract DetectDocumentText); the page
 # cap bounds the worst case (e.g. a 500-page scanned book).
 OCR_RENDER_DPI = 200  # good legibility for OCR without oversized images
+# A page with at least this many native characters is treated as a real text
+# page (never OCR'd). Below this, a page is OCR-eligible only when it is image-
+# dominated or textless — see _extract_from_document.
+NATIVE_TEXT_SUFFICIENT = 100
+# An image covering at least this fraction of the page area marks the page as a
+# scan (its real content is locked in the image, not the text layer).
+IMAGE_COVERAGE_RATIO = 0.5
 
 
 def _ocr_enabled() -> bool:
@@ -136,20 +143,26 @@ class PDFExtractor:
             )
 
         pages_text: list[str] = []
-        total_chars = 0
-        has_text = False
-
         for page in doc:
-            page_text = self._extract_page_text(page)
-            if page_text.strip():
-                has_text = True
-            pages_text.append(page_text)
-            total_chars += len(page_text)
+            pages_text.append(self._extract_page_text(page))
 
-        if not has_text:
-            # CC3-1049: scanned/image-only PDF (no text layer). When OCR is
-            # enabled, recover text via Textract and return it as a normal
-            # "extract_text" result so the orchestrator runs Bedrock unchanged.
+        # CC3-1049: detect "scanned" beyond pure image-only PDFs. A scan with a
+        # tiny digital overlay (e.g. a 'SAMPLE LETTER' heading stamped over an
+        # otherwise-scanned letter) leaves a sparse text layer that a naive
+        # any-text check treats as a complete text PDF — extracting almost
+        # nothing. Treat the PDF as scanned when no page carries a substantial
+        # native text layer AND the pages are either textless or image-dominated
+        # (a sparse-but-real text PDF with no images is left as extract_text).
+        has_substantial_text = any(
+            len(t.strip()) >= NATIVE_TEXT_SUFFICIENT for t in pages_text
+        )
+        all_textless = all(not t.strip() for t in pages_text)
+        image_dominated = any(self._has_dominant_image(page) for page in doc)
+
+        if not has_substantial_text and (all_textless or image_dominated):
+            # When OCR is enabled, recover text via Textract and return it as a
+            # normal "extract_text" result so the orchestrator runs Bedrock
+            # unchanged.
             if _ocr_enabled():
                 ocr_text = self._ocr_scanned(doc)
                 if ocr_text.strip():
@@ -173,7 +186,7 @@ class PDFExtractor:
                 )
             else:
                 logger.warning(
-                    "PDF appears to be scanned (no extractable text on %d pages). "
+                    "PDF appears to be scanned (no substantial text layer on %d pages). "
                     "OCR disabled (ENABLE_SCANNED_PDF_OCR off); returning empty text.",
                     page_count,
                 )
@@ -211,6 +224,26 @@ class PDFExtractor:
 
         text = page.get_text("text", clip=content_rect)
         return text
+
+    def _has_dominant_image(self, page: fitz.Page) -> bool:
+        """Whether a raster image covers a large fraction of the page.
+
+        The signal that a sparse-text page is actually a scan (real content
+        locked in a full-page image), versus a genuinely sparse text page (e.g.
+        a title slide) that has no image and should be kept as extracted text.
+        """
+        page_area = abs(page.rect.width * page.rect.height)
+        if page_area <= 0:
+            return False
+        for img in page.get_images(full=True):
+            try:
+                rects = page.get_image_rects(img[0])
+            except Exception:
+                continue
+            for rect in rects:
+                if abs(rect.width * rect.height) >= IMAGE_COVERAGE_RATIO * page_area:
+                    return True
+        return False
 
     def _get_textract(self):
         """Lazily create the Textract client (only when OCR actually runs)."""

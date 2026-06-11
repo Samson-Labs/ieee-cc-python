@@ -108,6 +108,23 @@ def _make_scanned_pdf(num_pages: int = 3) -> bytes:
     return buf
 
 
+def _make_image_pdf_with_overlay(overlay_text: str = "SAMPLE LETTER") -> bytes:
+    """A scan-style PDF: a full-page raster image with only a tiny digital text
+    overlay (mimics a scanned letter stamped with a 'SAMPLE LETTER' heading)."""
+    doc = fitz.open()
+    pix = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 80, 100))
+    pix.clear_with(220)  # light-gray "scan" image
+    page = doc.new_page()
+    page.insert_image(page.rect, pixmap=pix)  # full-page image
+    if overlay_text:
+        tw = fitz.TextWriter(page.rect)
+        tw.append(fitz.Point(72, 72), overlay_text)
+        tw.write_text(page)
+    buf = doc.tobytes()
+    doc.close()
+    return buf
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -257,6 +274,36 @@ class TestScannedPDFOCR:
 
         assert result["extraction_method"] == "ocr"
         assert result["text"] == ""
+
+    def test_scan_with_text_overlay_triggers_ocr(self, monkeypatch):
+        # CC3-1049: a scanned page with a tiny digital overlay (e.g. a
+        # "SAMPLE LETTER" heading) must still be detected as scanned and OCR'd —
+        # the few overlay chars must NOT mask it as a complete text PDF.
+        monkeypatch.setenv("ENABLE_SCANNED_PDF_OCR", "1")
+        textract = MagicMock()
+        textract.detect_document_text.return_value = {
+            "Blocks": [{"BlockType": "LINE", "Text": "Recovered scanned body text"}]
+        }
+        extractor = PDFExtractor(s3_client=MagicMock(), textract_client=textract)
+
+        result = extractor.extract_from_bytes(_make_image_pdf_with_overlay("SAMPLE LETTER"))
+
+        assert result["extraction_method"] == "extract_text"
+        assert "Recovered scanned body text" in result["text"]
+        assert textract.detect_document_text.called
+
+    def test_sparse_text_without_image_not_ocred(self, monkeypatch):
+        # Guard against over-triggering: a genuinely sparse text PDF (short text,
+        # NO image) must keep its native text and never call Textract.
+        monkeypatch.setenv("ENABLE_SCANNED_PDF_OCR", "1")
+        textract = MagicMock()
+        extractor = PDFExtractor(s3_client=MagicMock(), textract_client=textract)
+
+        result = extractor.extract_from_bytes(_make_pdf(["Short note."]))
+
+        assert result["extraction_method"] == "extract_text"
+        assert "Short note." in result["text"]
+        textract.detect_document_text.assert_not_called()
 
 
 class TestEncryptedPDF:
