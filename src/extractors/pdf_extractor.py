@@ -11,11 +11,13 @@ import json
 import logging
 import os
 import re
+import time
 from datetime import datetime, timezone
 from typing import TypedDict
 
 import boto3
 import fitz  # PyMuPDF
+from botocore.exceptions import ClientError
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +39,21 @@ NATIVE_TEXT_SUFFICIENT = 100
 # An image covering at least this fraction of the page area marks the page as a
 # scan (its real content is locked in the image, not the text layer).
 IMAGE_COVERAGE_RATIO = 0.5
+
+# Textract synchronous DetectDocumentText has low TPS limits, and _ocr_scanned
+# fires one call per page in a tight loop — so a multi-page scan can trip
+# ThrottlingException. Retry throttles specifically with bounded backoff so a
+# transient throttle doesn't silently drop a page and let a PARTIAL OCR
+# masquerade as a complete extract_text result.
+OCR_THROTTLE_RETRIES = 3
+OCR_THROTTLE_BACKOFF_BASE = 0.5  # seconds; 0.5, 1.0, 2.0
+_THROTTLE_ERROR_CODES = frozenset(
+    {
+        "ThrottlingException",
+        "ProvisionedThroughputExceededException",
+        "ThrottledException",
+    }
+)
 
 
 def _ocr_enabled() -> bool:
@@ -258,6 +275,11 @@ class PDFExtractor:
         (no S3 round-trip; one call per page, so the page cap directly bounds
         cost). Returns the recovered text, or "" if Textract finds nothing or
         errors — callers then fall back to the empty/manual path. Never raises.
+
+        Throttles are retried with bounded backoff (see _detect_document_text);
+        any page that still fails is skipped and counted, and a WARNING is
+        logged so a PARTIAL OCR is distinguishable from a clean full OCR (the
+        recovered text is otherwise returned as a complete extract_text result).
         """
         total = len(doc)
         limit = min(total, _max_ocr_pages())
@@ -271,11 +293,12 @@ class PDFExtractor:
         zoom = OCR_RENDER_DPI / 72.0
         matrix = fitz.Matrix(zoom, zoom)
         pages_text: list[str] = []
+        failed_pages = 0
         for i in range(limit):
             try:
                 pix = doc[i].get_pixmap(matrix=matrix)
                 png = pix.tobytes("png")
-                resp = client.detect_document_text(Document={"Bytes": png})
+                resp = self._detect_document_text(client, png, i)
                 lines = [
                     block["Text"]
                     for block in resp.get("Blocks", [])
@@ -285,7 +308,45 @@ class PDFExtractor:
                     pages_text.append("\n".join(lines))
             except Exception:
                 logger.exception("Textract OCR failed on page %d; skipping.", i + 1)
+                failed_pages += 1
+        if failed_pages:
+            logger.warning(
+                "Textract OCR skipped %d of %d page(s) after retries; OCR result "
+                "is PARTIAL but is returned downstream as a complete extract_text "
+                "result. Recovered text from %d page(s).",
+                failed_pages,
+                limit,
+                len(pages_text),
+            )
         return "\n\n".join(pages_text)
+
+    def _detect_document_text(self, client, png: bytes, page_index: int) -> dict:
+        """Call Textract DetectDocumentText with bounded backoff on throttling.
+
+        Retries only throttling errors (ThrottlingException and friends);
+        non-throttle errors raise immediately so the caller skips just that
+        page. A throttle that survives all retries also raises (and is counted
+        as a skipped, partial page by the caller).
+        """
+        for attempt in range(OCR_THROTTLE_RETRIES + 1):
+            try:
+                return client.detect_document_text(Document={"Bytes": png})
+            except ClientError as exc:
+                code = exc.response.get("Error", {}).get("Code", "")
+                if code in _THROTTLE_ERROR_CODES and attempt < OCR_THROTTLE_RETRIES:
+                    wait = OCR_THROTTLE_BACKOFF_BASE * (2 ** attempt)
+                    logger.warning(
+                        "Textract throttled on page %d (%s); retrying in %.1fs "
+                        "(attempt %d/%d).",
+                        page_index + 1,
+                        code,
+                        wait,
+                        attempt + 1,
+                        OCR_THROTTLE_RETRIES,
+                    )
+                    time.sleep(wait)
+                    continue
+                raise
 
     def _write_metadata(
         self,

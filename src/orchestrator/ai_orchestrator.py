@@ -508,6 +508,14 @@ class AIOrchestrator:
                 response_validator=_drupal_ack_validator,
             )
 
+        # CC3-1049: success has been reported (Step 5). Clear the failure
+        # context so a later error in Step 6 (S3 move) or Step 7 (metrics) —
+        # which the handler's except block routes through send_failure_webhook
+        # — can't deliver a second 'failure' webhook on top of the 'success'
+        # one and flip a correctly-enriched item into the failure path. The
+        # move/metrics failure still goes to the DLQ for reprocessing.
+        self._failure_ctx = None
+
         # Step 6: Move file from /pending/ to /processed/
         if has_file:
             self._move_file(bucket, key, destination_key, correlation)

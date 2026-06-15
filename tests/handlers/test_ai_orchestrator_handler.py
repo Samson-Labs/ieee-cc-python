@@ -1,6 +1,7 @@
 """Tests for AI Orchestrator Lambda handler."""
 
 import json
+from io import BytesIO
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -346,3 +347,112 @@ class TestDirectMetaInvocation:
 
         assert result["statusCode"] == 500
         mock_sqs.send_message.assert_called_once()
+
+
+# ---------------------------------------------------------------
+# CC3-1049: no duplicate webhook when an error occurs AFTER the
+# success webhook (Step 6 move / Step 7 metrics)
+# ---------------------------------------------------------------
+
+def _lambda_invoke_response(status_code=200, body=None):
+    """Build a mocked lambda.invoke() return value (mirrors the orchestrator
+    unit-test helper)."""
+    payload = {"statusCode": status_code, "body": body or {}}
+    mock_payload = MagicMock()
+    mock_payload.read.return_value = json.dumps(payload).encode()
+    return {"Payload": mock_payload, "StatusCode": 200}
+
+
+def _enriched_pdf_meta():
+    return {
+        "request_id": 42,
+        "item_id": "STD-12345",
+        "ou": "PES",
+        "product_part_number": "STD-12345",
+        "ai_enrichment_enabled": True,
+        "content": {
+            "media_type": "application/pdf",
+            "filename": "STD-12345.pdf",
+            "resource_center": "PES",
+        },
+        "callback_url": "https://drupal.example.com/hook",
+    }
+
+
+class TestNoDuplicateWebhookAfterSuccess:
+    """CC3-1049 regression: an error in Step 6 (S3 move) or Step 7 (metrics) —
+    which runs *after* the Step 5 success webhook — must NOT make the handler's
+    except block deliver a second 'failure' webhook for the same item, flipping
+    a correctly-enriched item into the failure path.
+
+    Drives the *real* orchestrator through ``handler()`` so the
+    success→failure interaction is exercised end-to-end. The unit test
+    (``test_failure_webhook_sent_on_processing_error``) calls
+    ``send_failure_webhook()`` manually, so it can't catch this.
+    """
+
+    def _real_orchestrator(self, copy_object_side_effect):
+        from src.orchestrator.ai_orchestrator import AIOrchestrator
+
+        s3 = MagicMock()
+        lam = MagicMock()
+        secrets = MagicMock()
+        secrets.get_secret_value.return_value = {"SecretString": "test-secret"}
+
+        s3.get_object.return_value = {
+            "Body": BytesIO(json.dumps(_enriched_pdf_meta()).encode())
+        }
+        s3.copy_object.side_effect = copy_object_side_effect
+
+        lam.invoke.side_effect = [
+            _lambda_invoke_response(
+                200,
+                {"text": "text", "page_count": 5, "extraction_method": "extract_text"},
+            ),
+            _lambda_invoke_response(
+                200,
+                {"abstract": "a", "keywords": ["k"], "learning_level": "Expert"},
+            ),
+        ]
+
+        return AIOrchestrator(
+            s3_client=s3, lambda_client=lam, secrets_client=secrets
+        ), s3
+
+    @patch("src.handlers.ai_orchestrator_handler.DLQ_QUEUE_URL", "")
+    @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
+    def test_step6_move_clienterror_sends_only_success(self, mock_send):
+        from botocore.exceptions import ClientError
+
+        # _move_file's copy_object raises AccessDenied AFTER the success webhook.
+        real_orch, _s3 = self._real_orchestrator(
+            ClientError(
+                {"Error": {"Code": "AccessDenied", "Message": "Forbidden"}},
+                "CopyObject",
+            )
+        )
+
+        with patch("src.handlers.ai_orchestrator_handler._orchestrator", real_orch):
+            result = handler(_s3_event(), None)
+
+        assert result["statusCode"] == 500
+        assert "AccessDenied" in result["body"]["error"]
+
+        # Exactly one webhook — the success. No failure webhook on top of it.
+        assert mock_send.call_count == 1
+        assert mock_send.call_args[0][2]["status"] == "success"
+
+    @patch("src.handlers.ai_orchestrator_handler.DLQ_QUEUE_URL", "")
+    @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
+    def test_step6_move_generic_error_sends_only_success(self, mock_send):
+        # The except Exception path (e.g. delete_object failing) must behave
+        # the same way — single success webhook, no failure follow-up.
+        real_orch, s3 = self._real_orchestrator(None)
+        s3.delete_object.side_effect = RuntimeError("transient S3 delete failure")
+
+        with patch("src.handlers.ai_orchestrator_handler._orchestrator", real_orch):
+            result = handler(_s3_event(), None)
+
+        assert result["statusCode"] == 500
+        assert mock_send.call_count == 1
+        assert mock_send.call_args[0][2]["status"] == "success"

@@ -305,6 +305,79 @@ class TestScannedPDFOCR:
         assert "Short note." in result["text"]
         textract.detect_document_text.assert_not_called()
 
+    @patch("src.extractors.pdf_extractor.time.sleep")
+    def test_ocr_retries_on_throttle(self, mock_sleep, monkeypatch, scanned_pdf: bytes):
+        # A transient ThrottlingException must be retried (not silently dropped),
+        # so the throttled page's text is still recovered.
+        monkeypatch.setenv("ENABLE_SCANNED_PDF_OCR", "1")
+        throttle = ClientError(
+            {"Error": {"Code": "ThrottlingException", "Message": "Rate exceeded"}},
+            "DetectDocumentText",
+        )
+        good = {"Blocks": [{"BlockType": "LINE", "Text": "page text"}]}
+        textract = MagicMock()
+        # Page 1 throttles once then succeeds; pages 2 and 3 succeed first try.
+        textract.detect_document_text.side_effect = [throttle, good, good, good]
+        extractor = PDFExtractor(s3_client=MagicMock(), textract_client=textract)
+
+        result = extractor.extract_from_bytes(scanned_pdf)
+
+        assert result["extraction_method"] == "extract_text"
+        assert "page text" in result["text"]
+        assert textract.detect_document_text.call_count == 4  # 1 retry + 3 pages
+        mock_sleep.assert_called_once()  # backed off exactly once
+
+    @patch("src.extractors.pdf_extractor.time.sleep")
+    def test_ocr_partial_when_throttle_exhausted(
+        self, mock_sleep, monkeypatch, caplog, scanned_pdf: bytes
+    ):
+        # A page whose throttle survives every retry is skipped and counted; the
+        # surviving pages' text is still returned, but a PARTIAL warning is
+        # logged so the result is distinguishable from a clean full OCR.
+        monkeypatch.setenv("ENABLE_SCANNED_PDF_OCR", "1")
+        throttle = ClientError(
+            {"Error": {"Code": "ThrottlingException", "Message": "Rate exceeded"}},
+            "DetectDocumentText",
+        )
+        good = {"Blocks": [{"BlockType": "LINE", "Text": "recovered page"}]}
+        textract = MagicMock()
+        # Page 1: 4 throttles (initial + 3 retries) -> skipped. Pages 2, 3: OK.
+        textract.detect_document_text.side_effect = [
+            throttle, throttle, throttle, throttle, good, good,
+        ]
+        extractor = PDFExtractor(s3_client=MagicMock(), textract_client=textract)
+
+        with caplog.at_level("WARNING"):
+            result = extractor.extract_from_bytes(scanned_pdf)
+
+        # Two of three pages recovered -> still surfaces as extract_text.
+        assert result["extraction_method"] == "extract_text"
+        assert "recovered page" in result["text"]
+        assert textract.detect_document_text.call_count == 6
+        assert any("PARTIAL" in rec.message for rec in caplog.records)
+
+    @patch("src.extractors.pdf_extractor.time.sleep")
+    def test_ocr_non_throttle_clienterror_not_retried(
+        self, mock_sleep, monkeypatch, scanned_pdf: bytes
+    ):
+        # A non-throttle ClientError (e.g. AccessDenied) must NOT be retried —
+        # the page is skipped immediately.
+        monkeypatch.setenv("ENABLE_SCANNED_PDF_OCR", "1")
+        denied = ClientError(
+            {"Error": {"Code": "AccessDeniedException", "Message": "no"}},
+            "DetectDocumentText",
+        )
+        textract = MagicMock()
+        textract.detect_document_text.side_effect = denied
+        extractor = PDFExtractor(s3_client=MagicMock(), textract_client=textract)
+
+        result = extractor.extract_from_bytes(scanned_pdf)
+
+        assert result["extraction_method"] == "ocr"  # all pages skipped -> empty
+        assert result["text"] == ""
+        assert textract.detect_document_text.call_count == 3  # one try per page
+        mock_sleep.assert_not_called()
+
 
 class TestEncryptedPDF:
     def test_returns_failed(self, extractor: PDFExtractor, encrypted_pdf: bytes):
