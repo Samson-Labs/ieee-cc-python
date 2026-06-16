@@ -108,6 +108,23 @@ def _make_scanned_pdf(num_pages: int = 3) -> bytes:
     return buf
 
 
+def _make_image_pdf_with_overlay(overlay_text: str = "SAMPLE LETTER") -> bytes:
+    """A scan-style PDF: a full-page raster image with only a tiny digital text
+    overlay (mimics a scanned letter stamped with a 'SAMPLE LETTER' heading)."""
+    doc = fitz.open()
+    pix = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 80, 100))
+    pix.clear_with(220)  # light-gray "scan" image
+    page = doc.new_page()
+    page.insert_image(page.rect, pixmap=pix)  # full-page image
+    if overlay_text:
+        tw = fitz.TextWriter(page.rect)
+        tw.append(fitz.Point(72, 72), overlay_text)
+        tw.write_text(page)
+    buf = doc.tobytes()
+    doc.close()
+    return buf
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -182,6 +199,184 @@ class TestScannedPDF:
             extractor.extract_from_bytes(scanned_pdf)
             mock_logger.warning.assert_called_once()
             assert "scanned" in mock_logger.warning.call_args[0][0].lower()
+
+
+class TestScannedPDFOCR:
+    """CC3-1049: optional Textract OCR fallback for scanned PDFs (flag-gated)."""
+
+    def test_ocr_disabled_by_default(self, scanned_pdf: bytes):
+        textract = MagicMock()
+        extractor = PDFExtractor(s3_client=MagicMock(), textract_client=textract)
+
+        result = extractor.extract_from_bytes(scanned_pdf)
+
+        assert result["extraction_method"] == "ocr"
+        assert result["text"] == ""
+        textract.detect_document_text.assert_not_called()
+
+    def test_ocr_recovers_text_when_enabled(self, monkeypatch, scanned_pdf: bytes):
+        monkeypatch.setenv("ENABLE_SCANNED_PDF_OCR", "1")
+        textract = MagicMock()
+        textract.detect_document_text.return_value = {
+            "Blocks": [
+                {"BlockType": "LINE", "Text": "Recovered heading"},
+                {"BlockType": "LINE", "Text": "Recovered body line"},
+                {"BlockType": "WORD", "Text": "ignored-word"},
+            ]
+        }
+        extractor = PDFExtractor(s3_client=MagicMock(), textract_client=textract)
+
+        result = extractor.extract_from_bytes(scanned_pdf)
+
+        # OCR text surfaces as a normal extract_text result so the orchestrator
+        # runs Bedrock exactly as it would for a born-digital PDF.
+        assert result["extraction_method"] == "extract_text"
+        assert "Recovered heading" in result["text"]
+        assert "Recovered body line" in result["text"]
+        assert "ignored-word" not in result["text"]  # only LINE blocks used
+        assert result["page_count"] == 3
+        assert textract.detect_document_text.call_count == 3  # one call per page
+
+    def test_ocr_respects_page_cap(self, monkeypatch):
+        monkeypatch.setenv("ENABLE_SCANNED_PDF_OCR", "1")
+        monkeypatch.setenv("MAX_OCR_PAGES", "2")
+        textract = MagicMock()
+        textract.detect_document_text.return_value = {
+            "Blocks": [{"BlockType": "LINE", "Text": "page text"}]
+        }
+        extractor = PDFExtractor(s3_client=MagicMock(), textract_client=textract)
+
+        result = extractor.extract_from_bytes(_make_scanned_pdf(5))
+
+        assert result["extraction_method"] == "extract_text"
+        assert result["page_count"] == 5
+        assert textract.detect_document_text.call_count == 2  # capped
+
+    def test_ocr_empty_result_falls_back_to_manual(self, monkeypatch, scanned_pdf: bytes):
+        monkeypatch.setenv("ENABLE_SCANNED_PDF_OCR", "1")
+        textract = MagicMock()
+        textract.detect_document_text.return_value = {"Blocks": []}
+        extractor = PDFExtractor(s3_client=MagicMock(), textract_client=textract)
+
+        result = extractor.extract_from_bytes(scanned_pdf)
+
+        assert result["extraction_method"] == "ocr"
+        assert result["text"] == ""
+
+    def test_ocr_textract_error_falls_back(self, monkeypatch, scanned_pdf: bytes):
+        monkeypatch.setenv("ENABLE_SCANNED_PDF_OCR", "1")
+        textract = MagicMock()
+        textract.detect_document_text.side_effect = RuntimeError("Textract down")
+        extractor = PDFExtractor(s3_client=MagicMock(), textract_client=textract)
+
+        # Must not raise — degrades to the empty/manual path.
+        result = extractor.extract_from_bytes(scanned_pdf)
+
+        assert result["extraction_method"] == "ocr"
+        assert result["text"] == ""
+
+    def test_scan_with_text_overlay_triggers_ocr(self, monkeypatch):
+        # CC3-1049: a scanned page with a tiny digital overlay (e.g. a
+        # "SAMPLE LETTER" heading) must still be detected as scanned and OCR'd —
+        # the few overlay chars must NOT mask it as a complete text PDF.
+        monkeypatch.setenv("ENABLE_SCANNED_PDF_OCR", "1")
+        textract = MagicMock()
+        textract.detect_document_text.return_value = {
+            "Blocks": [{"BlockType": "LINE", "Text": "Recovered scanned body text"}]
+        }
+        extractor = PDFExtractor(s3_client=MagicMock(), textract_client=textract)
+
+        result = extractor.extract_from_bytes(_make_image_pdf_with_overlay("SAMPLE LETTER"))
+
+        assert result["extraction_method"] == "extract_text"
+        assert "Recovered scanned body text" in result["text"]
+        assert textract.detect_document_text.called
+
+    def test_sparse_text_without_image_not_ocred(self, monkeypatch):
+        # Guard against over-triggering: a genuinely sparse text PDF (short text,
+        # NO image) must keep its native text and never call Textract.
+        monkeypatch.setenv("ENABLE_SCANNED_PDF_OCR", "1")
+        textract = MagicMock()
+        extractor = PDFExtractor(s3_client=MagicMock(), textract_client=textract)
+
+        result = extractor.extract_from_bytes(_make_pdf(["Short note."]))
+
+        assert result["extraction_method"] == "extract_text"
+        assert "Short note." in result["text"]
+        textract.detect_document_text.assert_not_called()
+
+    @patch("src.extractors.pdf_extractor.time.sleep")
+    def test_ocr_retries_on_throttle(self, mock_sleep, monkeypatch, scanned_pdf: bytes):
+        # A transient ThrottlingException must be retried (not silently dropped),
+        # so the throttled page's text is still recovered.
+        monkeypatch.setenv("ENABLE_SCANNED_PDF_OCR", "1")
+        throttle = ClientError(
+            {"Error": {"Code": "ThrottlingException", "Message": "Rate exceeded"}},
+            "DetectDocumentText",
+        )
+        good = {"Blocks": [{"BlockType": "LINE", "Text": "page text"}]}
+        textract = MagicMock()
+        # Page 1 throttles once then succeeds; pages 2 and 3 succeed first try.
+        textract.detect_document_text.side_effect = [throttle, good, good, good]
+        extractor = PDFExtractor(s3_client=MagicMock(), textract_client=textract)
+
+        result = extractor.extract_from_bytes(scanned_pdf)
+
+        assert result["extraction_method"] == "extract_text"
+        assert "page text" in result["text"]
+        assert textract.detect_document_text.call_count == 4  # 1 retry + 3 pages
+        mock_sleep.assert_called_once()  # backed off exactly once
+
+    @patch("src.extractors.pdf_extractor.time.sleep")
+    def test_ocr_partial_when_throttle_exhausted(
+        self, mock_sleep, monkeypatch, caplog, scanned_pdf: bytes
+    ):
+        # A page whose throttle survives every retry is skipped and counted; the
+        # surviving pages' text is still returned, but a PARTIAL warning is
+        # logged so the result is distinguishable from a clean full OCR.
+        monkeypatch.setenv("ENABLE_SCANNED_PDF_OCR", "1")
+        throttle = ClientError(
+            {"Error": {"Code": "ThrottlingException", "Message": "Rate exceeded"}},
+            "DetectDocumentText",
+        )
+        good = {"Blocks": [{"BlockType": "LINE", "Text": "recovered page"}]}
+        textract = MagicMock()
+        # Page 1: 4 throttles (initial + 3 retries) -> skipped. Pages 2, 3: OK.
+        textract.detect_document_text.side_effect = [
+            throttle, throttle, throttle, throttle, good, good,
+        ]
+        extractor = PDFExtractor(s3_client=MagicMock(), textract_client=textract)
+
+        with caplog.at_level("WARNING"):
+            result = extractor.extract_from_bytes(scanned_pdf)
+
+        # Two of three pages recovered -> still surfaces as extract_text.
+        assert result["extraction_method"] == "extract_text"
+        assert "recovered page" in result["text"]
+        assert textract.detect_document_text.call_count == 6
+        assert any("PARTIAL" in rec.message for rec in caplog.records)
+
+    @patch("src.extractors.pdf_extractor.time.sleep")
+    def test_ocr_non_throttle_clienterror_not_retried(
+        self, mock_sleep, monkeypatch, scanned_pdf: bytes
+    ):
+        # A non-throttle ClientError (e.g. AccessDenied) must NOT be retried —
+        # the page is skipped immediately.
+        monkeypatch.setenv("ENABLE_SCANNED_PDF_OCR", "1")
+        denied = ClientError(
+            {"Error": {"Code": "AccessDeniedException", "Message": "no"}},
+            "DetectDocumentText",
+        )
+        textract = MagicMock()
+        textract.detect_document_text.side_effect = denied
+        extractor = PDFExtractor(s3_client=MagicMock(), textract_client=textract)
+
+        result = extractor.extract_from_bytes(scanned_pdf)
+
+        assert result["extraction_method"] == "ocr"  # all pages skipped -> empty
+        assert result["text"] == ""
+        assert textract.detect_document_text.call_count == 3  # one try per page
+        mock_sleep.assert_not_called()
 
 
 class TestEncryptedPDF:

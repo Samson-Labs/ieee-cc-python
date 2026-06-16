@@ -520,8 +520,69 @@ class TestWebhook:
         assert payload["request_id"] == 42
         assert payload["ou"] == "PES"
         assert payload["status"] == "success"
+        # CC3-1049: explicit outcome — Bedrock produced data here.
+        assert payload["enrichment_status"] == "enriched"
         assert "data" in payload
         assert "completed_at" in payload
+
+    @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
+    def test_scanned_pdf_reports_enrichment_status(self, mock_send, orchestrator):
+        # CC3-1049: a scanned PDF (no text, extraction_method 'ocr') skips
+        # Bedrock; the webhook now states enrichment_status explicitly so Drupal
+        # doesn't have to infer it from empty data + extraction_method.
+        orch, s3, lam = orchestrator
+        meta = _make_meta(ai_enabled=True, callback_url="https://drupal.example.com/hook")
+        s3.get_object.return_value = _s3_get_object_response(meta)
+        lam.invoke.return_value = _lambda_invoke_response(
+            200, {"text": "", "page_count": 3, "extraction_method": "ocr"}
+        )
+
+        result = orch.process("bucket", "PES/pending/STD-12345.pdf")
+
+        assert result["action"] == "enriched"
+        payload = mock_send.call_args[0][2]
+        assert payload["enrichment_status"] == "scanned_pdf"
+        assert payload["data"] == {}
+        assert payload["extraction"]["extraction_method"] == "ocr"
+
+    @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=False)
+    def test_failure_webhook_sent_on_processing_error(self, mock_send, orchestrator):
+        # CC3-1049: when Bedrock hard-fails (e.g. the keyword 422), the handler
+        # calls send_failure_webhook so Drupal moves the item to pending_review
+        # instead of leaving it stuck in awaiting_* with no callback at all.
+        orch, s3, lam = orchestrator
+        meta = _make_meta(ai_enabled=True, callback_url="https://drupal.example.com/hook")
+        s3.get_object.return_value = _s3_get_object_response(meta)
+
+        extraction_body = {"text": "text", "page_count": 5, "extraction_method": "extract_text"}
+        lam.invoke.side_effect = [
+            _lambda_invoke_response(200, extraction_body),
+            _lambda_invoke_response(422, {"error": "keywords must have 8–12 items, got 4"}),
+        ]
+
+        with pytest.raises(RuntimeError, match="returned 422"):
+            orch.process("bucket", "PES/pending/STD-12345.pdf")
+
+        # process() raised before Step 5, so no success webhook was sent yet.
+        mock_send.assert_not_called()
+
+        # Simulate the handler's except block calling the failure reporter.
+        orch.send_failure_webhook(RuntimeError("Bedrock inference returned 422"))
+
+        mock_send.assert_called_once()
+        payload = mock_send.call_args[0][2]
+        assert payload["status"] == "failure"
+        assert payload["item_id"] == "STD-12345"
+        assert payload["request_id"] == 42
+        assert "error" in payload
+
+    def test_failure_webhook_noop_without_context(self, orchestrator):
+        # No item identity captured (failure before meta parsed, or fresh
+        # container) → nothing to notify; must not raise or send.
+        orch, _s3, _lam = orchestrator
+        with patch("src.orchestrator.ai_orchestrator.WebhookSender.send") as mock_send:
+            orch.send_failure_webhook(RuntimeError("boom"))
+            mock_send.assert_not_called()
 
     @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
     def test_request_id_falls_back_to_lambda_request_id(self, mock_send, orchestrator):

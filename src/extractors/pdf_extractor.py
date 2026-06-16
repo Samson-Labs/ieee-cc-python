@@ -9,17 +9,69 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import time
 from datetime import datetime, timezone
 from typing import TypedDict
 
 import boto3
 import fitz  # PyMuPDF
+from botocore.exceptions import ClientError
 
 logger = logging.getLogger(__name__)
 
 MAX_TEXT_LENGTH = 180_000
 HEADER_FOOTER_MARGIN_RATIO = 0.08  # top/bottom 8% of page treated as header/footer zone
+
+# CC3-1049: optional OCR fallback for scanned/image-only PDFs (no text layer).
+# When enabled, the first MAX_OCR_PAGES pages are rasterized and sent to AWS
+# Textract; the recovered text is returned as a normal "extract_text" result so
+# the orchestrator runs Bedrock exactly as it would for a born-digital PDF.
+# Default OFF — turn on per environment after validating OCR quality + cost on
+# real scans. Cost ≈ $1.50 / 1,000 pages (Textract DetectDocumentText); the page
+# cap bounds the worst case (e.g. a 500-page scanned book).
+OCR_RENDER_DPI = 200  # good legibility for OCR without oversized images
+# A page with at least this many native characters is treated as a real text
+# page (never OCR'd). Below this, a page is OCR-eligible only when it is image-
+# dominated or textless — see _extract_from_document.
+NATIVE_TEXT_SUFFICIENT = 100
+# An image covering at least this fraction of the page area marks the page as a
+# scan (its real content is locked in the image, not the text layer).
+IMAGE_COVERAGE_RATIO = 0.5
+
+# Textract synchronous DetectDocumentText has low TPS limits, and _ocr_scanned
+# fires one call per page in a tight loop — so a multi-page scan can trip
+# ThrottlingException. Retry throttles specifically with bounded backoff so a
+# transient throttle doesn't silently drop a page and let a PARTIAL OCR
+# masquerade as a complete extract_text result.
+OCR_THROTTLE_RETRIES = 3
+OCR_THROTTLE_BACKOFF_BASE = 0.5  # seconds; 0.5, 1.0, 2.0
+_THROTTLE_ERROR_CODES = frozenset(
+    {
+        "ThrottlingException",
+        "ProvisionedThroughputExceededException",
+        "ThrottledException",
+    }
+)
+
+
+def _ocr_enabled() -> bool:
+    """Whether the scanned-PDF OCR fallback is enabled (env flag, default off)."""
+    return os.environ.get("ENABLE_SCANNED_PDF_OCR", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _max_ocr_pages() -> int:
+    """Page cap for OCR — bounds cost/latency on very large scans."""
+    try:
+        return max(1, int(os.environ.get("MAX_OCR_PAGES", "20")))
+    except (TypeError, ValueError):
+        return 20
 
 
 class ExtractionResult(TypedDict):
@@ -36,8 +88,11 @@ class PDFExtractor:
         result = extractor.extract(bucket, key, ou, product_part_number)
     """
 
-    def __init__(self, s3_client=None):
+    def __init__(self, s3_client=None, textract_client=None):
         self._s3 = s3_client or boto3.client("s3")
+        # Created lazily on first OCR use (see _get_textract) so non-scanned
+        # extractions — and tests — never need a Textract client.
+        self._textract = textract_client
 
     def extract(
         self,
@@ -105,22 +160,53 @@ class PDFExtractor:
             )
 
         pages_text: list[str] = []
-        total_chars = 0
-        has_text = False
-
         for page in doc:
-            page_text = self._extract_page_text(page)
-            if page_text.strip():
-                has_text = True
-            pages_text.append(page_text)
-            total_chars += len(page_text)
+            pages_text.append(self._extract_page_text(page))
 
-        if not has_text:
-            logger.warning(
-                "PDF appears to be scanned (no extractable text on %d pages). "
-                "OCR is not performed; returning empty text.",
-                page_count,
-            )
+        # CC3-1049: detect "scanned" beyond pure image-only PDFs. A scan with a
+        # tiny digital overlay (e.g. a 'SAMPLE LETTER' heading stamped over an
+        # otherwise-scanned letter) leaves a sparse text layer that a naive
+        # any-text check treats as a complete text PDF — extracting almost
+        # nothing. Treat the PDF as scanned when no page carries a substantial
+        # native text layer AND the pages are either textless or image-dominated
+        # (a sparse-but-real text PDF with no images is left as extract_text).
+        has_substantial_text = any(
+            len(t.strip()) >= NATIVE_TEXT_SUFFICIENT for t in pages_text
+        )
+        all_textless = all(not t.strip() for t in pages_text)
+        image_dominated = any(self._has_dominant_image(page) for page in doc)
+
+        if not has_substantial_text and (all_textless or image_dominated):
+            # When OCR is enabled, recover text via Textract and return it as a
+            # normal "extract_text" result so the orchestrator runs Bedrock
+            # unchanged.
+            if _ocr_enabled():
+                ocr_text = self._ocr_scanned(doc)
+                if ocr_text.strip():
+                    cleaned = _clean_text(ocr_text)
+                    if len(cleaned) > MAX_TEXT_LENGTH:
+                        cleaned = cleaned[:MAX_TEXT_LENGTH]
+                    logger.info(
+                        "Textract OCR recovered %d chars from scanned PDF (%d pages).",
+                        len(cleaned),
+                        page_count,
+                    )
+                    return ExtractionResult(
+                        text=cleaned,
+                        page_count=page_count,
+                        extraction_method="extract_text",
+                    )
+                logger.warning(
+                    "Scanned PDF (%d pages): Textract OCR returned no usable text; "
+                    "falling back to manual entry.",
+                    page_count,
+                )
+            else:
+                logger.warning(
+                    "PDF appears to be scanned (no substantial text layer on %d pages). "
+                    "OCR disabled (ENABLE_SCANNED_PDF_OCR off); returning empty text.",
+                    page_count,
+                )
             return ExtractionResult(
                 text="", page_count=page_count, extraction_method="ocr"
             )
@@ -155,6 +241,112 @@ class PDFExtractor:
 
         text = page.get_text("text", clip=content_rect)
         return text
+
+    def _has_dominant_image(self, page: fitz.Page) -> bool:
+        """Whether a raster image covers a large fraction of the page.
+
+        The signal that a sparse-text page is actually a scan (real content
+        locked in a full-page image), versus a genuinely sparse text page (e.g.
+        a title slide) that has no image and should be kept as extracted text.
+        """
+        page_area = abs(page.rect.width * page.rect.height)
+        if page_area <= 0:
+            return False
+        for img in page.get_images(full=True):
+            try:
+                rects = page.get_image_rects(img[0])
+            except Exception:
+                continue
+            for rect in rects:
+                if abs(rect.width * rect.height) >= IMAGE_COVERAGE_RATIO * page_area:
+                    return True
+        return False
+
+    def _get_textract(self):
+        """Lazily create the Textract client (only when OCR actually runs)."""
+        if self._textract is None:
+            self._textract = boto3.client("textract", region_name="us-east-1")
+        return self._textract
+
+    def _ocr_scanned(self, doc: fitz.Document) -> str:
+        """OCR the first MAX_OCR_PAGES pages of a scanned PDF via AWS Textract.
+
+        Rasterizes each page and calls the synchronous DetectDocumentText API
+        (no S3 round-trip; one call per page, so the page cap directly bounds
+        cost). Returns the recovered text, or "" if Textract finds nothing or
+        errors — callers then fall back to the empty/manual path. Never raises.
+
+        Throttles are retried with bounded backoff (see _detect_document_text);
+        any page that still fails is skipped and counted, and a WARNING is
+        logged so a PARTIAL OCR is distinguishable from a clean full OCR (the
+        recovered text is otherwise returned as a complete extract_text result).
+        """
+        total = len(doc)
+        limit = min(total, _max_ocr_pages())
+        if total > limit:
+            logger.info(
+                "Scanned PDF has %d pages; OCR-ing the first %d (MAX_OCR_PAGES).",
+                total,
+                limit,
+            )
+        client = self._get_textract()
+        zoom = OCR_RENDER_DPI / 72.0
+        matrix = fitz.Matrix(zoom, zoom)
+        pages_text: list[str] = []
+        failed_pages = 0
+        for i in range(limit):
+            try:
+                pix = doc[i].get_pixmap(matrix=matrix)
+                png = pix.tobytes("png")
+                resp = self._detect_document_text(client, png, i)
+                lines = [
+                    block["Text"]
+                    for block in resp.get("Blocks", [])
+                    if block.get("BlockType") == "LINE" and block.get("Text")
+                ]
+                if lines:
+                    pages_text.append("\n".join(lines))
+            except Exception:
+                logger.exception("Textract OCR failed on page %d; skipping.", i + 1)
+                failed_pages += 1
+        if failed_pages:
+            logger.warning(
+                "Textract OCR skipped %d of %d page(s) after retries; OCR result "
+                "is PARTIAL but is returned downstream as a complete extract_text "
+                "result. Recovered text from %d page(s).",
+                failed_pages,
+                limit,
+                len(pages_text),
+            )
+        return "\n\n".join(pages_text)
+
+    def _detect_document_text(self, client, png: bytes, page_index: int) -> dict:
+        """Call Textract DetectDocumentText with bounded backoff on throttling.
+
+        Retries only throttling errors (ThrottlingException and friends);
+        non-throttle errors raise immediately so the caller skips just that
+        page. A throttle that survives all retries also raises (and is counted
+        as a skipped, partial page by the caller).
+        """
+        for attempt in range(OCR_THROTTLE_RETRIES + 1):
+            try:
+                return client.detect_document_text(Document={"Bytes": png})
+            except ClientError as exc:
+                code = exc.response.get("Error", {}).get("Code", "")
+                if code in _THROTTLE_ERROR_CODES and attempt < OCR_THROTTLE_RETRIES:
+                    wait = OCR_THROTTLE_BACKOFF_BASE * (2 ** attempt)
+                    logger.warning(
+                        "Textract throttled on page %d (%s); retrying in %.1fs "
+                        "(attempt %d/%d).",
+                        page_index + 1,
+                        code,
+                        wait,
+                        attempt + 1,
+                        OCR_THROTTLE_RETRIES,
+                    )
+                    time.sleep(wait)
+                    continue
+                raise
 
     def _write_metadata(
         self,

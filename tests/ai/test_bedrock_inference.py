@@ -309,54 +309,73 @@ class TestValidation:
             with pytest.raises(ValueError, match="Missing required fields"):
                 inference.generate_metadata(text="text")
 
-    def test_abstract_no_paragraphs_raises(self, inference, bedrock_mock):
+    def test_abstract_single_paragraph_accepted(self, inference, bedrock_mock):
+        # CC3-1049: off-format abstract (1 paragraph) is accepted, not rejected —
+        # the reviewer can reshape it in AI Review.
         metadata = _valid_metadata()
         metadata["abstract"] = " ".join(["word"] * 80)  # single paragraph
         bedrock_mock.invoke_model.return_value = _bedrock_response(
             json.dumps(metadata)
         )
 
-        with pytest.raises(ValueError, match="two paragraphs"):
-            inference.generate_metadata(text="text")
+        result = inference.generate_metadata(text="text")
+        assert result["abstract"] == metadata["abstract"]
 
-    def test_abstract_paragraph_too_short_raises(self, inference, bedrock_mock):
+    def test_abstract_off_length_paragraphs_accepted(self, inference, bedrock_mock):
+        # CC3-1049: paragraphs outside the 50–150-word target are accepted.
         metadata = _valid_metadata()
-        metadata["abstract"] = "Short.\n\n" + " ".join(["word"] * 80)
+        metadata["abstract"] = "Short.\n\n" + " ".join(["word"] * 160)
         bedrock_mock.invoke_model.return_value = _bedrock_response(
             json.dumps(metadata)
         )
 
-        with pytest.raises(ValueError, match="words"):
-            inference.generate_metadata(text="text")
+        result = inference.generate_metadata(text="text")
+        assert result["abstract"] == metadata["abstract"]
 
-    def test_abstract_paragraph_too_long_raises(self, inference, bedrock_mock):
+    def test_abstract_empty_raises(self, inference, bedrock_mock):
+        # The one remaining hard requirement: a non-empty string.
         metadata = _valid_metadata()
-        metadata["abstract"] = " ".join(["word"] * 160) + "\n\n" + " ".join(["word"] * 80)
+        metadata["abstract"] = "   "
         bedrock_mock.invoke_model.return_value = _bedrock_response(
             json.dumps(metadata)
         )
 
-        with pytest.raises(ValueError, match="words"):
+        with pytest.raises(ValueError, match="non-empty"):
             inference.generate_metadata(text="text")
 
-    def test_keywords_too_few_raises(self, inference, bedrock_mock):
+    def test_keywords_few_accepted(self, inference, bedrock_mock):
+        # CC3-1049: a low keyword count is non-fatal — accept what the model
+        # returned rather than 422-ing the whole item (which stranded loads).
         metadata = _valid_metadata()
         metadata["keywords"] = ["a", "b", "c"]
         bedrock_mock.invoke_model.return_value = _bedrock_response(
             json.dumps(metadata)
         )
 
-        with pytest.raises(ValueError, match="8–12"):
-            inference.generate_metadata(text="text")
+        result = inference.generate_metadata(text="text")
+        assert result["keywords"] == ["a", "b", "c"]
 
-    def test_keywords_too_many_raises(self, inference, bedrock_mock):
+    def test_keywords_too_many_clamped(self, inference, bedrock_mock):
+        # CC3-1049: an over-eager model is clamped to MAX_KEYWORDS, not rejected.
         metadata = _valid_metadata()
         metadata["keywords"] = [f"kw{i}" for i in range(15)]
         bedrock_mock.invoke_model.return_value = _bedrock_response(
             json.dumps(metadata)
         )
 
-        with pytest.raises(ValueError, match="8–12"):
+        result = inference.generate_metadata(text="text")
+        assert result["keywords"] == [f"kw{i}" for i in range(12)]
+
+    def test_keywords_empty_raises(self, inference, bedrock_mock):
+        # The one remaining hard failure: zero usable keywords. With L1 in place
+        # this now surfaces to Drupal as a failure webhook rather than a stall.
+        metadata = _valid_metadata()
+        metadata["keywords"] = []
+        bedrock_mock.invoke_model.return_value = _bedrock_response(
+            json.dumps(metadata)
+        )
+
+        with pytest.raises(ValueError, match="at least one"):
             inference.generate_metadata(text="text")
 
     def test_invalid_learning_level_raises(self, inference, bedrock_mock):
