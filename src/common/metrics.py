@@ -14,10 +14,17 @@ from typing import Sequence
 logger = logging.getLogger(__name__)
 
 METRIC_NAMESPACE = "ieee-rc"
-DEFAULT_DIMENSIONS = [
-    {"Name": "Environment", "Value": os.environ.get("ENVIRONMENT", "dev")},
-    {"Name": "Project", "Value": "ieee-rc"},
-]
+
+
+def _default_dimensions() -> list[dict]:
+    # Resolved per-call so a Lambda's STAGE/ENVIRONMENT env vars are
+    # respected even if set after module import.  ENVIRONMENT wins for
+    # explicit override; STAGE is the deploy-script-set fallback.
+    env = os.environ.get("ENVIRONMENT", os.environ.get("STAGE", "dev"))
+    return [
+        {"Name": "Environment", "Value": env},
+        {"Name": "Project", "Value": "ieee-rc"},
+    ]
 
 
 def publish_metrics(
@@ -42,9 +49,10 @@ def publish_metrics(
         return
 
     try:
+        defaults = _default_dimensions()
         metric_data = []
         for m in metrics:
-            dims = list(DEFAULT_DIMENSIONS)
+            dims = list(defaults)
             custom_dims = m.get("Dimensions")
             if isinstance(custom_dims, list):
                 dims.extend(custom_dims)

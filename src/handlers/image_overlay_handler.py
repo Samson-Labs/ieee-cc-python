@@ -19,7 +19,13 @@ logger = logging.getLogger()
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 
 _s3_client = boto3.client("s3")
-_generator = ImageOverlayGenerator(s3_client=_s3_client)
+_secrets_client = boto3.client("secretsmanager")
+_sns_client = boto3.client("sns")
+_generator = ImageOverlayGenerator(
+    s3_client=_s3_client,
+    secrets_client=_secrets_client,
+    sns_client=_sns_client,
+)
 
 
 def handler(event: dict, context) -> dict:
@@ -47,16 +53,21 @@ def handler(event: dict, context) -> dict:
             "body": {"error": f"Internal error: {type(exc).__name__}"},
         }
 
-    return {
-        "statusCode": 200,
-        "body": {
-            "output_key": result["output_key"],
-            "thumbnail_key": result["thumbnail_key"],
-            "width": result["width"],
-            "height": result["height"],
-            "format": result["format"],
-        },
+    body: dict = {
+        "output_key": result["output_key"],
+        "thumbnail_key": result.get("thumbnail_key", ""),
+        "width": result["width"],
+        "height": result["height"],
+        "format": result["format"],
     }
+    # CC3-906 fields (only present on the post-rewrite codepath)
+    if "callback_sent" in result:
+        body["callback_sent"] = result["callback_sent"]
+    if "s3_etag" in result:
+        body["s3_etag"] = result["s3_etag"]
+    if "bytes" in result:
+        body["bytes"] = result["bytes"]
+    return {"statusCode": 200, "body": body}
 
 
 def _parse_event(event: dict) -> tuple[str, str]:

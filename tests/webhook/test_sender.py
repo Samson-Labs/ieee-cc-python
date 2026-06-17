@@ -9,7 +9,13 @@ from unittest.mock import MagicMock, patch, call
 
 import pytest
 
-from src.webhook.sender import WebhookSender, MAX_RETRIES, BACKOFF_DELAYS, SNS_TOPIC_ENV
+from src.webhook.sender import (
+    WebhookSender,
+    MAX_RETRIES,
+    BACKOFF_DELAYS,
+    MAX_RESPONSE_BYTES,
+    SNS_TOPIC_ENV,
+)
 
 
 @pytest.fixture
@@ -24,11 +30,12 @@ PAYLOAD = {"item_id": "STD-12345", "status": "completed"}
 CORRELATION = "[req:STD-12345]"
 
 
-def _mock_success_response():
+def _mock_success_response(body: bytes | None = None):
     resp = MagicMock()
     resp.status = 200
     resp.__enter__ = MagicMock(return_value=resp)
     resp.__exit__ = MagicMock(return_value=False)
+    resp.read = MagicMock(return_value=body if body is not None else b"")
     return resp
 
 
@@ -168,6 +175,110 @@ class TestSNSAlert:
             ws.send(URL, SECRET, PAYLOAD, CORRELATION)
 
         sns.publish.assert_called_once()
+
+
+class TestResponseValidator:
+    """CC3-931: optional validator runs against the parsed 2xx body and can
+    fail an otherwise-successful HTTP call when the contract is violated.
+    """
+
+    @patch("src.webhook.sender.urllib.request.urlopen")
+    def test_validator_pass_returns_true(self, mock_urlopen, sender):
+        ws, _ = sender
+        mock_urlopen.return_value = _mock_success_response(
+            b'{"success":true,"message":"Webhook processed successfully."}'
+        )
+
+        result = ws.send(
+            URL, SECRET, PAYLOAD, CORRELATION,
+            response_validator=lambda body: (True, ""),
+        )
+
+        assert result is True
+
+    @patch("src.webhook.sender.urllib.request.urlopen")
+    def test_validator_fail_returns_false_and_alerts(self, mock_urlopen, sender):
+        ws, sns = sender
+        mock_urlopen.return_value = _mock_success_response(
+            b'{"success":true,"ignored":true,"message":"Webhook ignored: item is no longer awaiting AI processing."}'
+        )
+
+        with patch.dict("os.environ", {SNS_TOPIC_ENV: "arn:aws:sns:us-east-1:123:topic"}):
+            result = ws.send(
+                URL, SECRET, PAYLOAD, CORRELATION,
+                response_validator=lambda body: (False, "webhook ignored: stale callback"),
+            )
+
+        assert result is False
+        sns.publish.assert_called_once()
+        message = json.loads(sns.publish.call_args[1]["Message"])
+        assert "contract validation failed" in message["error"]
+        assert "ignored" in message["error"]
+
+    @patch("src.webhook.sender.urllib.request.urlopen")
+    def test_validator_receives_parsed_body(self, mock_urlopen, sender):
+        ws, _ = sender
+        mock_urlopen.return_value = _mock_success_response(
+            b'{"success":true,"message":"Webhook processed successfully."}'
+        )
+
+        seen = {}
+
+        def _capture(body):
+            seen["body"] = body
+            return True, ""
+
+        ws.send(URL, SECRET, PAYLOAD, CORRELATION, response_validator=_capture)
+
+        assert seen["body"] == {
+            "success": True,
+            "message": "Webhook processed successfully.",
+        }
+
+    @patch("src.webhook.sender.urllib.request.urlopen")
+    def test_validator_receives_none_for_unparseable_body(self, mock_urlopen, sender):
+        ws, _ = sender
+        mock_urlopen.return_value = _mock_success_response(b"<html>not json</html>")
+
+        seen = {}
+
+        def _capture(body):
+            seen["body"] = body
+            return True, ""
+
+        ws.send(URL, SECRET, PAYLOAD, CORRELATION, response_validator=_capture)
+
+        assert seen["body"] is None
+
+    @patch("src.webhook.sender.urllib.request.urlopen")
+    def test_response_read_is_capped_at_max_bytes(self, mock_urlopen, sender):
+        """Defense-in-depth: a runaway peer response must not exhaust Lambda memory."""
+        ws, _ = sender
+        resp = _mock_success_response()
+        resp.read = MagicMock(return_value=b'{"success":true,"message":"ok"}')
+        mock_urlopen.return_value = resp
+
+        ws.send(
+            URL, SECRET, PAYLOAD, CORRELATION,
+            response_validator=lambda body: (True, ""),
+        )
+
+        resp.read.assert_called_once_with(MAX_RESPONSE_BYTES)
+
+    @patch("src.webhook.sender.urllib.request.urlopen")
+    def test_no_validator_does_not_read_body(self, mock_urlopen, sender):
+        """Existing callers (no validator) should not pay the read cost or
+        be affected by response-parse failures.
+        """
+        ws, _ = sender
+        resp = _mock_success_response()
+        # Sentinel: if anything calls .read() this will break the test.
+        resp.read = MagicMock(side_effect=AssertionError("read() should not be called without a validator"))
+        mock_urlopen.return_value = resp
+
+        result = ws.send(URL, SECRET, PAYLOAD, CORRELATION)
+
+        assert result is True
 
 
 class TestLogging:

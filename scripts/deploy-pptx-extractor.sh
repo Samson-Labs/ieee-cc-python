@@ -1,0 +1,209 @@
+#!/usr/bin/env bash
+#
+# Deploy the PPTX Extractor Lambda using AWS CLI + Docker.
+#
+# Prerequisites:
+#   - AWS CLI configured with profile "ieee-cc"
+#   - Docker running locally
+#
+# Usage:
+#   ./scripts/deploy-pptx-extractor.sh <env>            # first-time setup + deploy
+#   ./scripts/deploy-pptx-extractor.sh <env> update     # rebuild + update Lambda code only
+#
+#   <env> = dev | staging   (prod naming handled separately under CC3-851)
+#
+set -euo pipefail
+
+ENV="${1:-}"
+case "${ENV}" in
+    dev|staging) ;;
+    *)
+        echo "Usage: $0 <env> [update]   # env = dev | staging" >&2
+        echo "       (prod naming is part of CC3-851; not accepted here)" >&2
+        exit 1
+        ;;
+esac
+
+AWS_PROFILE="${AWS_PROFILE:-ieee-cc}"
+AWS_REGION="${AWS_REGION:-us-east-1}"
+AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+
+ECR_REPO_NAME="ieee-rc-pptx-extractor"
+LAMBDA_FUNCTION_NAME="ieee-rc-pptx-extractor-${ENV}"
+S3_BUCKET_NAME="${ENV}-ieee-conference-cloud-bulk-uploads"
+LAMBDA_ROLE_NAME="ieee-rc-pptx-extractor-${ENV}-role"
+IMAGE_TAG="latest"
+
+ECR_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO_NAME}"
+PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
+export AWS_PROFILE AWS_REGION
+
+# ---------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------
+log() { echo "==> $*"; }
+
+ecr_login() {
+    log "Logging in to ECR..."
+    aws ecr get-login-password --region "${AWS_REGION}" \
+        | docker login --username AWS --password-stdin \
+          "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+}
+
+build_and_push() {
+    log "Building Docker image..."
+    docker buildx build --platform linux/amd64 --provenance=false \
+        --output type=docker \
+        -f "${PROJECT_ROOT}/src/extractors/PPTXExtractorDockerfile" \
+        -t "${ECR_REPO_NAME}:${IMAGE_TAG}" "${PROJECT_ROOT}"
+
+    log "Tagging image..."
+    docker tag "${ECR_REPO_NAME}:${IMAGE_TAG}" "${ECR_URI}:${IMAGE_TAG}"
+
+    ecr_login
+
+    log "Pushing image to ECR..."
+    docker push "${ECR_URI}:${IMAGE_TAG}"
+}
+
+# ---------------------------------------------------------------
+# 1. Create ECR repository (idempotent)
+# ---------------------------------------------------------------
+create_ecr_repo() {
+    log "Creating ECR repository: ${ECR_REPO_NAME}"
+    aws ecr describe-repositories --repository-names "${ECR_REPO_NAME}" \
+        --region "${AWS_REGION}" >/dev/null 2>&1 \
+    || aws ecr create-repository \
+        --repository-name "${ECR_REPO_NAME}" \
+        --region "${AWS_REGION}" \
+        --image-scanning-configuration scanOnPush=true \
+        --encryption-configuration encryptionType=AES256
+}
+
+# ---------------------------------------------------------------
+# 2. Create IAM role for Lambda (idempotent)
+# ---------------------------------------------------------------
+create_lambda_role() {
+    log "Creating IAM role: ${LAMBDA_ROLE_NAME}"
+
+    TRUST_POLICY='{
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Principal": {"Service": "lambda.amazonaws.com"},
+            "Action": "sts:AssumeRole"
+        }]
+    }'
+
+    INLINE_POLICY="{
+        \"Version\": \"2012-10-17\",
+        \"Statement\": [
+            {
+                \"Effect\": \"Allow\",
+                \"Action\": [\"s3:GetObject\", \"s3:PutObject\"],
+                \"Resource\": \"arn:aws:s3:::${S3_BUCKET_NAME}/*\"
+            },
+            {
+                \"Effect\": \"Allow\",
+                \"Action\": [\"s3:ListBucket\"],
+                \"Resource\": \"arn:aws:s3:::${S3_BUCKET_NAME}\"
+            },
+            {
+                \"Effect\": \"Allow\",
+                \"Action\": [\"cloudwatch:PutMetricData\"],
+                \"Resource\": \"*\",
+                \"Condition\": {
+                    \"StringEquals\": {
+                        \"cloudwatch:namespace\": \"ieee-rc\"
+                    }
+                }
+            }
+        ]
+    }"
+
+    aws iam get-role --role-name "${LAMBDA_ROLE_NAME}" >/dev/null 2>&1 \
+    || aws iam create-role \
+        --role-name "${LAMBDA_ROLE_NAME}" \
+        --assume-role-policy-document "${TRUST_POLICY}"
+
+    aws iam attach-role-policy \
+        --role-name "${LAMBDA_ROLE_NAME}" \
+        --policy-arn "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole" 2>/dev/null || true
+
+    aws iam put-role-policy \
+        --role-name "${LAMBDA_ROLE_NAME}" \
+        --policy-name "S3CloudWatchAccess" \
+        --policy-document "${INLINE_POLICY}"
+
+    ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/${LAMBDA_ROLE_NAME}"
+}
+
+# ---------------------------------------------------------------
+# 3. Create or update Lambda function
+# ---------------------------------------------------------------
+create_lambda() {
+    log "Creating Lambda function: ${LAMBDA_FUNCTION_NAME}"
+    ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/${LAMBDA_ROLE_NAME}"
+
+    if aws lambda get-function --function-name "${LAMBDA_FUNCTION_NAME}" \
+        --region "${AWS_REGION}" >/dev/null 2>&1; then
+        log "Lambda already exists — updating code..."
+        update_lambda_code
+    else
+        log "Waiting for IAM role propagation..."
+        aws iam wait role-exists --role-name "${LAMBDA_ROLE_NAME}"
+
+        aws lambda create-function \
+            --function-name "${LAMBDA_FUNCTION_NAME}" \
+            --region "${AWS_REGION}" \
+            --package-type Image \
+            --code "ImageUri=${ECR_URI}:${IMAGE_TAG}" \
+            --role "${ROLE_ARN}" \
+            --memory-size 1024 \
+            --timeout 120 \
+            --architectures x86_64 \
+            --environment "Variables={LOG_LEVEL=INFO,STAGE=${ENV}}"
+
+        aws lambda wait function-active-v2 \
+            --function-name "${LAMBDA_FUNCTION_NAME}" \
+            --region "${AWS_REGION}"
+    fi
+
+    log "Lambda deployed: ${LAMBDA_FUNCTION_NAME}"
+}
+
+update_lambda_code() {
+    aws lambda update-function-code \
+        --function-name "${LAMBDA_FUNCTION_NAME}" \
+        --region "${AWS_REGION}" \
+        --image-uri "${ECR_URI}:${IMAGE_TAG}"
+
+    aws lambda wait function-updated-v2 \
+        --function-name "${LAMBDA_FUNCTION_NAME}" \
+        --region "${AWS_REGION}"
+}
+
+# ---------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------
+if [[ "${2:-}" == "update" ]]; then
+    log "Update mode (${ENV}) — rebuilding image and updating Lambda code only."
+    build_and_push
+    update_lambda_code
+    log "Done."
+    exit 0
+fi
+
+log "Full deployment starting (env=${ENV})..."
+create_ecr_repo
+create_lambda_role
+build_and_push
+create_lambda
+log "Deployment complete."
+log ""
+log "  ECR:     ${ECR_URI}:${IMAGE_TAG}"
+log "  Lambda:  ${LAMBDA_FUNCTION_NAME} (1024 MB, 2 min timeout)"
+log ""
+log "  Invoke:"
+log "    ./scripts/invoke-pptx-extractor.sh <bucket> <key> <ou> <product_part_number>"

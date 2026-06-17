@@ -1,0 +1,330 @@
+name: STAGING - CD Promote + Deploy to Lambda
+
+on:
+  workflow_dispatch:
+    inputs:
+      pdf_extractor_tag:
+        description: "Tag in DEV ieee-cc-pdf-extractor to promote & deploy to STAGING (e.g. a1b2c3d or latest)"
+        required: false
+        type: string
+      deploy_pdf_extractor:
+        description: "Promote & deploy pdf-extractor?"
+        required: true
+        default: "no"
+        type: choice
+        options: ["yes", "no"]
+
+      image_overlay_tag:
+        description: "Tag in DEV ieee-rc-image-generator to promote & deploy to STAGING"
+        required: false
+        type: string
+      deploy_image_overlay:
+        description: "Promote & deploy image-overlay?"
+        required: true
+        default: "no"
+        type: choice
+        options: ["yes", "no"]
+
+      bedrock_tag:
+        description: "Tag in DEV ieee-cc-bedrock-inference to promote & deploy to STAGING"
+        required: false
+        type: string
+      deploy_bedrock:
+        description: "Promote & deploy bedrock-inference?"
+        required: true
+        default: "no"
+        type: choice
+        options: ["yes", "no"]
+
+      video_transcriber_tag:
+        description: "Tag in DEV ieee-cc-video-transcriber to promote & deploy to STAGING"
+        required: false
+        type: string
+      deploy_video_transcriber:
+        description: "Promote & deploy video-transcriber?"
+        required: true
+        default: "no"
+        type: choice
+        options: ["yes", "no"]
+
+      ai_orchestrator_tag:
+        description: "Tag in DEV ieee-rc-ai-orchestrator to promote & deploy to STAGING"
+        required: false
+        type: string
+      deploy_ai_orchestrator:
+        description: "Promote & deploy ai-orchestrator?"
+        required: true
+        default: "no"
+        type: choice
+        options: ["yes", "no"]
+
+      dlq_processor_tag:
+        description: "Tag in DEV ieee-rc-dlq-processor to promote & deploy to STAGING"
+        required: false
+        type: string
+      deploy_dlq_processor:
+        description: "Promote & deploy dlq-processor?"
+        required: true
+        default: "no"
+        type: choice
+        options: ["yes", "no"]
+
+      bulk_processor_tag:
+        description: "Tag in DEV ieee-rc-bulk-processor to promote & deploy to STAGING"
+        required: false
+        type: string
+      deploy_bulk_processor:
+        description: "Promote & deploy bulk-processor?"
+        required: true
+        default: "no"
+        type: choice
+        options: ["yes", "no"]
+
+      bulk_worker_tag:
+        description: "Tag in DEV ieee-rc-bulk-worker to promote & deploy to STAGING"
+        required: false
+        type: string
+      deploy_bulk_worker:
+        description: "Promote & deploy bulk-worker?"
+        required: true
+        default: "no"
+        type: choice
+        options: ["yes", "no"]
+
+      wizard_transfer_tag:
+        description: "Tag in DEV ieee-rc-wizard-transfer to promote & deploy to STAGING"
+        required: false
+        type: string
+      deploy_wizard_transfer:
+        description: "Promote & deploy wizard-transfer?"
+        required: true
+        default: "no"
+        type: choice
+        options: ["yes", "no"]
+
+      pptx_extractor_tag:
+        description: "Tag in DEV ieee-rc-pptx-extractor to promote & deploy to STAGING"
+        required: false
+        type: string
+      deploy_pptx_extractor:
+        description: "Promote & deploy pptx-extractor?"
+        required: true
+        default: "no"
+        type: choice
+        options: ["yes", "no"]
+
+concurrency:
+  group: cd-deploy-staging
+  cancel-in-progress: false  # never cancel an in-flight deploy
+
+jobs:
+  promote-and-deploy:
+    name: Promote DEV images to STAGING ECR & deploy to STAGING Lambdas
+    runs-on: [self-hosted, cc3]
+    if: github.event_name == 'workflow_dispatch'
+
+    env:
+      AWS_REGION: "us-east-1"
+      AWS_DEFAULT_REGION: "us-east-1"
+      ACCOUNT_ID: "141770997341"
+
+      # DEV ECR repos (CI pushes here)
+      DEV_ECR_PDF_EXTRACTOR:     "ieee-cc-pdf-extractor"
+      DEV_ECR_IMAGE_OVERLAY:     "ieee-rc-image-generator"
+      DEV_ECR_BEDROCK:           "ieee-cc-bedrock-inference"
+      DEV_ECR_VIDEO_TRANSCRIBER: "ieee-cc-video-transcriber"
+      DEV_ECR_AI_ORCHESTRATOR:   "ieee-rc-ai-orchestrator"
+      DEV_ECR_DLQ_PROCESSOR:     "ieee-rc-dlq-processor"
+      DEV_ECR_BULK_PROCESSOR:    "ieee-rc-bulk-processor"
+      DEV_ECR_BULK_WORKER:       "ieee-rc-bulk-worker"
+      DEV_ECR_WIZARD_TRANSFER:   "ieee-rc-wizard-transfer"
+      DEV_ECR_PPTX_EXTRACTOR:    "ieee-rc-pptx-extractor"
+
+      # STAGING ECR repos (promote target)
+      STAGING_ECR_PDF_EXTRACTOR:     "ieee-cc-pdf-extractor-staging"
+      STAGING_ECR_IMAGE_OVERLAY:     "ieee-rc-image-generator-staging"
+      STAGING_ECR_BEDROCK:           "ieee-cc-bedrock-inference-staging"
+      STAGING_ECR_VIDEO_TRANSCRIBER: "ieee-cc-video-transcriber-staging"
+      STAGING_ECR_AI_ORCHESTRATOR:   "ieee-rc-ai-orchestrator-staging"
+      STAGING_ECR_DLQ_PROCESSOR:     "ieee-rc-dlq-processor-staging"
+      STAGING_ECR_BULK_PROCESSOR:    "ieee-rc-bulk-processor-staging"
+      STAGING_ECR_BULK_WORKER:       "ieee-rc-bulk-worker-staging"
+      STAGING_ECR_WIZARD_TRANSFER:   "ieee-rc-wizard-transfer-staging"
+      STAGING_ECR_PPTX_EXTRACTOR:    "ieee-rc-pptx-extractor-staging"
+
+      PDF_EXTRACTOR_TAG:      ${{ github.event.inputs.pdf_extractor_tag }}
+      PDF_EXTRACTOR_FLAG:     ${{ github.event.inputs.deploy_pdf_extractor }}
+      IMAGE_OVERLAY_TAG:      ${{ github.event.inputs.image_overlay_tag }}
+      IMAGE_OVERLAY_FLAG:     ${{ github.event.inputs.deploy_image_overlay }}
+      BEDROCK_TAG:            ${{ github.event.inputs.bedrock_tag }}
+      BEDROCK_FLAG:           ${{ github.event.inputs.deploy_bedrock }}
+      VIDEO_TRANSCRIBER_TAG:  ${{ github.event.inputs.video_transcriber_tag }}
+      VIDEO_TRANSCRIBER_FLAG: ${{ github.event.inputs.deploy_video_transcriber }}
+      AI_ORCHESTRATOR_TAG:    ${{ github.event.inputs.ai_orchestrator_tag }}
+      AI_ORCHESTRATOR_FLAG:   ${{ github.event.inputs.deploy_ai_orchestrator }}
+      DLQ_PROCESSOR_TAG:      ${{ github.event.inputs.dlq_processor_tag }}
+      DLQ_PROCESSOR_FLAG:     ${{ github.event.inputs.deploy_dlq_processor }}
+      BULK_PROCESSOR_TAG:     ${{ github.event.inputs.bulk_processor_tag }}
+      BULK_PROCESSOR_FLAG:    ${{ github.event.inputs.deploy_bulk_processor }}
+      BULK_WORKER_TAG:        ${{ github.event.inputs.bulk_worker_tag }}
+      BULK_WORKER_FLAG:       ${{ github.event.inputs.deploy_bulk_worker }}
+      WIZARD_TRANSFER_TAG:    ${{ github.event.inputs.wizard_transfer_tag }}
+      WIZARD_TRANSFER_FLAG:   ${{ github.event.inputs.deploy_wizard_transfer }}
+      PPTX_EXTRACTOR_TAG:     ${{ github.event.inputs.pptx_extractor_tag }}
+      PPTX_EXTRACTOR_FLAG:    ${{ github.event.inputs.deploy_pptx_extractor }}
+
+    steps:
+      - name: Start summary
+        run: |
+          set -euo pipefail
+          {
+            echo "## STAGING - Promotion and Deployment (DEV ECR → STAGING ECR → STAGING Lambda)"
+            echo ""
+            echo "**Branch**: \`${GITHUB_REF_NAME}\`  |  **Actor**: \`${{ github.actor }}\`"
+            echo ""
+            echo "| Service | Promote & Deploy? | Tag |"
+            echo "|---------|-------------------|-----|"
+            echo "| pdf-extractor | \`${PDF_EXTRACTOR_FLAG}\` | \`${PDF_EXTRACTOR_TAG:-<none>}\` |"
+            echo "| image-overlay | \`${IMAGE_OVERLAY_FLAG}\` | \`${IMAGE_OVERLAY_TAG:-<none>}\` |"
+            echo "| bedrock-inference | \`${BEDROCK_FLAG}\` | \`${BEDROCK_TAG:-<none>}\` |"
+            echo "| video-transcriber | \`${VIDEO_TRANSCRIBER_FLAG}\` | \`${VIDEO_TRANSCRIBER_TAG:-<none>}\` |"
+            echo "| ai-orchestrator | \`${AI_ORCHESTRATOR_FLAG}\` | \`${AI_ORCHESTRATOR_TAG:-<none>}\` |"
+            echo "| dlq-processor | \`${DLQ_PROCESSOR_FLAG}\` | \`${DLQ_PROCESSOR_TAG:-<none>}\` |"
+            echo "| bulk-processor | \`${BULK_PROCESSOR_FLAG}\` | \`${BULK_PROCESSOR_TAG:-<none>}\` |"
+            echo "| bulk-worker | \`${BULK_WORKER_FLAG}\` | \`${BULK_WORKER_TAG:-<none>}\` |"
+            echo "| wizard-transfer | \`${WIZARD_TRANSFER_FLAG}\` | \`${WIZARD_TRANSFER_TAG:-<none>}\` |"
+            echo "| pptx-extractor | \`${PPTX_EXTRACTOR_FLAG}\` | \`${PPTX_EXTRACTOR_TAG:-<none>}\` |"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Show AWS identity
+        run: |
+          set -euo pipefail
+          aws sts get-caller-identity
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+        with:
+          registry-type: private
+          mask-password: true
+          skip-logout: false
+
+      - name: Promote & deploy
+        id: promote-deploy
+        run: |
+          set -euo pipefail
+
+          IMAGE_RESULTS_FILE="staging_image_results.txt"
+          LAMBDA_RESULTS_FILE="staging_lambda_results.txt"
+          : > "$IMAGE_RESULTS_FILE"
+          : > "$LAMBDA_RESULTS_FILE"
+
+          BASE="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+
+          promote_and_deploy() {
+            local DEV_REPO="$1"
+            local STAGING_REPO="$2"
+            local LAMBDA_NAME="$3"
+            local TAG="$4"
+            local FLAG="$5"
+            local LABEL="$6"
+
+            if [[ "${FLAG}" == "no" ]]; then
+              echo "${STAGING_REPO} -> SKIPPED (flag=no)" | tee -a "$IMAGE_RESULTS_FILE"
+              echo "${LAMBDA_NAME} -> SKIPPED (flag=no)" | tee -a "$LAMBDA_RESULTS_FILE"
+              return
+            fi
+
+            if [[ -z "${TAG:-}" ]]; then
+              echo "ERROR: promote flag is yes for ${LABEL} but tag is empty." >&2
+              exit 1
+            fi
+
+            local DEV_URI="${BASE}/${DEV_REPO}:${TAG}"
+            local STAGING_URI="${BASE}/${STAGING_REPO}:${TAG}"
+            local STAGING_LATEST="${BASE}/${STAGING_REPO}:latest"
+
+            echo "=== ${LABEL} ==="
+            echo "Pulling  : ${DEV_URI}"
+            docker pull "${DEV_URI}"
+
+            echo "Tagging  : ${STAGING_URI}"
+            docker tag "${DEV_URI}" "${STAGING_URI}"
+            docker tag "${DEV_URI}" "${STAGING_LATEST}"
+
+            echo "Pushing  : ${STAGING_URI}"
+            docker push "${STAGING_URI}"
+            docker push "${STAGING_LATEST}"
+
+            echo "${STAGING_REPO} -> PROMOTED from ${DEV_REPO} (tag=${TAG}, latest updated)" | tee -a "$IMAGE_RESULTS_FILE"
+
+            echo "Deploying: ${STAGING_URI} → ${LAMBDA_NAME}"
+            aws lambda update-function-code \
+              --function-name "${LAMBDA_NAME}" \
+              --image-uri "${STAGING_URI}" \
+              --region "${AWS_REGION}"
+
+            echo "${LAMBDA_NAME} -> OK (tag=${TAG})" | tee -a "$LAMBDA_RESULTS_FILE"
+          }
+
+          promote_and_deploy "${DEV_ECR_PDF_EXTRACTOR}"     "${STAGING_ECR_PDF_EXTRACTOR}"     "ieee-cc-pdf-extractor-staging"     "${PDF_EXTRACTOR_TAG:-}"     "${PDF_EXTRACTOR_FLAG}"     "pdf-extractor"
+          promote_and_deploy "${DEV_ECR_IMAGE_OVERLAY}"     "${STAGING_ECR_IMAGE_OVERLAY}"     "ieee-rc-image-generator-staging"   "${IMAGE_OVERLAY_TAG:-}"     "${IMAGE_OVERLAY_FLAG}"     "image-overlay"
+          promote_and_deploy "${DEV_ECR_BEDROCK}"           "${STAGING_ECR_BEDROCK}"           "ieee-cc-bedrock-inference-staging" "${BEDROCK_TAG:-}"           "${BEDROCK_FLAG}"           "bedrock-inference"
+          promote_and_deploy "${DEV_ECR_VIDEO_TRANSCRIBER}" "${STAGING_ECR_VIDEO_TRANSCRIBER}" "ieee-cc-video-transcriber-staging" "${VIDEO_TRANSCRIBER_TAG:-}" "${VIDEO_TRANSCRIBER_FLAG}" "video-transcriber"
+          promote_and_deploy "${DEV_ECR_AI_ORCHESTRATOR}"   "${STAGING_ECR_AI_ORCHESTRATOR}"   "ieee-rc-ai-orchestrator-staging"   "${AI_ORCHESTRATOR_TAG:-}"   "${AI_ORCHESTRATOR_FLAG}"   "ai-orchestrator"
+          promote_and_deploy "${DEV_ECR_DLQ_PROCESSOR}"     "${STAGING_ECR_DLQ_PROCESSOR}"     "ieee-rc-dlq-processor-staging"     "${DLQ_PROCESSOR_TAG:-}"     "${DLQ_PROCESSOR_FLAG}"     "dlq-processor"
+          promote_and_deploy "${DEV_ECR_BULK_PROCESSOR}"    "${STAGING_ECR_BULK_PROCESSOR}"    "ieee-rc-bulk-processor-staging"    "${BULK_PROCESSOR_TAG:-}"    "${BULK_PROCESSOR_FLAG}"    "bulk-processor"
+          promote_and_deploy "${DEV_ECR_BULK_WORKER}"       "${STAGING_ECR_BULK_WORKER}"       "ieee-rc-bulk-worker-staging"       "${BULK_WORKER_TAG:-}"       "${BULK_WORKER_FLAG}"       "bulk-worker"
+          promote_and_deploy "${DEV_ECR_WIZARD_TRANSFER}"   "${STAGING_ECR_WIZARD_TRANSFER}"   "ieee-rc-wizard-transfer-staging"   "${WIZARD_TRANSFER_TAG:-}"   "${WIZARD_TRANSFER_FLAG}"   "wizard-transfer"
+          promote_and_deploy "${DEV_ECR_PPTX_EXTRACTOR}"    "${STAGING_ECR_PPTX_EXTRACTOR}"    "ieee-rc-pptx-extractor-staging"    "${PPTX_EXTRACTOR_TAG:-}"    "${PPTX_EXTRACTOR_FLAG}"    "pptx-extractor"
+
+          echo "IMAGE_RESULTS_FILE=${IMAGE_RESULTS_FILE}" >> "$GITHUB_ENV"
+          echo "LAMBDA_RESULTS_FILE=${LAMBDA_RESULTS_FILE}" >> "$GITHUB_ENV"
+
+      - name: Docker cleanup
+        if: always()
+        run: |
+          docker image prune -af || true
+          docker builder prune -af || true
+
+      - name: Write deployment summary
+        if: always()
+        run: |
+          set -euo pipefail
+
+          IMAGE_RESULTS_FILE="${IMAGE_RESULTS_FILE:-staging_image_results.txt}"
+          LAMBDA_RESULTS_FILE="${LAMBDA_RESULTS_FILE:-staging_lambda_results.txt}"
+
+          {
+            echo "### STAGING Image Promotion Summary"
+            echo ""
+            echo "| ECR Repository | Status |"
+            echo "|----------------|--------|"
+            if [[ -f "${IMAGE_RESULTS_FILE}" ]]; then
+              while IFS= read -r line; do
+                NAME=$(echo "${line}" | cut -d' ' -f1)
+                STATUS=$(echo "${line}" | cut -d'>' -f2- | xargs)
+                echo "| \`${NAME}\` | ${STATUS} |"
+              done < "${IMAGE_RESULTS_FILE}"
+            else
+              echo "| (none) | no results file found |"
+            fi
+
+            echo ""
+            echo "### STAGING Lambda Deployment Summary"
+            echo ""
+            echo "| Lambda | Status |"
+            echo "|--------|--------|"
+            if [[ -f "${LAMBDA_RESULTS_FILE}" ]]; then
+              while IFS= read -r line; do
+                NAME=$(echo "${line}" | cut -d' ' -f1)
+                STATUS=$(echo "${line}" | cut -d'>' -f2- | xargs)
+                echo "| \`${NAME}\` | ${STATUS} |"
+              done < "${LAMBDA_RESULTS_FILE}"
+            else
+              echo "| (none) | no results file found |"
+            fi
+
+            echo ""
+            echo "> Check the [Lambda console](https://us-east-1.console.aws.amazon.com/lambda/home?region=us-east-1#/functions) to verify."
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -62,26 +62,40 @@ def _make_transcribe_json(
     }
 
 
-def _mock_transcribe_complete(transcribe_mock, job_name_pattern=None):
+def _mock_transcribe_complete(transcribe_mock, job_name_pattern=None, vtt_uri=None):
     """Set up Transcribe mock for a successful job."""
-    transcribe_mock.get_transcription_job.return_value = {
+    job_result = {
         "TranscriptionJob": {
             "TranscriptionJobStatus": "COMPLETED",
             "Transcript": {
                 "TranscriptFileUri": "s3://output-bucket/transcripts/job.json"
             },
+            "Subtitles": {
+                "SubtitleFileUris": [
+                    vtt_uri or "s3://output-bucket/transcribe-output/job.vtt"
+                ],
+                "Formats": ["vtt"],
+                "OutputStartIndex": 1,
+            },
         }
     }
+    transcribe_mock.get_transcription_job.return_value = job_result
 
 
-def _mock_s3_transcript(s3_mock, transcript_json=None):
-    """Set up S3 mock to return transcript JSON."""
+def _mock_s3_transcript(s3_mock, transcript_json=None, source_size: int = 1_000):
+    """Set up S3 mock to return transcript JSON.
+
+    Also wires ``head_object`` so the size-check branch in ``transcribe()`` takes
+    the fast path by default. Callers exercising the audio-extraction branch
+    should pass a larger ``source_size``.
+    """
     tj = transcript_json or _make_transcribe_json()
 
     def get_object_side_effect(Bucket, Key):
         return {"Body": BytesIO(json.dumps(tj).encode())}
 
     s3_mock.get_object.side_effect = get_object_side_effect
+    s3_mock.head_object.return_value = {"ContentLength": source_size}
 
 
 def _mock_bedrock_cleanup(bedrock_mock, cleaned_text="Hello, this is a test transcript."):
@@ -258,6 +272,10 @@ class TestStartJob:
                 "ShowSpeakerLabels": True,
                 "MaxSpeakerLabels": MAX_SPEAKERS,
             },
+            Subtitles={
+                "Formats": ["vtt"],
+                "OutputStartIndex": 1,
+            },
         )
 
 
@@ -337,7 +355,9 @@ class TestPollJob:
         with pytest.raises(TimeoutError, match="timed out"):
             transcriber._poll_job("test-job")
 
-        expected_polls = POLL_TIMEOUT_SECONDS // POLL_INTERVAL_SECONDS
+        # Loop body sleeps each iteration while elapsed < POLL_TIMEOUT_SECONDS,
+        # so the count is ceil(POLL_TIMEOUT_SECONDS / POLL_INTERVAL_SECONDS).
+        expected_polls = -(-POLL_TIMEOUT_SECONDS // POLL_INTERVAL_SECONDS)
         assert mock_sleep.call_count == expected_polls
 
 
@@ -420,6 +440,7 @@ class TestTranscribeFlow:
         assert result["duration"] == "01:01:01"
         assert result["duration_seconds"] == 3661
         assert result["speaker_count"] == 2
+        assert result["vtt_s3_key"] == "transcribe-output/job.vtt"
 
         # Verify metadata was written
         put_calls = [
@@ -594,4 +615,304 @@ class TestCloudWatchMetrics:
             key="PES/pending/video.mp4",
             ou="PES",
             product_part_number="VID-002",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Tests: WebVTT subtitles
+# ---------------------------------------------------------------------------
+
+
+class TestWebVTTSubtitles:
+    @patch("src.extractors.video_transcriber.time.sleep")
+    def test_vtt_key_empty_when_no_subtitles_in_response(self, mock_sleep):
+        """Transcribe job completes without Subtitles output."""
+        s3_mock = MagicMock()
+        t_mock = MagicMock()
+        bedrock_mock = MagicMock()
+
+        transcript_json = _make_transcribe_json("hello", end_time="60.0")
+        _mock_s3_transcript(s3_mock, transcript_json)
+        _mock_bedrock_cleanup(bedrock_mock, "hello")
+
+        # Job response without Subtitles key
+        t_mock.get_transcription_job.return_value = {
+            "TranscriptionJob": {
+                "TranscriptionJobStatus": "COMPLETED",
+                "Transcript": {
+                    "TranscriptFileUri": "s3://output-bucket/transcripts/job.json"
+                },
+            }
+        }
+
+        transcriber = VideoTranscriber(
+            s3_client=s3_mock,
+            transcribe_client=t_mock,
+            bedrock_client=bedrock_mock,
+        )
+
+        result = transcriber.transcribe(
+            bucket="test-bucket",
+            key="PES/pending/video.mp4",
+            ou="PES",
+            product_part_number="VID-001",
+        )
+
+        assert result["vtt_s3_key"] == ""
+
+    @patch("src.extractors.video_transcriber.time.sleep")
+    def test_vtt_key_empty_when_subtitle_uris_empty(self, mock_sleep):
+        """Transcribe job has Subtitles but empty SubtitleFileUris."""
+        s3_mock = MagicMock()
+        t_mock = MagicMock()
+        bedrock_mock = MagicMock()
+
+        transcript_json = _make_transcribe_json("hello", end_time="60.0")
+        _mock_s3_transcript(s3_mock, transcript_json)
+        _mock_bedrock_cleanup(bedrock_mock, "hello")
+
+        t_mock.get_transcription_job.return_value = {
+            "TranscriptionJob": {
+                "TranscriptionJobStatus": "COMPLETED",
+                "Transcript": {
+                    "TranscriptFileUri": "s3://output-bucket/transcripts/job.json"
+                },
+                "Subtitles": {
+                    "SubtitleFileUris": [],
+                    "Formats": ["vtt"],
+                },
+            }
+        }
+
+        transcriber = VideoTranscriber(
+            s3_client=s3_mock,
+            transcribe_client=t_mock,
+            bedrock_client=bedrock_mock,
+        )
+
+        result = transcriber.transcribe(
+            bucket="test-bucket",
+            key="PES/pending/video.mp4",
+            ou="PES",
+            product_part_number="VID-001",
+        )
+
+        assert result["vtt_s3_key"] == ""
+
+    def test_start_job_with_output_bucket_includes_subtitles(self):
+        """Verify Subtitles param is present even when OutputBucketName is set."""
+        t_mock = MagicMock()
+        transcriber = VideoTranscriber(
+            s3_client=MagicMock(),
+            transcribe_client=t_mock,
+            bedrock_client=MagicMock(),
+        )
+
+        transcriber._start_job(
+            "test-job", "s3://bucket/video.mp4", "mp4", output_bucket="my-bucket"
+        )
+
+        call_kwargs = t_mock.start_transcription_job.call_args[1]
+        assert "Subtitles" in call_kwargs
+        assert call_kwargs["Subtitles"] == {"Formats": ["vtt"], "OutputStartIndex": 1}
+        assert call_kwargs["OutputBucketName"] == "my-bucket"
+
+
+# ---------------------------------------------------------------------------
+# Tests: oversized-file audio extraction branch
+# ---------------------------------------------------------------------------
+
+
+class TestAudioExtractionBranch:
+    @patch("src.extractors.video_transcriber.time.sleep")
+    def test_under_threshold_skips_audio_extraction(self, mock_sleep, monkeypatch):
+        monkeypatch.setenv("ENABLE_AUDIO_EXTRACTION", "true")
+
+        s3_mock = MagicMock()
+        t_mock = MagicMock()
+        bedrock_mock = MagicMock()
+        ae_mock = MagicMock()
+
+        _mock_s3_transcript(s3_mock, source_size=1_000_000)  # 1 MB
+        _mock_transcribe_complete(t_mock)
+        _mock_bedrock_cleanup(bedrock_mock, "ok")
+
+        transcriber = VideoTranscriber(
+            s3_client=s3_mock,
+            transcribe_client=t_mock,
+            bedrock_client=bedrock_mock,
+            audio_extractor=ae_mock,
+        )
+
+        transcriber.transcribe(
+            bucket="test-bucket",
+            key="PES/pending/video.mp4",
+            ou="PES",
+            product_part_number="VID-001",
+        )
+
+        ae_mock.extract_audio.assert_not_called()
+        start_kwargs = t_mock.start_transcription_job.call_args[1]
+        assert start_kwargs["Media"]["MediaFileUri"] == "s3://test-bucket/PES/pending/video.mp4"
+        assert start_kwargs["MediaFormat"] == "mp4"
+        # No audio cleanup needed since none was extracted.
+        s3_mock.delete_object.assert_not_called()
+
+    @patch("src.extractors.video_transcriber.time.sleep")
+    def test_over_threshold_routes_through_mediaconvert(self, mock_sleep, monkeypatch):
+        monkeypatch.setenv("ENABLE_AUDIO_EXTRACTION", "true")
+
+        s3_mock = MagicMock()
+        t_mock = MagicMock()
+        bedrock_mock = MagicMock()
+        ae_mock = MagicMock()
+        ae_mock.extract_audio.return_value = (
+            "s3://test-bucket/transcribe-input/ieee-rc-VID-002-9999/video-audio.mp3"
+        )
+
+        _mock_s3_transcript(s3_mock, source_size=3_000_000_000)  # 3 GB
+        _mock_transcribe_complete(t_mock)
+        _mock_bedrock_cleanup(bedrock_mock, "ok")
+
+        transcriber = VideoTranscriber(
+            s3_client=s3_mock,
+            transcribe_client=t_mock,
+            bedrock_client=bedrock_mock,
+            audio_extractor=ae_mock,
+        )
+
+        transcriber.transcribe(
+            bucket="test-bucket",
+            key="PES/pending/video.mp4",
+            ou="PES",
+            product_part_number="VID-002",
+        )
+
+        ae_mock.extract_audio.assert_called_once()
+        ae_kwargs = ae_mock.extract_audio.call_args[1]
+        assert ae_kwargs["source_uri"] == "s3://test-bucket/PES/pending/video.mp4"
+        assert ae_kwargs["output_bucket"] == "test-bucket"
+        assert ae_kwargs["output_key_prefix"].startswith("transcribe-input/ieee-rc-VID-002-")
+
+        start_kwargs = t_mock.start_transcription_job.call_args[1]
+        assert start_kwargs["Media"]["MediaFileUri"] == ae_mock.extract_audio.return_value
+        assert start_kwargs["MediaFormat"] == "mp3"
+
+        # Extracted audio should be deleted after the job completes.
+        s3_mock.delete_object.assert_called_once_with(
+            Bucket="test-bucket",
+            Key="transcribe-input/ieee-rc-VID-002-9999/video-audio.mp3",
+        )
+
+    @patch("src.extractors.video_transcriber.time.sleep")
+    def test_metadata_uses_original_format_after_audio_extraction(
+        self, mock_sleep, monkeypatch
+    ):
+        monkeypatch.setenv("ENABLE_AUDIO_EXTRACTION", "true")
+
+        s3_mock = MagicMock()
+        t_mock = MagicMock()
+        bedrock_mock = MagicMock()
+        ae_mock = MagicMock()
+        ae_mock.extract_audio.return_value = (
+            "s3://test-bucket/transcribe-input/job/video-audio.mp3"
+        )
+
+        _mock_s3_transcript(s3_mock, source_size=3_000_000_000)
+        _mock_transcribe_complete(t_mock)
+        _mock_bedrock_cleanup(bedrock_mock, "ok")
+
+        transcriber = VideoTranscriber(
+            s3_client=s3_mock,
+            transcribe_client=t_mock,
+            bedrock_client=bedrock_mock,
+            audio_extractor=ae_mock,
+        )
+
+        transcriber.transcribe(
+            bucket="test-bucket",
+            key="PES/pending/video.mp4",
+            ou="PES",
+            product_part_number="VID-003",
+        )
+
+        # Metadata key uses the original .mp4 extension, not .mp3.
+        metadata_keys = [
+            c[1]["Key"]
+            for c in s3_mock.put_object.call_args_list
+            if c[1]["Key"].endswith(".json")
+        ]
+        assert metadata_keys == ["PES/metadata/VID-003.mp4.json"]
+
+    @patch("src.extractors.video_transcriber.time.sleep")
+    def test_disabled_flag_skips_extraction_even_when_oversized(
+        self, mock_sleep, monkeypatch
+    ):
+        monkeypatch.setenv("ENABLE_AUDIO_EXTRACTION", "false")
+
+        s3_mock = MagicMock()
+        t_mock = MagicMock()
+        bedrock_mock = MagicMock()
+        ae_mock = MagicMock()
+
+        _mock_s3_transcript(s3_mock, source_size=3_000_000_000)
+        _mock_transcribe_complete(t_mock)
+        _mock_bedrock_cleanup(bedrock_mock, "ok")
+
+        transcriber = VideoTranscriber(
+            s3_client=s3_mock,
+            transcribe_client=t_mock,
+            bedrock_client=bedrock_mock,
+            audio_extractor=ae_mock,
+        )
+
+        transcriber.transcribe(
+            bucket="test-bucket",
+            key="PES/pending/video.mp4",
+            ou="PES",
+            product_part_number="VID-004",
+        )
+
+        ae_mock.extract_audio.assert_not_called()
+        start_kwargs = t_mock.start_transcription_job.call_args[1]
+        assert start_kwargs["MediaFormat"] == "mp4"
+
+    @patch("src.extractors.video_transcriber.time.sleep")
+    def test_audio_deleted_even_when_transcribe_fails(self, mock_sleep, monkeypatch):
+        monkeypatch.setenv("ENABLE_AUDIO_EXTRACTION", "true")
+
+        s3_mock = MagicMock()
+        t_mock = MagicMock()
+        bedrock_mock = MagicMock()
+        ae_mock = MagicMock()
+        ae_mock.extract_audio.return_value = (
+            "s3://test-bucket/transcribe-input/job/video-audio.mp3"
+        )
+
+        s3_mock.head_object.return_value = {"ContentLength": 3_000_000_000}
+        t_mock.get_transcription_job.return_value = {
+            "TranscriptionJob": {
+                "TranscriptionJobStatus": "FAILED",
+                "FailureReason": "boom",
+            }
+        }
+
+        transcriber = VideoTranscriber(
+            s3_client=s3_mock,
+            transcribe_client=t_mock,
+            bedrock_client=bedrock_mock,
+            audio_extractor=ae_mock,
+        )
+
+        with pytest.raises(RuntimeError, match="failed: boom"):
+            transcriber.transcribe(
+                bucket="test-bucket",
+                key="PES/pending/video.mp4",
+                ou="PES",
+                product_part_number="VID-005",
+            )
+
+        s3_mock.delete_object.assert_called_once_with(
+            Bucket="test-bucket",
+            Key="transcribe-input/job/video-audio.mp3",
         )

@@ -7,23 +7,42 @@
 #   - Docker running locally
 #
 # Usage:
-#   ./scripts/deploy-image-overlay.sh                # first-time setup + deploy
-#   ./scripts/deploy-image-overlay.sh update         # rebuild image + update Lambda code only
+#   ./scripts/deploy-image-overlay.sh <env>            # first-time setup + deploy
+#   ./scripts/deploy-image-overlay.sh <env> update     # rebuild + update Lambda code only
+#
+#   <env> = dev | staging   (prod naming handled separately under CC3-851)
 #
 set -euo pipefail
+
+ENV="${1:-}"
+case "${ENV}" in
+    dev|staging) ;;
+    *)
+        echo "Usage: $0 <env> [update]   # env = dev | staging" >&2
+        echo "       (prod naming is part of CC3-851; not accepted here)" >&2
+        exit 1
+        ;;
+esac
 
 AWS_PROFILE="${AWS_PROFILE:-ieee-cc}"
 AWS_REGION="${AWS_REGION:-us-east-1}"
 AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
 
 ECR_REPO_NAME="ieee-rc-image-generator"
-LAMBDA_FUNCTION_NAME="ieee-rc-image-generator"
-TRIGGER_BUCKET_NAME="dev-ieee-conference-cloud-bulk-uploads"
-LAMBDA_ROLE_NAME="ieee-rc-image-generator-role"
+LAMBDA_FUNCTION_NAME="ieee-rc-image-generator-${ENV}"
+TRIGGER_BUCKET_NAME="${ENV}-ieee-conference-cloud-bulk-uploads"
+# Source bucket: where backgrounds (and overlay sources) are read from.
+# Distinct from TRIGGER_BUCKET (which holds actions/*.json + dest images).
+SOURCE_BUCKET_NAME="${ENV}-ieee-conference-cloud-uploads"
+LAMBDA_ROLE_NAME="ieee-rc-image-generator-${ENV}-role"
 IMAGE_TAG="latest"
 
 ECR_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO_NAME}"
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
+# Optional — passed through to the Lambda environment if set.
+WEBHOOK_FAILURES_SNS_TOPIC_ARN="${WEBHOOK_FAILURES_SNS_TOPIC_ARN:-}"
+DRUPAL_WEBHOOK_SECRET="${DRUPAL_WEBHOOK_SECRET:-}"
 
 export AWS_PROFILE AWS_REGION
 
@@ -84,20 +103,32 @@ create_lambda_role() {
         }]
     }'
 
-    # S3 policy: read from any source bucket (backgrounds), write to any dest
-    # bucket, read+delete trigger JSONs from the trigger bucket
-    S3_POLICY="{
+    # S3 + Secrets Manager + SNS policy:
+    # - S3: read backgrounds (source bucket), write outputs + manage trigger
+    #   JSONs (trigger bucket). Tightened from "arn:aws:s3:::*/*" to named
+    #   buckets only so the policy emission doesn't carry an over-broad grant.
+    #   ListBucket covers both buckets — without it on the source bucket,
+    #   GetObject of a missing key returns AccessDenied instead of NoSuchKey,
+    #   which is opaque to the Lambda error mapping (see CC3-920 forensics).
+    # - Secrets Manager: fetch the Drupal callback secret (CC3-906)
+    # - SNS: publish webhook delivery failures to the dead-letter topic
+    INLINE_POLICY="{
         \"Version\": \"2012-10-17\",
         \"Statement\": [
             {
                 \"Effect\": \"Allow\",
                 \"Action\": [\"s3:GetObject\"],
-                \"Resource\": \"arn:aws:s3:::*/*\"
+                \"Resource\": [
+                    \"arn:aws:s3:::${SOURCE_BUCKET_NAME}/*\",
+                    \"arn:aws:s3:::${TRIGGER_BUCKET_NAME}/*\"
+                ]
             },
             {
                 \"Effect\": \"Allow\",
                 \"Action\": [\"s3:PutObject\"],
-                \"Resource\": \"arn:aws:s3:::*/*\"
+                \"Resource\": [
+                    \"arn:aws:s3:::${TRIGGER_BUCKET_NAME}/*\"
+                ]
             },
             {
                 \"Effect\": \"Allow\",
@@ -107,7 +138,20 @@ create_lambda_role() {
             {
                 \"Effect\": \"Allow\",
                 \"Action\": [\"s3:ListBucket\"],
-                \"Resource\": \"arn:aws:s3:::${TRIGGER_BUCKET_NAME}\"
+                \"Resource\": [
+                    \"arn:aws:s3:::${SOURCE_BUCKET_NAME}\",
+                    \"arn:aws:s3:::${TRIGGER_BUCKET_NAME}\"
+                ]
+            },
+            {
+                \"Effect\": \"Allow\",
+                \"Action\": [\"secretsmanager:GetSecretValue\"],
+                \"Resource\": \"arn:aws:secretsmanager:${AWS_REGION}:${AWS_ACCOUNT_ID}:secret:iplr/webhook-secret*\"
+            },
+            {
+                \"Effect\": \"Allow\",
+                \"Action\": [\"sns:Publish\"],
+                \"Resource\": \"arn:aws:sns:${AWS_REGION}:${AWS_ACCOUNT_ID}:ieee-rc-webhook-failures*\"
             }
         ]
     }"
@@ -123,11 +167,19 @@ create_lambda_role() {
         --role-name "${LAMBDA_ROLE_NAME}" \
         --policy-arn "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole" 2>/dev/null || true
 
-    # Put inline S3 policy
+    # Remove the legacy "S3Access" inline policy if it was attached by a prior
+    # deploy. put-role-policy below only overwrites the same-named policy, so
+    # without this the role would carry both the old and new policies until
+    # someone cleaned it up by hand.
+    aws iam delete-role-policy \
+        --role-name "${LAMBDA_ROLE_NAME}" \
+        --policy-name "S3Access" 2>/dev/null || true
+
+    # Put inline policy (idempotent — overwrites previous version)
     aws iam put-role-policy \
         --role-name "${LAMBDA_ROLE_NAME}" \
-        --policy-name "S3Access" \
-        --policy-document "${S3_POLICY}"
+        --policy-name "ImageOverlayAccess" \
+        --policy-document "${INLINE_POLICY}"
 
     ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/${LAMBDA_ROLE_NAME}"
 }
@@ -135,13 +187,28 @@ create_lambda_role() {
 # ---------------------------------------------------------------
 # 3. Create or update Lambda function
 # ---------------------------------------------------------------
+# Builds the comma-separated env-vars value for both create-function and
+# update-function-configuration. Echoed to stdout so callers capture it
+# with $(build_env_vars). Both deploy paths emit the same set so a redeploy
+# never silently strips a previously-set var.
+build_env_vars() {
+    local env_vars="LOG_LEVEL=INFO,STAGE=${ENV}"
+    if [[ -n "${DRUPAL_WEBHOOK_SECRET}" ]]; then
+        env_vars="${env_vars},DRUPAL_WEBHOOK_SECRET=${DRUPAL_WEBHOOK_SECRET}"
+    fi
+    if [[ -n "${WEBHOOK_FAILURES_SNS_TOPIC_ARN}" ]]; then
+        env_vars="${env_vars},WEBHOOK_FAILURES_SNS_TOPIC_ARN=${WEBHOOK_FAILURES_SNS_TOPIC_ARN}"
+    fi
+    printf '%s' "${env_vars}"
+}
+
 create_lambda() {
     log "Creating Lambda function: ${LAMBDA_FUNCTION_NAME}"
     ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/${LAMBDA_ROLE_NAME}"
 
     if aws lambda get-function --function-name "${LAMBDA_FUNCTION_NAME}" \
         --region "${AWS_REGION}" >/dev/null 2>&1; then
-        log "Lambda already exists — updating code..."
+        log "Lambda already exists — updating code and configuration..."
         update_lambda_code
     else
         # Wait for role to propagate
@@ -157,7 +224,7 @@ create_lambda() {
             --memory-size 1024 \
             --timeout 60 \
             --architectures x86_64 \
-            --environment "Variables={LOG_LEVEL=INFO}"
+            --environment "Variables={$(build_env_vars)}"
 
         aws lambda wait function-active-v2 \
             --function-name "${LAMBDA_FUNCTION_NAME}" \
@@ -172,6 +239,21 @@ update_lambda_code() {
         --function-name "${LAMBDA_FUNCTION_NAME}" \
         --region "${AWS_REGION}" \
         --image-uri "${ECR_URI}:${IMAGE_TAG}"
+
+    aws lambda wait function-updated-v2 \
+        --function-name "${LAMBDA_FUNCTION_NAME}" \
+        --region "${AWS_REGION}"
+
+    # Re-emit env vars on every deploy so config changes (new vars added to
+    # build_env_vars, secrets rotated, etc.) actually land on existing
+    # Lambdas — not just on first create. Mirrors the IAM policy which is
+    # also re-emitted idempotently every run via put-role-policy. Without
+    # this, --environment changes on the create-function path silently no-op
+    # for any Lambda that already exists.
+    aws lambda update-function-configuration \
+        --function-name "${LAMBDA_FUNCTION_NAME}" \
+        --region "${AWS_REGION}" \
+        --environment "Variables={$(build_env_vars)}"
 
     aws lambda wait function-updated-v2 \
         --function-name "${LAMBDA_FUNCTION_NAME}" \
@@ -225,22 +307,68 @@ configure_s3_trigger() {
 # ---------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------
-if [[ "${1:-}" == "update" ]]; then
-    log "Update mode — rebuilding image and updating Lambda code only."
+# ---------------------------------------------------------------
+# Seed default-background placeholders for BOTH trigger schemas:
+#   - Legacy (Drupal today) — `video-image-backgrounds/{ou,conference,
+#     presentation}/default.jpg`, resolved via Drupal's
+#     ImageGenerationService::resolveBackgroundSource priority chain.
+#   - Standard (image_overlay_generator.py:227) — `backgrounds/default.jpg`,
+#     where the Lambda prepends `backgrounds/` to the trigger payload's
+#     `background_source` field. Currently unused by Drupal but seeded so
+#     any future client that uses the standard schema has a fallback.
+# Idempotent — head-object first, only cp if the key is absent. Preserves
+# any admin-supplied prod default. Defined before any usage (both update-
+# mode and full-deploy entrypoints call it).
+# ---------------------------------------------------------------
+seed_default_backgrounds() {
+    log "Seeding default backgrounds on s3://${SOURCE_BUCKET_NAME}/"
+    local placeholder="${PROJECT_ROOT}/assets/default-background.jpg"
+    if [[ ! -f "${placeholder}" ]]; then
+        log "  ERROR: ${placeholder} not found in repo; cannot seed."
+        return 1
+    fi
+    # Keys covering both schemas. Adding a new schema later? Append a key here.
+    local keys=(
+        "video-image-backgrounds/ou/default.jpg"
+        "video-image-backgrounds/conference/default.jpg"
+        "video-image-backgrounds/presentation/default.jpg"
+        "backgrounds/default.jpg"
+    )
+    local key
+    for key in "${keys[@]}"; do
+        if aws s3api head-object --bucket "${SOURCE_BUCKET_NAME}" --key "${key}" \
+            --region "${AWS_REGION}" >/dev/null 2>&1; then
+            log "  s3://${SOURCE_BUCKET_NAME}/${key} — already present, skip"
+        else
+            aws s3 cp "${placeholder}" "s3://${SOURCE_BUCKET_NAME}/${key}" \
+                --region "${AWS_REGION}" --no-progress \
+                --content-type "image/jpeg"
+            log "  s3://${SOURCE_BUCKET_NAME}/${key} — seeded"
+        fi
+    done
+}
+
+if [[ "${2:-}" == "update" ]]; then
+    log "Update mode (${ENV}) — rebuilding image and updating Lambda code only."
     build_and_push
     update_lambda_code
+    # Seeding is idempotent and cheap — re-run on update so a deploy
+    # immediately after someone manually deletes a default key restores it.
+    seed_default_backgrounds || true
     log "Done."
     exit 0
 fi
 
-log "Full deployment starting..."
+log "Full deployment starting (env=${ENV})..."
 create_ecr_repo
 create_lambda_role
 build_and_push
 create_lambda
 configure_s3_trigger
+seed_default_backgrounds
 log "Deployment complete."
 log ""
 log "  ECR:     ${ECR_URI}:${IMAGE_TAG}"
 log "  Lambda:  ${LAMBDA_FUNCTION_NAME} (1024 MB, 60s timeout)"
 log "  Trigger: s3://${TRIGGER_BUCKET_NAME}/actions/*.json"
+log "  Source:  s3://${SOURCE_BUCKET_NAME}/{video-image-backgrounds,backgrounds}/"

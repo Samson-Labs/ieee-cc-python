@@ -87,7 +87,7 @@ aws s3 cp /path/to/your/file.pdf \
   "body": {
     "text": "... extracted text content ...",
     "page_count": 42,
-    "extraction_method": "text"
+    "extraction_method": "extract_text"
   }
 }
 ```

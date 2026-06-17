@@ -20,6 +20,7 @@ def _make_meta(
     callback_url=None,
 ):
     meta = {
+        "request_id": 42,
         "item_id": "STD-12345",
         "ou": "PES",
         "product_part_number": "STD-12345",
@@ -27,6 +28,7 @@ def _make_meta(
         "content": {
             "media_type": media_type,
             "filename": "STD-12345.pdf",
+            "resource_center": "PES",
         },
     }
     if callback_url:
@@ -46,7 +48,12 @@ def _lambda_invoke_response(status_code=200, body=None):
 
 
 @pytest.fixture
-def orchestrator():
+def orchestrator(monkeypatch):
+    # FunctionName assertions assume STAGE is unset → orchestrator resolves
+    # downstream Lambda names with the default `-dev` suffix. Strip any
+    # exported STAGE so tests don't break when run in a shell with it set.
+    monkeypatch.delenv("STAGE", raising=False)
+    monkeypatch.delenv("ENVIRONMENT", raising=False)
     s3 = MagicMock()
     lam = MagicMock()
     sns = MagicMock()
@@ -55,7 +62,9 @@ def orchestrator():
 
 
 @pytest.fixture
-def orchestrator_with_cw():
+def orchestrator_with_cw(monkeypatch):
+    monkeypatch.delenv("STAGE", raising=False)
+    monkeypatch.delenv("ENVIRONMENT", raising=False)
     s3 = MagicMock()
     lam = MagicMock()
     sns = MagicMock()
@@ -130,6 +139,42 @@ class TestValidateMeta:
         meta = _make_meta()
         # Should not raise
         AIOrchestrator._validate_meta(meta)
+
+    def test_missing_product_part_number_raises(self):
+        # CC3-998: PPN is required at the top level. The orchestrator
+        # used to fabricate `{resource_center}_{item_id}` when it was
+        # absent; that fabricated value silently flowed into the VTT
+        # destination key and the Drupal webhook payload.
+        meta = _make_meta()
+        del meta["product_part_number"]
+        with pytest.raises(ValueError, match="Missing required .meta.json"):
+            AIOrchestrator._validate_meta(meta)
+
+    def test_empty_product_part_number_raises(self):
+        # CC3-998: empty string slipped past the missing-keys check and
+        # still triggered the fabrication fallback. Must be rejected.
+        meta = _make_meta()
+        meta["product_part_number"] = ""
+        with pytest.raises(ValueError, match="must be a non-empty string"):
+            AIOrchestrator._validate_meta(meta)
+
+    def test_whitespace_only_product_part_number_raises(self):
+        meta = _make_meta()
+        meta["product_part_number"] = "   "
+        with pytest.raises(ValueError, match="must be a non-empty string"):
+            AIOrchestrator._validate_meta(meta)
+
+    def test_non_string_product_part_number_raises(self):
+        # Drupal emits PPN as a string; defend against ints / None
+        # leaking through (would otherwise crash `.strip()` downstream).
+        meta = _make_meta()
+        meta["product_part_number"] = 0
+        with pytest.raises(ValueError, match="must be a non-empty string"):
+            AIOrchestrator._validate_meta(meta)
+
+        meta["product_part_number"] = None
+        with pytest.raises(ValueError, match="must be a non-empty string"):
+            AIOrchestrator._validate_meta(meta)
 
 
 # ---------------------------------------------------------------
@@ -240,7 +285,7 @@ class TestPDFFlow:
         meta = _make_meta(ai_enabled=True, media_type="application/pdf")
         s3.get_object.return_value = _s3_get_object_response(meta)
 
-        extraction_body = {"text": "extracted text", "page_count": 10, "extraction_method": "text"}
+        extraction_body = {"text": "extracted text", "page_count": 10, "extraction_method": "extract_text"}
         bedrock_body = {"abstract": "summary", "keywords": ["ai"], "learning_level": "Expert", "intended_audience": "Seasoned", "category": "Research"}
 
         lam.invoke.side_effect = [
@@ -256,11 +301,11 @@ class TestPDFFlow:
 
         # First call: PDF extractor
         first_call = lam.invoke.call_args_list[0]
-        assert first_call[1]["FunctionName"] == "ieee-cc-pdf-extractor"
+        assert first_call[1]["FunctionName"] == "ieee-cc-pdf-extractor-dev"
 
         # Second call: Bedrock
         second_call = lam.invoke.call_args_list[1]
-        assert second_call[1]["FunctionName"] == "ieee-cc-bedrock-inference"
+        assert second_call[1]["FunctionName"] == "ieee-cc-bedrock-inference-dev"
 
     def test_skips_bedrock_when_no_text(self, orchestrator):
         orch, s3, lam = orchestrator
@@ -287,7 +332,7 @@ class TestVideoFlow:
         meta["content"]["filename"] = "lecture.mp4"
         s3.get_object.return_value = _s3_get_object_response(meta)
 
-        transcription_body = {"transcript": "hello world", "duration": "00:10:00", "duration_seconds": 600, "speaker_count": 1}
+        transcription_body = {"transcript": "hello world", "duration": "00:10:00", "duration_seconds": 600, "speaker_count": 1, "extraction_method": "transcribe"}
         bedrock_body = {"abstract": "talk", "keywords": ["video"], "learning_level": "Foundational", "intended_audience": "New", "category": "Tutorial"}
 
         lam.invoke.side_effect = [
@@ -299,7 +344,7 @@ class TestVideoFlow:
 
         assert result["action"] == "enriched"
         first_call = lam.invoke.call_args_list[0]
-        assert first_call[1]["FunctionName"] == "ieee-cc-video-transcriber"
+        assert first_call[1]["FunctionName"] == "ieee-cc-video-transcriber-dev"
 
     def test_supports_quicktime_media_type(self, orchestrator):
         orch, s3, lam = orchestrator
@@ -308,7 +353,7 @@ class TestVideoFlow:
         s3.get_object.return_value = _s3_get_object_response(meta)
 
         lam.invoke.side_effect = [
-            _lambda_invoke_response(200, {"transcript": "text", "duration": "00:01:00", "duration_seconds": 60, "speaker_count": 1}),
+            _lambda_invoke_response(200, {"transcript": "text", "duration": "00:01:00", "duration_seconds": 60, "speaker_count": 1, "extraction_method": "transcribe"}),
             _lambda_invoke_response(200, {"abstract": "a", "keywords": [], "learning_level": "Expert", "intended_audience": "Seasoned", "category": "Research"}),
         ]
 
@@ -322,6 +367,96 @@ class TestVideoFlow:
 
         with pytest.raises(ValueError, match="Unsupported media type"):
             orch.process("bucket", "PES/pending/image.png")
+
+    def test_drupal_video_media_type_normalized(self, orchestrator):
+        """Drupal sends 'Video' instead of 'video/mp4' — verify normalization."""
+        orch, s3, lam = orchestrator
+        meta = _make_meta(ai_enabled=True, media_type="Video")
+        meta["content"]["filename"] = "lecture.mp4"
+        s3.get_object.return_value = _s3_get_object_response(meta)
+
+        lam.invoke.side_effect = [
+            _lambda_invoke_response(200, {"transcript": "text", "duration": "00:01:00", "duration_seconds": 60, "speaker_count": 1, "extraction_method": "transcribe"}),
+            _lambda_invoke_response(200, {"abstract": "a", "keywords": [], "learning_level": "Expert"}),
+        ]
+
+        result = orch.process("bucket", "PES/pending/lecture.mp4")
+        assert result["action"] == "enriched"
+
+    def test_drupal_pdf_media_type_normalized(self, orchestrator):
+        """Drupal sends 'PDF' instead of 'application/pdf' — verify normalization."""
+        orch, s3, lam = orchestrator
+        meta = _make_meta(ai_enabled=True, media_type="PDF")
+        s3.get_object.return_value = _s3_get_object_response(meta)
+
+        lam.invoke.side_effect = [
+            _lambda_invoke_response(200, {"text": "extracted", "page_count": 5, "extraction_method": "extract_text"}),
+            _lambda_invoke_response(200, {"abstract": "a", "keywords": [], "learning_level": "Expert"}),
+        ]
+
+        result = orch.process("bucket", "PES/pending/STD-12345.pdf")
+        assert result["action"] == "enriched"
+
+
+# ---------------------------------------------------------------
+# AI Enabled — PPTX Flow (CC3-881)
+# ---------------------------------------------------------------
+
+class TestPptxFlow:
+    def test_dispatches_to_pptx_extractor(self, orchestrator):
+        orch, s3, lam = orchestrator
+        meta = _make_meta(
+            ai_enabled=True,
+            media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        )
+        meta["content"]["filename"] = "deck.pptx"
+        s3.get_object.return_value = _s3_get_object_response(meta)
+
+        extraction_body = {"text": "slide content", "slide_count": 10, "extraction_method": "extract_text"}
+        bedrock_body = {"abstract": "deck", "keywords": ["slides"], "learning_level": "Foundational", "intended_audience": "New", "category": "Tutorial"}
+
+        lam.invoke.side_effect = [
+            _lambda_invoke_response(200, extraction_body),
+            _lambda_invoke_response(200, bedrock_body),
+        ]
+
+        result = orch.process("bucket", "AESS/pending/deck.pptx")
+
+        assert result["action"] == "enriched"
+        first_call = lam.invoke.call_args_list[0]
+        assert first_call[1]["FunctionName"] == "ieee-rc-pptx-extractor-dev"
+
+    def test_drupal_powerpoint_media_type_normalized(self, orchestrator):
+        """Drupal sends 'PowerPoint' instead of the MIME — verify normalization."""
+        orch, s3, lam = orchestrator
+        meta = _make_meta(ai_enabled=True, media_type="PowerPoint")
+        meta["content"]["filename"] = "deck.pptx"
+        s3.get_object.return_value = _s3_get_object_response(meta)
+
+        lam.invoke.side_effect = [
+            _lambda_invoke_response(200, {"text": "t", "slide_count": 1, "extraction_method": "extract_text"}),
+            _lambda_invoke_response(200, {"abstract": "a", "keywords": [], "learning_level": "Expert"}),
+        ]
+
+        result = orch.process("bucket", "PES/pending/deck.pptx")
+        assert result["action"] == "enriched"
+        assert lam.invoke.call_args_list[0][1]["FunctionName"] == "ieee-rc-pptx-extractor-dev"
+
+    def test_raw_pptx_alias_routes_to_extractor(self, orchestrator):
+        """Shorthand 'pptx' media type also routes correctly."""
+        orch, s3, lam = orchestrator
+        meta = _make_meta(ai_enabled=True, media_type="pptx")
+        meta["content"]["filename"] = "deck.pptx"
+        s3.get_object.return_value = _s3_get_object_response(meta)
+
+        lam.invoke.side_effect = [
+            _lambda_invoke_response(200, {"text": "t", "slide_count": 2, "extraction_method": "extract_text"}),
+            _lambda_invoke_response(200, {"abstract": "a", "keywords": [], "learning_level": "Expert"}),
+        ]
+
+        result = orch.process("bucket", "PES/pending/deck.pptx")
+        assert result["action"] == "enriched"
+        assert lam.invoke.call_args_list[0][1]["FunctionName"] == "ieee-rc-pptx-extractor-dev"
 
 
 # ---------------------------------------------------------------
@@ -363,7 +498,7 @@ class TestWebhook:
         meta = _make_meta(ai_enabled=True, callback_url="https://drupal.example.com/hook")
         s3.get_object.return_value = _s3_get_object_response(meta)
 
-        extraction_body = {"text": "text", "page_count": 5, "extraction_method": "text"}
+        extraction_body = {"text": "text", "page_count": 5, "extraction_method": "extract_text"}
         bedrock_body = {"abstract": "a", "keywords": [], "learning_level": "Expert", "intended_audience": "Seasoned", "category": "Research"}
         lam.invoke.side_effect = [
             _lambda_invoke_response(200, extraction_body),
@@ -382,9 +517,89 @@ class TestWebhook:
         assert payload["signal"] == "extraction_ready"
         assert payload["product_part_number"] == "STD-12345"
         assert payload["item_id"] == "STD-12345"
+        assert payload["request_id"] == 42
         assert payload["ou"] == "PES"
-        assert payload["status"] == "completed"
+        assert payload["status"] == "success"
+        # CC3-1049: explicit outcome — Bedrock produced data here.
+        assert payload["enrichment_status"] == "enriched"
+        assert "data" in payload
         assert "completed_at" in payload
+
+    @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
+    def test_scanned_pdf_reports_enrichment_status(self, mock_send, orchestrator):
+        # CC3-1049: a scanned PDF (no text, extraction_method 'ocr') skips
+        # Bedrock; the webhook now states enrichment_status explicitly so Drupal
+        # doesn't have to infer it from empty data + extraction_method.
+        orch, s3, lam = orchestrator
+        meta = _make_meta(ai_enabled=True, callback_url="https://drupal.example.com/hook")
+        s3.get_object.return_value = _s3_get_object_response(meta)
+        lam.invoke.return_value = _lambda_invoke_response(
+            200, {"text": "", "page_count": 3, "extraction_method": "ocr"}
+        )
+
+        result = orch.process("bucket", "PES/pending/STD-12345.pdf")
+
+        assert result["action"] == "enriched"
+        payload = mock_send.call_args[0][2]
+        assert payload["enrichment_status"] == "scanned_pdf"
+        assert payload["data"] == {}
+        assert payload["extraction"]["extraction_method"] == "ocr"
+
+    @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=False)
+    def test_failure_webhook_sent_on_processing_error(self, mock_send, orchestrator):
+        # CC3-1049: when Bedrock hard-fails (e.g. the keyword 422), the handler
+        # calls send_failure_webhook so Drupal moves the item to pending_review
+        # instead of leaving it stuck in awaiting_* with no callback at all.
+        orch, s3, lam = orchestrator
+        meta = _make_meta(ai_enabled=True, callback_url="https://drupal.example.com/hook")
+        s3.get_object.return_value = _s3_get_object_response(meta)
+
+        extraction_body = {"text": "text", "page_count": 5, "extraction_method": "extract_text"}
+        lam.invoke.side_effect = [
+            _lambda_invoke_response(200, extraction_body),
+            _lambda_invoke_response(422, {"error": "keywords must have 8–12 items, got 4"}),
+        ]
+
+        with pytest.raises(RuntimeError, match="returned 422"):
+            orch.process("bucket", "PES/pending/STD-12345.pdf")
+
+        # process() raised before Step 5, so no success webhook was sent yet.
+        mock_send.assert_not_called()
+
+        # Simulate the handler's except block calling the failure reporter.
+        orch.send_failure_webhook(RuntimeError("Bedrock inference returned 422"))
+
+        mock_send.assert_called_once()
+        payload = mock_send.call_args[0][2]
+        assert payload["status"] == "failure"
+        assert payload["item_id"] == "STD-12345"
+        assert payload["request_id"] == 42
+        assert "error" in payload
+
+    def test_failure_webhook_noop_without_context(self, orchestrator):
+        # No item identity captured (failure before meta parsed, or fresh
+        # container) → nothing to notify; must not raise or send.
+        orch, _s3, _lam = orchestrator
+        with patch("src.orchestrator.ai_orchestrator.WebhookSender.send") as mock_send:
+            orch.send_failure_webhook(RuntimeError("boom"))
+            mock_send.assert_not_called()
+
+    @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
+    def test_request_id_falls_back_to_lambda_request_id(self, mock_send, orchestrator):
+        orch, s3, lam = orchestrator
+        meta = _make_meta(ai_enabled=True, callback_url="https://drupal.example.com/hook")
+        del meta["request_id"]  # simulate missing request_id in .meta.json
+        s3.get_object.return_value = _s3_get_object_response(meta)
+
+        lam.invoke.side_effect = [
+            _lambda_invoke_response(200, {"text": "text", "page_count": 5, "extraction_method": "extract_text"}),
+            _lambda_invoke_response(200, {"abstract": "a", "keywords": [], "learning_level": "Expert"}),
+        ]
+
+        orch.process("bucket", "PES/pending/STD-12345.pdf", request_id="lambda-req-abc")
+
+        payload = mock_send.call_args[0][2]
+        assert payload["request_id"] == "lambda-req-abc"
 
     @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
     def test_video_signal_is_transcription_ready(self, mock_send, orchestrator):
@@ -393,7 +608,7 @@ class TestWebhook:
         meta["content"]["filename"] = "lecture.mp4"
         s3.get_object.return_value = _s3_get_object_response(meta)
 
-        transcription_body = {"transcript": "text", "duration": "00:01:00", "duration_seconds": 60, "speaker_count": 1}
+        transcription_body = {"transcript": "text", "duration": "00:01:00", "duration_seconds": 60, "speaker_count": 1, "extraction_method": "transcribe"}
         bedrock_body = {"abstract": "a", "keywords": [], "learning_level": "Expert", "intended_audience": "Seasoned", "category": "Research"}
         lam.invoke.side_effect = [
             _lambda_invoke_response(200, transcription_body),
@@ -405,12 +620,128 @@ class TestWebhook:
         payload = mock_send.call_args[0][2]
         assert payload["signal"] == "transcription_ready"
 
+    @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
+    def test_video_webhook_includes_vtt_key(self, mock_send, orchestrator):
+        orch, s3, lam = orchestrator
+        meta = _make_meta(ai_enabled=True, media_type="video/mp4", callback_url="https://drupal.example.com/hook")
+        meta["content"]["filename"] = "lecture.mp4"
+        s3.get_object.return_value = _s3_get_object_response(meta)
+
+        transcription_body = {
+            "transcript": "text", "duration": "00:05:00",
+            "duration_seconds": 300, "speaker_count": 1,
+            "vtt_s3_key": "transcribe-output/job.vtt",
+            "extraction_method": "transcribe",
+        }
+        bedrock_body = {"abstract": "a", "keywords": [], "learning_level": "Expert"}
+        lam.invoke.side_effect = [
+            _lambda_invoke_response(200, transcription_body),
+            _lambda_invoke_response(200, bedrock_body),
+        ]
+
+        orch.process("bucket", "AESS/pending/lecture.mp4")
+
+        # VTT file should be copied to subtitles path (meta_ou = "PES" from fixture)
+        s3.copy_object.assert_any_call(
+            Bucket="bucket",
+            CopySource={"Bucket": "bucket", "Key": "transcribe-output/job.vtt"},
+            Key="PES/subtitles/STD-12345.vtt",
+        )
+
+        # Webhook should include vtt_s3_key
+        payload = mock_send.call_args[0][2]
+        assert payload["vtt_s3_key"] == "PES/subtitles/STD-12345.vtt"
+
+    @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
+    def test_explicit_ppn_used_verbatim_for_vtt_and_webhook(self, mock_send, orchestrator):
+        # CC3-998 regression: orchestrator must use the literal PPN from
+        # meta — never synthesize `{resource_center}_{item_id}`. Use a
+        # PPN distinct from both so a regression to the old fabrication
+        # branch would be visible.
+        orch, s3, lam = orchestrator
+        meta = _make_meta(ai_enabled=True, media_type="video/mp4", callback_url="https://drupal.example.com/hook")
+        meta["product_part_number"] = "APS_CONFERENCES_2020-AP-SYMPOSIUM_TEES_05162026"
+        meta["content"]["filename"] = "lecture.mp4"
+        s3.get_object.return_value = _s3_get_object_response(meta)
+
+        transcription_body = {
+            "transcript": "text", "duration": "00:05:00",
+            "duration_seconds": 300, "speaker_count": 1,
+            "vtt_s3_key": "transcribe-output/job.vtt",
+            "extraction_method": "transcribe",
+        }
+        bedrock_body = {"abstract": "a", "keywords": [], "learning_level": "Expert"}
+        lam.invoke.side_effect = [
+            _lambda_invoke_response(200, transcription_body),
+            _lambda_invoke_response(200, bedrock_body),
+        ]
+
+        orch.process("bucket", "PES/pending/STD-12345.mp4")
+
+        expected_vtt = "PES/subtitles/APS_CONFERENCES_2020-AP-SYMPOSIUM_TEES_05162026.vtt"
+        s3.copy_object.assert_any_call(
+            Bucket="bucket",
+            CopySource={"Bucket": "bucket", "Key": "transcribe-output/job.vtt"},
+            Key=expected_vtt,
+        )
+        payload = mock_send.call_args[0][2]
+        assert payload["product_part_number"] == "APS_CONFERENCES_2020-AP-SYMPOSIUM_TEES_05162026"
+        assert payload["vtt_s3_key"] == expected_vtt
+        # Negative assertion: the synthesized form must not appear.
+        assert "PES_STD-12345" not in payload["vtt_s3_key"]
+
+    @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
+    def test_video_no_vtt_skips_copy(self, mock_send, orchestrator):
+        """When vtt_s3_key is empty, orchestrator should not attempt copy."""
+        orch, s3, lam = orchestrator
+        meta = _make_meta(ai_enabled=True, media_type="video/mp4", callback_url="https://drupal.example.com/hook")
+        meta["content"]["filename"] = "lecture.mp4"
+        s3.get_object.return_value = _s3_get_object_response(meta)
+
+        transcription_body = {
+            "transcript": "text", "duration": "00:05:00",
+            "duration_seconds": 300, "speaker_count": 1,
+            "vtt_s3_key": "",
+            "extraction_method": "transcribe",
+        }
+        bedrock_body = {"abstract": "a", "keywords": [], "learning_level": "Expert"}
+        lam.invoke.side_effect = [
+            _lambda_invoke_response(200, transcription_body),
+            _lambda_invoke_response(200, bedrock_body),
+        ]
+
+        orch.process("bucket", "AESS/pending/lecture.mp4")
+
+        # copy_object should only be called once (for file move), not for VTT
+        copy_calls = s3.copy_object.call_args_list
+        vtt_copies = [c for c in copy_calls if "subtitles" in str(c)]
+        assert len(vtt_copies) == 0
+
+        payload = mock_send.call_args[0][2]
+        assert payload["vtt_s3_key"] is None
+
+    @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
+    def test_pdf_webhook_has_no_vtt_key(self, mock_send, orchestrator):
+        orch, s3, lam = orchestrator
+        meta = _make_meta(ai_enabled=True, callback_url="https://drupal.example.com/hook")
+        s3.get_object.return_value = _s3_get_object_response(meta)
+
+        lam.invoke.side_effect = [
+            _lambda_invoke_response(200, {"text": "text", "page_count": 5, "extraction_method": "extract_text"}),
+            _lambda_invoke_response(200, {"abstract": "a", "keywords": [], "learning_level": "Expert"}),
+        ]
+
+        orch.process("bucket", "PES/pending/STD-12345.pdf")
+
+        payload = mock_send.call_args[0][2]
+        assert payload["vtt_s3_key"] is None
+
     def test_no_callback_url_skips(self, orchestrator):
         orch, s3, lam = orchestrator
         meta = _make_meta(ai_enabled=True)  # No callback_url
         s3.get_object.return_value = _s3_get_object_response(meta)
 
-        extraction_body = {"text": "text", "page_count": 5, "extraction_method": "text"}
+        extraction_body = {"text": "text", "page_count": 5, "extraction_method": "extract_text"}
         bedrock_body = {"abstract": "a", "keywords": [], "learning_level": "Expert", "intended_audience": "Seasoned", "category": "Research"}
         lam.invoke.side_effect = [
             _lambda_invoke_response(200, extraction_body),
@@ -427,7 +758,7 @@ class TestWebhook:
         meta = _make_meta(ai_enabled=True, callback_url="https://drupal.example.com/hook")
         s3.get_object.return_value = _s3_get_object_response(meta)
 
-        extraction_body = {"text": "text", "page_count": 5, "extraction_method": "text"}
+        extraction_body = {"text": "text", "page_count": 5, "extraction_method": "extract_text"}
         bedrock_body = {"abstract": "a", "keywords": [], "learning_level": "Expert", "intended_audience": "Seasoned", "category": "Research"}
         lam.invoke.side_effect = [
             _lambda_invoke_response(200, extraction_body),
@@ -457,16 +788,16 @@ class TestMetrics:
         metric_data = cw.put_metric_data.call_args[1]["MetricData"]
         assert metric_data[0]["MetricName"] == "submission-processed"
         assert metric_data[0]["Value"] == 1
-        # Check AiToggleEnabled dimension
         dim_map = {d["Name"]: d["Value"] for d in metric_data[0]["Dimensions"]}
         assert dim_map["AiToggleEnabled"] == "false"
+        assert dim_map["ResourceCenter"] == "PES"
 
     def test_submission_processed_ai_enabled(self, orchestrator_with_cw):
         orch, s3, lam, cw = orchestrator_with_cw
         meta = _make_meta(ai_enabled=True, media_type="application/pdf")
         s3.get_object.return_value = _s3_get_object_response(meta)
 
-        extraction_body = {"text": "text", "page_count": 5}
+        extraction_body = {"text": "text", "page_count": 5, "extraction_method": "extract_text"}
         bedrock_body = {
             "abstract": "a", "keywords": [], "input_tokens": 1000,
             "output_tokens": 500, "learning_level": "Expert",
@@ -486,13 +817,70 @@ class TestMetrics:
         assert "submission-processed" in names
         dim_map = {d["Name"]: d["Value"] for d in names["submission-processed"]["Dimensions"]}
         assert dim_map["AiToggleEnabled"] == "true"
+        assert dim_map["ResourceCenter"] == "PES"
+        cost_dims = {d["Name"]: d["Value"] for d in names["processing-cost-estimate"]["Dimensions"]}
+        assert cost_dims["ResourceCenter"] == "PES"
+
+    def test_resource_center_uses_meta_ou(self, orchestrator_with_cw):
+        # meta["ou"] is the source of truth for ResourceCenter, not the
+        # S3 key prefix — Drupal can override per-submission.
+        orch, s3, lam, cw = orchestrator_with_cw
+        meta = _make_meta(ai_enabled=True, media_type="application/pdf")
+        meta["ou"] = "AESS"
+        s3.get_object.return_value = _s3_get_object_response(meta)
+
+        extraction_body = {"text": "text", "page_count": 5, "extraction_method": "extract_text"}
+        bedrock_body = {
+            "abstract": "a", "keywords": [], "input_tokens": 1000,
+            "output_tokens": 500, "learning_level": "Expert",
+        }
+        lam.invoke.side_effect = [
+            _lambda_invoke_response(200, extraction_body),
+            _lambda_invoke_response(200, bedrock_body),
+        ]
+
+        # S3 key still says PES, but meta["ou"] = AESS should win.
+        orch.process("bucket", "PES/pending/STD-12345.pdf")
+
+        metric_data = cw.put_metric_data.call_args[1]["MetricData"]
+        for m in metric_data:
+            dims = {d["Name"]: d["Value"] for d in m["Dimensions"]}
+            assert dims["ResourceCenter"] == "AESS"
+
+    def test_resource_center_defaults_to_unknown_when_blank(self, orchestrator_with_cw):
+        # CC3-858 direct-invocation path can supply meta without `ou`. The
+        # ResourceCenter dim must never be empty — CloudWatch's
+        # PutMetricData rejects empty dimension values, dropping the
+        # entire batch (including processing-cost-estimate, which has no
+        # AiToggleEnabled fallback).
+        orch, _, _, cw = orchestrator_with_cw
+        meta = {
+            "request_id": 99,
+            "item_id": "STD-77777",
+            "product_part_number": "STD-77777",
+            "ai_enrichment_enabled": False,
+            "content": {
+                "media_type": "application/pdf",
+                "filename": "STD-77777.pdf",
+                # no resource_center either
+            },
+        }
+
+        orch.process("bucket", key=None, meta=meta)
+
+        cw.put_metric_data.assert_called_once()
+        metric_data = cw.put_metric_data.call_args[1]["MetricData"]
+        for m in metric_data:
+            dims = {d["Name"]: d["Value"] for d in m["Dimensions"]}
+            assert dims["ResourceCenter"] == "unknown"
+            assert dims["ResourceCenter"] != ""
 
     def test_cost_estimate_pdf(self, orchestrator_with_cw):
         orch, s3, lam, cw = orchestrator_with_cw
         meta = _make_meta(ai_enabled=True, media_type="application/pdf")
         s3.get_object.return_value = _s3_get_object_response(meta)
 
-        extraction_body = {"text": "text", "page_count": 5}
+        extraction_body = {"text": "text", "page_count": 5, "extraction_method": "extract_text"}
         bedrock_body = {
             "abstract": "a", "keywords": [], "input_tokens": 1_000_000,
             "output_tokens": 100_000, "learning_level": "Expert",
@@ -518,6 +906,7 @@ class TestMetrics:
         transcription_body = {
             "transcript": "text", "duration": "00:10:00",
             "duration_seconds": 600, "speaker_count": 1,
+            "extraction_method": "transcribe",
         }
         bedrock_body = {
             "abstract": "a", "keywords": [], "input_tokens": 0,
@@ -537,12 +926,594 @@ class TestMetrics:
 
 
 # ---------------------------------------------------------------
+# CC3-858: Input text, direct invocation, selective fields
+# ---------------------------------------------------------------
+
+
+def _make_text_meta(
+    input_text="User-provided abstract text here.",
+    input_text_mode="as_source",
+    requested_fields=None,
+    callback_url="https://drupal.example.com/hook",
+):
+    meta = {
+        "request_id": 99,
+        "item_id": "ITEM-100",
+        "ou": "PES",
+        "product_part_number": "PES_ITEM-100",
+        "ai_enrichment_enabled": True,
+        "content": {"media_type": "text", "resource_center": "PES"},
+        "input_text": input_text,
+        "input_text_mode": input_text_mode,
+        "callback_url": callback_url,
+    }
+    if requested_fields is not None:
+        meta["requested_fields"] = requested_fields
+    return meta
+
+
+class TestInputTextAsSource:
+    """AC1: input_text with as_source mode — Bedrock generates all 5 fields."""
+
+    @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
+    def test_skips_extraction_uses_input_text(self, mock_send, orchestrator):
+        orch, s3, lam = orchestrator
+        meta = _make_text_meta(input_text_mode="as_source")
+        s3.get_object.return_value = _s3_get_object_response(meta)
+
+        bedrock_body = {"abstract": "a", "keywords": [], "learning_level": "Expert"}
+        lam.invoke.return_value = _lambda_invoke_response(200, bedrock_body)
+
+        result = orch.process("bucket", "PES/pending/ITEM-100.pdf")
+
+        assert result["action"] == "enriched"
+        # Only 1 Lambda call (Bedrock), not 2 (extraction + Bedrock)
+        assert lam.invoke.call_count == 1
+        bedrock_payload = json.loads(lam.invoke.call_args[1]["Payload"])
+        assert bedrock_payload["text"] == "User-provided abstract text here."
+
+    @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
+    def test_webhook_signal_metadata_ready(self, mock_send, orchestrator):
+        orch, s3, lam = orchestrator
+        meta = _make_text_meta()
+        s3.get_object.return_value = _s3_get_object_response(meta)
+        lam.invoke.return_value = _lambda_invoke_response(200, {"abstract": "a", "keywords": []})
+
+        orch.process("bucket", "PES/pending/ITEM-100.pdf")
+
+        payload = mock_send.call_args[0][2]
+        assert payload["signal"] == "metadata_ready"
+        # CC3-952 / D3: input_text path omits the `extraction` block entirely
+        # (signal carries the distinction; Drupal does not need extraction_method).
+        assert "extraction" not in payload
+        assert "generated_fields" in payload
+
+
+class TestInputTextAsAbstract:
+    """AC2: input_text with as_abstract mode — abstract passed through."""
+
+    @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
+    def test_abstract_not_in_bedrock_requested_fields(self, mock_send, orchestrator):
+        orch, s3, lam = orchestrator
+        meta = _make_text_meta(input_text_mode="as_abstract")
+        s3.get_object.return_value = _s3_get_object_response(meta)
+        lam.invoke.return_value = _lambda_invoke_response(200, {"keywords": [], "learning_level": "Expert"})
+
+        orch.process("bucket", "PES/pending/ITEM-100.pdf")
+
+        bedrock_payload = json.loads(lam.invoke.call_args[1]["Payload"])
+        assert "abstract" not in bedrock_payload.get("requested_fields", [])
+
+    @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
+    def test_abstract_merged_from_input_text(self, mock_send, orchestrator):
+        orch, s3, lam = orchestrator
+        meta = _make_text_meta(
+            input_text="My custom abstract.",
+            input_text_mode="as_abstract",
+        )
+        s3.get_object.return_value = _s3_get_object_response(meta)
+        lam.invoke.return_value = _lambda_invoke_response(200, {"keywords": ["kw1"], "learning_level": "Expert"})
+
+        orch.process("bucket", "PES/pending/ITEM-100.pdf")
+
+        payload = mock_send.call_args[0][2]
+        assert payload["data"]["abstract"] == "My custom abstract."
+        assert "abstract" not in payload["generated_fields"]
+
+    @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
+    def test_bedrock_gets_framing_context(self, mock_send, orchestrator):
+        orch, s3, lam = orchestrator
+        meta = _make_text_meta(input_text_mode="as_abstract")
+        s3.get_object.return_value = _s3_get_object_response(meta)
+        lam.invoke.return_value = _lambda_invoke_response(200, {"keywords": []})
+
+        orch.process("bucket", "PES/pending/ITEM-100.pdf")
+
+        bedrock_payload = json.loads(lam.invoke.call_args[1]["Payload"])
+        assert "finalized abstract" in bedrock_payload["text"]
+
+
+class TestRequestedFieldsOrchestrator:
+    """AC3: requested_fields subset forwarded to Bedrock."""
+
+    @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
+    def test_forwards_requested_fields_to_bedrock(self, mock_send, orchestrator):
+        orch, s3, lam = orchestrator
+        meta = _make_text_meta(requested_fields=["keywords", "category"])
+        s3.get_object.return_value = _s3_get_object_response(meta)
+        lam.invoke.return_value = _lambda_invoke_response(200, {"keywords": [], "category": "Research"})
+
+        orch.process("bucket", "PES/pending/ITEM-100.pdf")
+
+        bedrock_payload = json.loads(lam.invoke.call_args[1]["Payload"])
+        assert sorted(bedrock_payload["requested_fields"]) == ["category", "keywords"]
+
+    @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
+    def test_generated_fields_in_webhook(self, mock_send, orchestrator):
+        orch, s3, lam = orchestrator
+        meta = _make_text_meta(requested_fields=["keywords", "category"])
+        s3.get_object.return_value = _s3_get_object_response(meta)
+        lam.invoke.return_value = _lambda_invoke_response(200, {"keywords": [], "category": "Research"})
+
+        orch.process("bucket", "PES/pending/ITEM-100.pdf")
+
+        payload = mock_send.call_args[0][2]
+        assert sorted(payload["generated_fields"]) == ["category", "keywords"]
+
+
+class TestDirectInvocation:
+    """AC4: Direct invocation with meta in event, no S3 file."""
+
+    @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
+    def test_no_file_read_or_move(self, mock_send, orchestrator):
+        orch, s3, lam = orchestrator
+        meta = _make_text_meta()
+        lam.invoke.return_value = _lambda_invoke_response(200, {"abstract": "a", "keywords": []})
+
+        result = orch.process(bucket="bucket", key=None, meta=meta)
+
+        assert result["action"] == "enriched"
+        assert result["source_key"] == ""
+        assert result["destination_key"] == ""
+        # No S3 reads (no meta.json from S3)
+        s3.get_object.assert_not_called()
+        # No file move
+        s3.copy_object.assert_not_called()
+        s3.delete_object.assert_not_called()
+
+    @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
+    def test_webhook_signal_metadata_ready(self, mock_send, orchestrator):
+        orch, s3, lam = orchestrator
+        meta = _make_text_meta()
+        lam.invoke.return_value = _lambda_invoke_response(200, {"abstract": "a"})
+
+        orch.process(bucket="bucket", key=None, meta=meta)
+
+        payload = mock_send.call_args[0][2]
+        assert payload["signal"] == "metadata_ready"
+        assert payload["item_id"] == "ITEM-100"
+        assert payload["ou"] == "PES"
+
+    def test_direct_invocation_without_input_text_raises(self, orchestrator):
+        orch, s3, lam = orchestrator
+        meta = _make_text_meta()
+        del meta["input_text"]
+
+        with pytest.raises(ValueError, match="input_text"):
+            orch.process(bucket="bucket", key=None, meta=meta)
+
+
+class TestCC858BackwardCompat:
+    """AC5: Existing meta.json without new fields works identically."""
+
+    def test_existing_pdf_flow_unchanged(self, orchestrator):
+        orch, s3, lam = orchestrator
+        meta = _make_meta(ai_enabled=True)
+        s3.get_object.return_value = _s3_get_object_response(meta)
+
+        extraction_body = {"text": "text", "page_count": 5, "extraction_method": "extract_text"}
+        bedrock_body = {"abstract": "a", "keywords": [], "learning_level": "Expert"}
+        lam.invoke.side_effect = [
+            _lambda_invoke_response(200, extraction_body),
+            _lambda_invoke_response(200, bedrock_body),
+        ]
+
+        result = orch.process("bucket", "PES/pending/STD-12345.pdf")
+
+        assert result["action"] == "enriched"
+        assert lam.invoke.call_count == 2  # extraction + Bedrock
+        bedrock_payload = json.loads(lam.invoke.call_args_list[1][1]["Payload"])
+        assert "requested_fields" not in bedrock_payload
+
+
+class TestCC858Validation:
+    """AC6: Validation of new meta fields."""
+
+    def test_invalid_input_text_mode_raises(self, orchestrator):
+        orch, s3, lam = orchestrator
+        meta = _make_text_meta(input_text_mode="invalid_mode")
+        s3.get_object.return_value = _s3_get_object_response(meta)
+
+        with pytest.raises(ValueError, match="input_text_mode"):
+            orch.process("bucket", "PES/pending/ITEM-100.pdf")
+
+    def test_invalid_requested_fields_raises(self, orchestrator):
+        orch, s3, lam = orchestrator
+        meta = _make_text_meta(requested_fields=["not_a_field"])
+        s3.get_object.return_value = _s3_get_object_response(meta)
+
+        with pytest.raises(ValueError, match="requested_fields"):
+            orch.process("bucket", "PES/pending/ITEM-100.pdf")
+
+    def test_empty_requested_fields_raises(self, orchestrator):
+        orch, s3, lam = orchestrator
+        meta = _make_text_meta(requested_fields=[])
+        s3.get_object.return_value = _s3_get_object_response(meta)
+
+        with pytest.raises(ValueError, match="non-empty"):
+            orch.process("bucket", "PES/pending/ITEM-100.pdf")
+
+
+# ---------------------------------------------------------------
+# Webhook contract (CC3-931 + CC3-952 follow-up)
+#
+# Request shape: Bedrock output goes under the `data` key — what Drupal's
+# WebhookController.aiEnrichment() reads at line 286 (`$data['data']`).
+# Verified against the cc3-772 epic and confirmed on master.
+#
+# Response shape: Drupal returns one of two body shapes on 2xx:
+#   - {"success": True, "message": "Webhook processed successfully."}
+#       healthy apply
+#   - {"success": True, "ignored": True, "message": "..."}
+#       stale-webhook guard rejected a duplicate/late callback
+# Drupal has never emitted `updated_fields` or `field_ai_processed`;
+# the original CC3-931 validator looked for them and produced false-
+# positive ERRORs on every webhook. Replaced per CC3-952 forensics.
+# ---------------------------------------------------------------
+
+class TestWebhookContract:
+    @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
+    def test_payload_uses_data_key_with_bedrock_fields(self, mock_send, orchestrator):
+        orch, s3, lam = orchestrator
+        meta = _make_meta(ai_enabled=True, callback_url="https://drupal.example.com/hook")
+        s3.get_object.return_value = _s3_get_object_response(meta)
+
+        bedrock_body = {
+            "abstract": "An IEEE paper about X.",
+            "keywords": ["alpha", "beta"],
+            "learning_level": "Expert",
+            "intended_audience": "Seasoned Engineering Professional",
+            "category": "Research",
+        }
+        lam.invoke.side_effect = [
+            _lambda_invoke_response(200, {"text": "extracted", "page_count": 5, "extraction_method": "extract_text"}),
+            _lambda_invoke_response(200, bedrock_body),
+        ]
+
+        orch.process("bucket", "PES/pending/STD-12345.pdf")
+
+        payload = mock_send.call_args[0][2]
+        # CC3-952: Bedrock output is keyed under "data" — what Drupal's
+        # WebhookController reads. CC3-931 briefly renamed to "metadata"
+        # based on a misread of the Drupal spec; reverted here.
+        assert "data" in payload
+        assert "metadata" not in payload
+        assert payload["data"]["abstract"] == "An IEEE paper about X."
+        assert payload["data"]["keywords"] == ["alpha", "beta"]
+        assert payload["data"]["learning_level"] == "Expert"
+        assert payload["data"]["category"] == "Research"
+        assert sorted(payload["generated_fields"]) == [
+            "abstract", "category", "intended_audience", "keywords", "learning_level",
+        ]
+
+    @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
+    def test_response_validator_passed_to_sender(self, mock_send, orchestrator):
+        orch, s3, lam = orchestrator
+        meta = _make_meta(ai_enabled=True, callback_url="https://drupal.example.com/hook")
+        s3.get_object.return_value = _s3_get_object_response(meta)
+        lam.invoke.side_effect = [
+            _lambda_invoke_response(200, {"text": "extracted", "page_count": 5, "extraction_method": "extract_text"}),
+            _lambda_invoke_response(200, {"abstract": "a", "keywords": []}),
+        ]
+
+        orch.process("bucket", "PES/pending/STD-12345.pdf")
+
+        validator = mock_send.call_args.kwargs.get("response_validator")
+        assert validator is not None
+
+        # Healthy ack — Drupal applied the metadata.
+        ok, _ = validator({"success": True, "message": "Webhook processed successfully."})
+        assert ok is True
+
+        # Stale-webhook guard fired (item already past awaiting_*) — surface
+        # via SNS DLQ so it can be investigated.
+        bad, reason = validator(
+            {"success": True, "ignored": True, "message": "Webhook ignored: item is no longer awaiting AI processing."}
+        )
+        assert bad is False
+        assert "ignored" in reason.lower()
+
+        # success: False — Drupal reached the controller but failed to apply.
+        bad, reason = validator({"success": False, "message": "something went wrong"})
+        assert bad is False
+        assert "success=" in reason
+
+        # Missing `success` key entirely — fail closed.
+        bad, _ = validator({"message": "Webhook processed successfully."})
+        assert bad is False
+
+        # Non-dict body — fail closed.
+        bad, _ = validator(None)
+        assert bad is False
+        bad, _ = validator("not a dict")
+        assert bad is False
+
+
+# ---------------------------------------------------------------
+# CC3-952: extraction.extraction_method webhook contract
+#
+# Drupal's WebhookController accepts only {transcribe, extract_text, ocr,
+# failed} for extraction.extraction_method. Anything else is reported as
+# `(missing)` and every AI field is silently dropped. These tests pin the
+# contract end-to-end across every extraction path.
+# ---------------------------------------------------------------
+
+
+VALID_EXTRACTION_METHODS = {"transcribe", "extract_text", "ocr", "failed"}
+
+
+class TestExtractionMethodContract:
+    @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
+    def test_pdf_success_emits_extract_text(self, mock_send, orchestrator):
+        orch, s3, lam = orchestrator
+        meta = _make_meta(ai_enabled=True, callback_url="https://drupal.example.com/hook")
+        s3.get_object.return_value = _s3_get_object_response(meta)
+        lam.invoke.side_effect = [
+            _lambda_invoke_response(200, {"text": "extracted", "page_count": 5, "extraction_method": "extract_text"}),
+            _lambda_invoke_response(200, {"abstract": "a", "keywords": [], "learning_level": "Expert"}),
+        ]
+
+        orch.process("bucket", "PES/pending/STD-12345.pdf")
+
+        payload = mock_send.call_args[0][2]
+        assert payload["extraction"]["extraction_method"] == "extract_text"
+        assert payload["extraction"]["extraction_method"] in VALID_EXTRACTION_METHODS
+
+    @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
+    def test_pdf_scanned_emits_ocr(self, mock_send, orchestrator):
+        orch, s3, lam = orchestrator
+        meta = _make_meta(ai_enabled=True, callback_url="https://drupal.example.com/hook")
+        s3.get_object.return_value = _s3_get_object_response(meta)
+        lam.invoke.side_effect = [
+            _lambda_invoke_response(200, {"text": "", "page_count": 10, "extraction_method": "ocr"}),
+        ]
+
+        orch.process("bucket", "PES/pending/STD-12345.pdf")
+
+        payload = mock_send.call_args[0][2]
+        assert payload["extraction"]["extraction_method"] == "ocr"
+
+    @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
+    def test_pdf_failed_emits_failed(self, mock_send, orchestrator):
+        orch, s3, lam = orchestrator
+        meta = _make_meta(ai_enabled=True, callback_url="https://drupal.example.com/hook")
+        s3.get_object.return_value = _s3_get_object_response(meta)
+        lam.invoke.side_effect = [
+            _lambda_invoke_response(200, {"text": "", "page_count": 0, "extraction_method": "failed"}),
+        ]
+
+        orch.process("bucket", "PES/pending/STD-12345.pdf")
+
+        payload = mock_send.call_args[0][2]
+        assert payload["extraction"]["extraction_method"] == "failed"
+
+    @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
+    def test_pptx_success_emits_extract_text(self, mock_send, orchestrator):
+        orch, s3, lam = orchestrator
+        meta = _make_meta(ai_enabled=True, media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation", callback_url="https://drupal.example.com/hook")
+        s3.get_object.return_value = _s3_get_object_response(meta)
+        lam.invoke.side_effect = [
+            _lambda_invoke_response(200, {"text": "slide content", "slide_count": 3, "extraction_method": "extract_text"}),
+            _lambda_invoke_response(200, {"abstract": "a", "keywords": [], "learning_level": "Expert"}),
+        ]
+
+        orch.process("bucket", "PES/pending/STD-12345.pptx")
+
+        payload = mock_send.call_args[0][2]
+        assert payload["extraction"]["extraction_method"] == "extract_text"
+
+    @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
+    def test_pptx_empty_emits_extract_text_with_empty_text(self, mock_send, orchestrator):
+        orch, s3, lam = orchestrator
+        meta = _make_meta(ai_enabled=True, media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation", callback_url="https://drupal.example.com/hook")
+        s3.get_object.return_value = _s3_get_object_response(meta)
+        lam.invoke.side_effect = [
+            _lambda_invoke_response(200, {"text": "", "slide_count": 5, "extraction_method": "extract_text"}),
+        ]
+
+        orch.process("bucket", "PES/pending/STD-12345.pptx")
+
+        payload = mock_send.call_args[0][2]
+        assert payload["extraction"]["extraction_method"] == "extract_text"
+        assert payload["extraction"]["text"] == ""
+
+    @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
+    def test_video_success_emits_transcribe(self, mock_send, orchestrator):
+        orch, s3, lam = orchestrator
+        meta = _make_meta(ai_enabled=True, media_type="video/mp4", callback_url="https://drupal.example.com/hook")
+        meta["content"]["filename"] = "lecture.mp4"
+        s3.get_object.return_value = _s3_get_object_response(meta)
+        lam.invoke.side_effect = [
+            _lambda_invoke_response(200, {"transcript": "hi", "duration": "00:01:00", "duration_seconds": 60, "speaker_count": 1, "extraction_method": "transcribe"}),
+            _lambda_invoke_response(200, {"abstract": "a", "keywords": [], "learning_level": "Expert"}),
+        ]
+
+        orch.process("bucket", "PES/pending/lecture.mp4")
+
+        payload = mock_send.call_args[0][2]
+        assert payload["extraction"]["extraction_method"] == "transcribe"
+
+    @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
+    def test_input_text_path_omits_extraction_block(self, mock_send, orchestrator):
+        orch, s3, lam = orchestrator
+        meta = _make_text_meta(input_text_mode="as_source")
+        s3.get_object.return_value = _s3_get_object_response(meta)
+        lam.invoke.return_value = _lambda_invoke_response(200, {"abstract": "a", "keywords": []})
+
+        orch.process("bucket", "PES/pending/ITEM-100.pdf")
+
+        payload = mock_send.call_args[0][2]
+        assert payload["signal"] == "metadata_ready"
+        assert "extraction" not in payload
+
+    @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
+    def test_normalization_guard_coerces_unknown_to_failed(self, mock_send, orchestrator, caplog):
+        """A new/forgotten extractor leaking a non-canonical value must not
+        silently drop the item — the guard coerces to 'failed' and warns."""
+        orch, s3, lam = orchestrator
+        meta = _make_meta(ai_enabled=True, callback_url="https://drupal.example.com/hook")
+        s3.get_object.return_value = _s3_get_object_response(meta)
+        lam.invoke.side_effect = [
+            _lambda_invoke_response(200, {"text": "x", "page_count": 1, "extraction_method": "bogus_value"}),
+            _lambda_invoke_response(200, {"abstract": "a", "keywords": []}),
+        ]
+
+        with caplog.at_level("WARNING"):
+            orch.process("bucket", "PES/pending/STD-12345.pdf")
+
+        payload = mock_send.call_args[0][2]
+        assert payload["extraction"]["extraction_method"] == "failed"
+        assert any("bogus_value" in rec.message for rec in caplog.records)
+
+    @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
+    def test_normalization_guard_coerces_missing_to_failed(self, mock_send, orchestrator):
+        """An extractor that returns a body without extraction_method (e.g. a
+        legacy or partially-deployed Lambda) is coerced to 'failed' so Drupal
+        gets a valid value rather than `(missing)`."""
+        orch, s3, lam = orchestrator
+        meta = _make_meta(ai_enabled=True, callback_url="https://drupal.example.com/hook")
+        s3.get_object.return_value = _s3_get_object_response(meta)
+        lam.invoke.side_effect = [
+            _lambda_invoke_response(200, {"text": "x", "page_count": 1}),
+            _lambda_invoke_response(200, {"abstract": "a", "keywords": []}),
+        ]
+
+        orch.process("bucket", "PES/pending/STD-12345.pdf")
+
+        payload = mock_send.call_args[0][2]
+        assert payload["extraction"]["extraction_method"] == "failed"
+
+
+# ---------------------------------------------------------------
+# Webhook secret resolution (CC3-900)
+#
+# Mirrors the policy in src/transfer/wizard_transfer.py: Secrets Manager
+# first, DRUPAL_WEBHOOK_SECRET env-var fallback. These tests exercise
+# _resolve_webhook_secret directly rather than the full process() flow
+# so each policy branch is asserted in isolation.
+# ---------------------------------------------------------------
+
+class TestWebhookSecretResolution:
+    def _build(self, secrets_client):
+        return AIOrchestrator(
+            s3_client=MagicMock(),
+            lambda_client=MagicMock(),
+            sns_client=MagicMock(),
+            secrets_client=secrets_client,
+        )
+
+    def test_uses_secrets_manager_value_when_present(self):
+        secrets = MagicMock()
+        secrets.get_secret_value.return_value = {"SecretString": "secret-from-sm"}
+
+        orch = self._build(secrets)
+        result = orch._resolve_webhook_secret("[corr]")
+
+        assert result == "secret-from-sm"
+        secrets.get_secret_value.assert_called_once_with(
+            SecretId="iplr/webhook-secret"
+        )
+
+    def test_falls_back_to_env_when_resource_not_found(self, monkeypatch):
+        monkeypatch.setenv("DRUPAL_WEBHOOK_SECRET", "env-fallback")
+        secrets = MagicMock()
+        secrets.get_secret_value.side_effect = _client_error(
+            "ResourceNotFoundException", "no such secret"
+        )
+
+        orch = self._build(secrets)
+        assert orch._resolve_webhook_secret("[corr]") == "env-fallback"
+
+    def test_falls_back_to_env_when_access_denied(self, monkeypatch):
+        # IAM not yet propagated, or the role hasn't been redeployed with
+        # secretsmanager:GetSecretValue — pre-CC3-900 prod scenario.
+        monkeypatch.setenv("DRUPAL_WEBHOOK_SECRET", "env-fallback")
+        secrets = MagicMock()
+        secrets.get_secret_value.side_effect = _client_error(
+            "AccessDeniedException", "denied"
+        )
+
+        orch = self._build(secrets)
+        assert orch._resolve_webhook_secret("[corr]") == "env-fallback"
+
+    def test_falls_back_to_env_when_secrets_manager_returns_empty(self, monkeypatch):
+        # Secret exists in SM but its value is empty — treat as miss.
+        monkeypatch.setenv("DRUPAL_WEBHOOK_SECRET", "env-fallback")
+        secrets = MagicMock()
+        secrets.get_secret_value.return_value = {"SecretString": ""}
+
+        orch = self._build(secrets)
+        assert orch._resolve_webhook_secret("[corr]") == "env-fallback"
+
+    def test_returns_empty_when_neither_source_available(self, monkeypatch):
+        monkeypatch.delenv("DRUPAL_WEBHOOK_SECRET", raising=False)
+        secrets = MagicMock()
+        secrets.get_secret_value.side_effect = _client_error(
+            "ResourceNotFoundException", "no such secret"
+        )
+
+        orch = self._build(secrets)
+        # Returns empty rather than raising; webhook will then HMAC-sign
+        # with empty key and Drupal will return 401, which WebhookSender
+        # treats as a permanent failure (the correct outcome).
+        assert orch._resolve_webhook_secret("[corr]") == ""
+
+    def test_honors_webhook_secret_ref_env_override(self, monkeypatch):
+        # Operators must be able to point the orchestrator at a different
+        # SM key (e.g. per-tenant rotation) without code changes.
+        monkeypatch.setenv("WEBHOOK_SECRET_REF", "tenants/acme/webhook-secret")
+        # Force module-constant re-read by reimporting.
+        import importlib
+        import src.orchestrator.ai_orchestrator as orch_module
+        importlib.reload(orch_module)
+
+        secrets = MagicMock()
+        secrets.get_secret_value.return_value = {"SecretString": "tenant-secret"}
+
+        orch = orch_module.AIOrchestrator(
+            s3_client=MagicMock(),
+            lambda_client=MagicMock(),
+            sns_client=MagicMock(),
+            secrets_client=secrets,
+        )
+
+        assert orch._resolve_webhook_secret("[corr]") == "tenant-secret"
+        secrets.get_secret_value.assert_called_once_with(
+            SecretId="tenants/acme/webhook-secret"
+        )
+
+        # Restore module state for subsequent tests.
+        monkeypatch.delenv("WEBHOOK_SECRET_REF")
+        importlib.reload(orch_module)
+
+
+# ---------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------
 
-def _client_error(code, message="Error"):
+def _client_error(code, message="Error", operation="GetObject"):
     from botocore.exceptions import ClientError
     return ClientError(
         {"Error": {"Code": code, "Message": message}},
-        "GetObject",
+        operation,
     )

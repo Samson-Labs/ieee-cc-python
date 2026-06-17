@@ -21,6 +21,7 @@ python -m pytest tests/webhook/test_sender.py -v
 python -m pytest tests/common/ -v
 python -m pytest tests/dlq/test_dlq_processor.py -v
 python -m pytest tests/bulk/ -v
+python -m pytest tests/transfer/ -v
 
 # Run a single test class or method
 python -m pytest tests/extractors/test_pdf_extractor.py::TestNormalPDF::test_extracts_text -v
@@ -34,35 +35,41 @@ pip install -r requirements.txt -r requirements-dev.txt
 ./scripts/invoke.sh <bucket> <key> <ou> <product_part_number>
 ./scripts/teardown.sh
 
-# Image Overlay Generator Lambda
-./scripts/deploy-image-overlay.sh          # first-time full deploy
-./scripts/deploy-image-overlay.sh update   # rebuild + update code only
+# Image Overlay Generator Lambda    (env = dev | staging)
+./scripts/deploy-image-overlay.sh <env>          # first-time full deploy
+./scripts/deploy-image-overlay.sh <env> update   # rebuild + update code only
 ./scripts/invoke-image-overlay.sh <bucket> <key>
 ./scripts/teardown-image-overlay.sh
 
-# Bedrock Metadata Generation Lambda
-./scripts/deploy-bedrock.sh                # first-time full deploy
-./scripts/deploy-bedrock.sh update         # rebuild + update code only
-./scripts/invoke-bedrock.sh <bucket> <key> # S3 metadata reference
-./scripts/invoke-bedrock.sh --text "text"  # direct text invocation
+# Bedrock Metadata Generation Lambda    (env = dev | staging)
+./scripts/deploy-bedrock.sh <env>                # first-time full deploy
+./scripts/deploy-bedrock.sh <env> update         # rebuild + update code only
+./scripts/invoke-bedrock.sh <bucket> <key>       # S3 metadata reference
+./scripts/invoke-bedrock.sh --text "text"        # direct text invocation
 ./scripts/teardown-bedrock.sh
 
-# Video Transcriber Lambda
-./scripts/deploy-video-transcriber.sh          # first-time full deploy
-./scripts/deploy-video-transcriber.sh update   # rebuild + update code only
+# Video Transcriber Lambda    (env = dev | staging)
+./scripts/deploy-video-transcriber.sh <env>          # first-time full deploy
+./scripts/deploy-video-transcriber.sh <env> update   # rebuild + update code only
 ./scripts/invoke-video-transcriber.sh <bucket> <key> <ou> <product_part_number>
 ./scripts/teardown-video-transcriber.sh
 
-# AI Orchestrator Lambda
-./scripts/deploy-ai-orchestrator.sh            # first-time full deploy
-./scripts/deploy-ai-orchestrator.sh update     # rebuild + update code only
+# AI Orchestrator Lambda    (env = dev | staging)
+./scripts/deploy-ai-orchestrator.sh <env>            # first-time full deploy
+./scripts/deploy-ai-orchestrator.sh <env> update     # rebuild + update code only
 ./scripts/invoke-ai-orchestrator.sh <bucket> <key>
 ./scripts/teardown-ai-orchestrator.sh
 
-# DLQ Processor Lambda
-./scripts/deploy-dlq-processor.sh              # first-time full deploy
-./scripts/deploy-dlq-processor.sh update       # rebuild + update code only
-./scripts/invoke-dlq-processor.sh              # test with sample DLQ event
+# PPTX Extractor Lambda    (env = dev | staging)
+./scripts/deploy-pptx-extractor.sh <env>             # first-time full deploy
+./scripts/deploy-pptx-extractor.sh <env> update      # rebuild + update code only
+./scripts/invoke-pptx-extractor.sh <bucket> <key>
+./scripts/teardown-pptx-extractor.sh
+
+# DLQ Processor Lambda    (env = dev | staging)
+./scripts/deploy-dlq-processor.sh <env>              # first-time full deploy
+./scripts/deploy-dlq-processor.sh <env> update       # rebuild + update code only
+./scripts/invoke-dlq-processor.sh                    # test with sample DLQ event
 ./scripts/teardown-dlq-processor.sh
 
 # Bulk Processor Lambda (manifest dispatcher)
@@ -76,7 +83,20 @@ pip install -r requirements.txt -r requirements-dev.txt
 ./scripts/deploy-bulk-worker.sh update         # rebuild + update code only
 ./scripts/invoke-bulk-worker.sh                # test with sample bulk item
 ./scripts/teardown-bulk-worker.sh
+
+# Wizard Async Transfer Lambda (CC3-898 — Drive/URL streaming into S3)
+./scripts/deploy-wizard-transfer.sh            # first-time full deploy
+./scripts/deploy-wizard-transfer.sh update     # rebuild + update code only
+./scripts/invoke-wizard-transfer.sh <bucket> <key>
+./scripts/teardown-wizard-transfer.sh
 ```
+
+> **Note (CC3-886 transition):** `deploy-*.sh` scripts marked `(env = dev | staging)` create
+> env-suffixed Lambdas/roles (e.g. `ieee-rc-ai-orchestrator-dev`). The corresponding
+> `invoke-*.sh` and `teardown-*.sh` scripts have **not** been updated and still target the
+> legacy unsuffixed names. Until they are updated (separate ticket), prefer
+> `aws lambda invoke --function-name <env-suffixed-name>` for direct invokes against the new
+> Lambdas, and use the AWS Console / CLI for teardown of env-suffixed resources.
 
 ## Architecture
 
@@ -88,6 +108,7 @@ pip install -r requirements.txt -r requirements-dev.txt
 - **`src/dlq/`** — DLQ processor module. `DLQProcessor` reads failed events from SQS, re-invokes the orchestrator for retriable errors (up to 2 reprocess attempts), and archives permanently failed messages to S3 with SNS alerting. Contains its own `Dockerfile` and `requirements.txt`.
 - **`src/bulk/`** — Bulk processing modules for existing catalog re-tagging. `BulkProcessor` reads a batch manifest from S3 and fans out items to an SQS queue with configurable delay. `BulkWorker` processes individual items from SQS by copying files to `/pending/`, creating `.meta.json`, and invoking the orchestrator Lambda. Tracks progress in S3 and sends SNS on batch completion. Contains its own Dockerfiles and `requirements.txt`.
 - **`src/orchestrator/`** — AI Orchestrator module. `AIOrchestrator` reads `.meta.json` for uploaded files, routes based on `ai_enrichment_enabled` flag: dispatches to PDF extractor or video transcriber, invokes Bedrock for metadata, sends webhook to Drupal, and moves files from `/pending/` to `/processed/`. Contains its own `Dockerfile` and `requirements.txt`.
+- **`src/transfer/`** — Wizard async transfer module (CC3-898 / CC3-896 companion). `WizardTransfer` reads a `transfer-actions/*.json` trigger, streams Google Drive (with OAuth token from Secrets Manager) or URL bytes into S3 via multipart upload, and POSTs an HMAC-signed callback to Drupal. Contracts in `docs/contracts/transfer-trigger-v1.json` and `docs/contracts/transfer-callback-v1.json` (must stay byte-identical with the same files in `Samson-Labs/ieee-cc`).
 - **`src/handlers/`** — Lambda entry points. Each handler wraps an extractor, generator, inference, or orchestrator module, parses the event, and returns a structured response.
 - **`scripts/`** — AWS CLI deployment scripts (per-Lambda: `deploy-*.sh`, `invoke-*.sh`, `teardown-*.sh`).
 - **`tests/`** — Mirrors `src/` structure. Tests use in-memory assets and mock S3 via `unittest.mock`.
@@ -109,6 +130,7 @@ Docker-based Lambdas deployed via AWS CLI (no CDK/SAM). Each Lambda has its own 
 | ECR | `ieee-rc-dlq-processor` | DLQ processor |
 | ECR | `ieee-rc-bulk-processor` | Bulk manifest dispatcher |
 | ECR | `ieee-rc-bulk-worker` | Bulk per-item worker |
+| ECR | `ieee-rc-wizard-transfer` | Wizard async transfer (CC3-898) |
 | Lambda | `ieee-cc-pdf-extractor` | 3 GB, 5 min timeout, Python 3.13 |
 | Lambda | `ieee-rc-image-generator` | 1024 MB, 60s timeout, Python 3.12 |
 | Lambda | `ieee-cc-bedrock-inference` | 512 MB, 120s timeout, Python 3.13 |
@@ -117,6 +139,7 @@ Docker-based Lambdas deployed via AWS CLI (no CDK/SAM). Each Lambda has its own 
 | Lambda | `ieee-rc-dlq-processor` | 256 MB, 60s timeout, Python 3.13 |
 | Lambda | `ieee-rc-bulk-processor` | 512 MB, 5 min timeout, Python 3.13 |
 | Lambda | `ieee-rc-bulk-worker` | 512 MB, 5 min timeout, Python 3.13 |
+| Lambda | `ieee-rc-wizard-transfer` | 1024 MB, 15 min timeout, Python 3.13 |
 | IAM Role | `ieee-cc-pdf-extractor-role` | S3 read/write + CloudWatch |
 | IAM Role | `ieee-rc-image-generator-role` | S3 read/write/delete + CloudWatch |
 | IAM Role | `ieee-cc-bedrock-inference-role` | S3 read + Bedrock invoke + CloudWatch |
@@ -125,11 +148,13 @@ Docker-based Lambdas deployed via AWS CLI (no CDK/SAM). Each Lambda has its own 
 | IAM Role | `ieee-rc-dlq-processor-role` | Lambda invoke + S3 write (failed/) + SNS publish + SQS receive + CloudWatch |
 | IAM Role | `ieee-rc-bulk-processor-role` | S3 read (manifests) + S3 write (progress) + SQS send + SNS publish + CloudWatch |
 | IAM Role | `ieee-rc-bulk-worker-role` | Lambda invoke + S3 read/write (pending, metadata, progress) + SNS publish + SQS receive + CloudWatch |
+| IAM Role | `ieee-rc-wizard-transfer-role` | S3 read/delete (transfer-actions/) + S3 write/multipart (any) + SecretsManager read (iplr/drive-tokens/*, iplr/webhook-secret*) + SNS publish + SQS send (DLQ) + CloudWatch |
 | SQS Queue | `ieee-rc-processing-dlq` | DLQ for failed pipeline events |
 | SQS Queue | `ieee-rc-bulk-processing-queue` | Bulk re-tagging work queue (MaxConcurrency 10) |
 | SQS Trigger | `ieee-rc-processing-dlq` | -> `ieee-rc-dlq-processor` (batch size 1) |
 | SQS Trigger | `ieee-rc-bulk-processing-queue` | -> `ieee-rc-bulk-worker` (batch size 1, MaxConcurrency 10) |
 | S3 Trigger | `actions/*.json` | -> `ieee-rc-image-generator` |
+| S3 Trigger | `transfer-actions/*.json` | -> `ieee-rc-wizard-transfer` |
 
 ### S3 Path Conventions
 
@@ -143,8 +168,11 @@ Docker-based Lambdas deployed via AWS CLI (no CDK/SAM). Each Lambda has its own 
 - Meta config: `{ou}/metadata/{item_id}.meta.json`
 - Processed output: `{ou}/processed/{item_id}.{ext}`
 - DLQ archive: `failed/{correlation_id}/{timestamp}.json`
+- WebVTT subtitle (transcribe output): `transcribe-output/{job_name}.vtt`
+- WebVTT subtitle (orchestrator copy): `{ou}/subtitles/{product_part_number}.vtt`
 - Bulk manifest: `bulk/manifests/{batch_id}.json`
 - Bulk progress: `bulk/progress/{batch_id}_progress.json`
+- Wizard transfer trigger: `transfer-actions/{request_id}-{item_id}-{operation}.json`
 
 ### Key Conventions
 

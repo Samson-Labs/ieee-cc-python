@@ -17,8 +17,9 @@ logger = get_json_logger(__name__)
 DEFAULT_BUCKET = os.environ.get("S3_BUCKET", "dev-ieee-conference-cloud-bulk-uploads")
 
 REQUIRED_MANIFEST_FIELDS = {"batch_id", "callback_url", "items"}
-REQUIRED_ITEM_FIELDS = {"item_id", "request_id", "s3_key", "media_type", "resource_center"}
+ALWAYS_REQUIRED_ITEM_FIELDS = {"item_id", "resource_center"}
 VALID_MEDIA_TYPES = {"PDF", "MP4", "MOV", "WEBM"}
+VALID_INPUT_TEXT_MODES = frozenset({"as_source", "as_abstract"})
 
 # Estimated per-item costs (USD) for logging purposes.
 COST_ESTIMATES = {
@@ -26,6 +27,7 @@ COST_ESTIMATES = {
     "MP4": 0.03,     # Transcribe + Bedrock inference
     "MOV": 0.03,
     "WEBM": 0.03,
+    "text": 0.005,   # Bedrock inference only, no extraction
 }
 
 
@@ -112,17 +114,117 @@ class BulkProcessor:
         if not isinstance(items, list) or len(items) == 0:
             raise ValidationError("Manifest 'items' must be a non-empty list")
 
+        # Item-validation contract:
+        #   ALWAYS REQUIRED:       {item_id, resource_center}
+        #   WHEN s3_key PRESENT:   media_type ∈ VALID_MEDIA_TYPES;
+        #                          source_bucket non-empty if provided;
+        #                          product_part_number non-empty string
+        #   WHEN s3_key EMPTY:     input_text non-empty
+        # Empty/absent values for context-dependent fields are tolerated
+        # (Strategy A items emit input_text="" by design; text-only items
+        # emit source_bucket="" because there's no source to fetch).
+        # product_part_number is the canonical S3-layout key for
+        # {ou}/processed/{PPN}.{ext}, {ou}/subtitles/{PPN}.vtt, etc.
+        # (CC3-1001: required to avoid last-write-wins collisions when
+        # bulk batches share a synthesized id).
         for i, item in enumerate(items):
-            item_missing = REQUIRED_ITEM_FIELDS - set(item.keys())
+            # Always-required fields
+            item_missing = ALWAYS_REQUIRED_ITEM_FIELDS - set(item.keys())
             if item_missing:
                 raise ValidationError(
                     f"Item {i} missing required fields: {sorted(item_missing)}"
                 )
-            if item["media_type"] not in VALID_MEDIA_TYPES:
+
+            # Use consistent truthiness checks (matches BulkWorker routing)
+            has_file = bool(item.get("s3_key"))
+            input_text = item.get("input_text")
+            if input_text is not None and not isinstance(input_text, str):
                 raise ValidationError(
-                    f"Item {i} has invalid media_type '{item['media_type']}'; "
-                    f"expected one of {sorted(VALID_MEDIA_TYPES)}"
+                    f"Item {i} 'input_text' must be a string"
                 )
+            has_text = isinstance(input_text, str) and bool(input_text.strip())
+
+            # Must have at least one of s3_key or input_text — the only
+            # real "no content" failure case. Strict-empty checks for
+            # input_text/input_text_mode/source_bucket are gated on
+            # has_file below so file-bearing items (Strategy A) aren't
+            # rejected for sending the empty-string sentinels that the
+            # Drupal builder emits for inapplicable fields.
+            if not has_file and not has_text:
+                raise ValidationError(
+                    f"Item {i} must have at least one of 's3_key' or 'input_text'"
+                )
+
+            # File items: media_type must be valid; source_bucket if
+            # present must be non-empty (the worker would otherwise issue
+            # an S3 CopyObject with an empty source bucket name).
+            if has_file:
+                if "media_type" not in item:
+                    raise ValidationError(
+                        f"Item {i} has 's3_key' but missing 'media_type'"
+                    )
+                if item["media_type"] not in VALID_MEDIA_TYPES:
+                    raise ValidationError(
+                        f"Item {i} has invalid media_type '{item['media_type']}'; "
+                        f"expected one of {sorted(VALID_MEDIA_TYPES)}"
+                    )
+                ppn = item.get("product_part_number")
+                if not isinstance(ppn, str) or not ppn.strip():
+                    raise ValidationError(
+                        f"Item {i} has 's3_key' but missing or empty "
+                        f"'product_part_number' (required for canonical "
+                        f"S3 layout — see CC3-1001)"
+                    )
+
+            # source_bucket: validate type if the key is present (null
+            # would otherwise propagate through worker.get(...,bucket) as
+            # None and break S3 CopyObject). Non-empty enforced only for
+            # file items, where the worker actually uses it.
+            if "source_bucket" in item:
+                source_bucket = item["source_bucket"]
+                if not isinstance(source_bucket, str):
+                    raise ValidationError(
+                        f"Item {i} 'source_bucket' must be a string"
+                    )
+                if has_file and not source_bucket.strip():
+                    raise ValidationError(
+                        f"Item {i} 'source_bucket' must be non-empty when "
+                        f"'s3_key' is set"
+                    )
+
+            # input_text_mode: empty string is a Drupal sentinel for "not
+            # applicable" — tolerated only when there's no input_text to
+            # operate on (Strategy A). When input_text IS provided, mode
+            # must be a valid non-empty member of VALID_INPUT_TEXT_MODES
+            # if the key is present (key absent is fine — the worker
+            # defaults to "as_source").
+            input_text_mode = item.get("input_text_mode")
+            if has_text:
+                if "input_text_mode" in item and input_text_mode not in VALID_INPUT_TEXT_MODES:
+                    raise ValidationError(
+                        f"Item {i} has invalid input_text_mode "
+                        f"'{input_text_mode}'; "
+                        f"expected one of {sorted(VALID_INPUT_TEXT_MODES)}"
+                    )
+            elif input_text_mode:
+                # Mode set (non-empty) but no text to apply it to.
+                raise ValidationError(
+                    f"Item {i} has 'input_text_mode' without 'input_text'"
+                )
+
+            requested_fields = item.get("requested_fields")
+            if requested_fields is not None:
+                if not isinstance(requested_fields, list) or not requested_fields:
+                    raise ValidationError(
+                        f"Item {i} 'requested_fields' must be a non-empty array"
+                    )
+                if any(
+                    not isinstance(field, str) or not field.strip()
+                    for field in requested_fields
+                ):
+                    raise ValidationError(
+                        f"Item {i} 'requested_fields' must contain only non-empty strings"
+                    )
 
     @staticmethod
     def _estimate_cost(items: list[dict]) -> dict:
@@ -130,7 +232,7 @@ class BulkProcessor:
         breakdown: dict[str, int] = {}
         total = 0.0
         for item in items:
-            media = item["media_type"]
+            media = item.get("media_type", "text")
             breakdown[media] = breakdown.get(media, 0) + 1
             total += COST_ESTIMATES.get(media, 0.01)
 

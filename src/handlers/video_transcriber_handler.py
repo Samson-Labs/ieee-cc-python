@@ -76,6 +76,8 @@ def handler(event: dict, context) -> dict:
             "duration": result["duration"],
             "duration_seconds": result["duration_seconds"],
             "speaker_count": result["speaker_count"],
+            "vtt_s3_key": result.get("vtt_s3_key", ""),
+            "extraction_method": result["extraction_method"],
         },
     }
 

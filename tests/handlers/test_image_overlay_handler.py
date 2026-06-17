@@ -154,3 +154,45 @@ class TestParseEvent:
     def test_wrong_prefix_raises(self):
         with pytest.raises(ValueError, match="does not match"):
             _parse_event({"bucket": "b", "key": "other/file.json"})
+
+
+# ---------------------------------------------------------------------------
+# CC3-906 callback fields surface in the response
+# ---------------------------------------------------------------------------
+
+
+class TestCallbackFieldsInResponse:
+    def test_callback_sent_true_propagates(self):
+        with patch("src.handlers.image_overlay_handler._generator") as mock:
+            mock.process_trigger.return_value = {
+                "output_key": "SPS/X.jpg",
+                "thumbnail_key": "",
+                "width": 800,
+                "height": 600,
+                "format": "jpg",
+                "bytes": 12345,
+                "s3_etag": "\"abc\"",
+                "callback_sent": True,
+            }
+            result = handler({"bucket": "b", "key": "actions/job.json"}, None)
+
+        assert result["statusCode"] == 200
+        assert result["body"]["callback_sent"] is True
+        assert result["body"]["s3_etag"] == "\"abc\""
+        assert result["body"]["bytes"] == 12345
+
+    def test_no_callback_fields_in_response_when_absent(self):
+        """Pre-CC3-906 result shape (no callback_sent/s3_etag/bytes) still works."""
+        with patch("src.handlers.image_overlay_handler._generator") as mock:
+            mock.process_trigger.return_value = {
+                "output_key": "SPS/X.jpg",
+                "thumbnail_key": "",
+                "width": 800,
+                "height": 600,
+                "format": "jpg",
+            }
+            result = handler({"bucket": "b", "key": "actions/job.json"}, None)
+
+        assert result["statusCode"] == 200
+        assert "callback_sent" not in result["body"]
+        assert "s3_etag" not in result["body"]

@@ -15,7 +15,7 @@ def _valid_manifest(item_count: int = 2) -> dict:
     items = [
         {
             "item_id": 100 + i,
-            "request_id": i,
+            "product_part_number": f"PESPAPER{i:03d}",
             "s3_key": f"PES/archive/paper-{i}.pdf",
             "media_type": "PDF",
             "resource_center": "PES",
@@ -71,7 +71,7 @@ class TestManifestValidation:
         del manifest["items"][0]["media_type"]
         s3_mock.get_object.return_value = _s3_manifest_response(manifest)
 
-        with pytest.raises(ValidationError, match="Item 0 missing"):
+        with pytest.raises(ValidationError, match="missing 'media_type'"):
             proc.process_manifest("bucket", "test")
 
     def test_invalid_media_type(self, processor):
@@ -100,6 +100,325 @@ class TestManifestValidation:
             proc.process_manifest("bucket", "bad-json")
 
 
+# --- CC3-860: Backfill validation ---
+
+
+def _text_only_manifest():
+    return {
+        "batch_id": "backfill-001",
+        "callback_url": "https://example.com/webhook",
+        "items": [
+            {
+                "item_id": 200,
+                "resource_center": "PES",
+                "input_text": "User-provided abstract text.",
+                "input_text_mode": "as_abstract",
+                "requested_fields": ["keywords", "category"],
+            }
+        ],
+    }
+
+
+class TestBackfillValidation:
+    def test_text_only_item_accepted(self, processor):
+        proc, s3_mock, sqs_mock, _ = processor
+        manifest = _text_only_manifest()
+        s3_mock.get_object.return_value = _s3_manifest_response(manifest)
+        s3_mock.exceptions.NoSuchKey = type("NoSuchKey", (Exception,), {})
+
+        with patch.dict("os.environ", {"BULK_QUEUE_URL": "https://sqs/q"}):
+            result = proc.process_manifest("bucket", "backfill-001")
+
+        assert result["total_items"] == 1
+        assert result["published_count"] == 1
+
+    def test_hybrid_item_accepted(self, processor):
+        proc, s3_mock, sqs_mock, _ = processor
+        manifest = {
+            "batch_id": "hybrid-001",
+            "callback_url": "https://example.com/webhook",
+            "items": [{
+                "item_id": 300,
+                "product_part_number": "PESHYBRID300",
+                "s3_key": "PES/archive/paper.pdf",
+                "media_type": "PDF",
+                "resource_center": "PES",
+                "input_text": "Existing abstract.",
+                "input_text_mode": "as_abstract",
+            }],
+        }
+        s3_mock.get_object.return_value = _s3_manifest_response(manifest)
+        s3_mock.exceptions.NoSuchKey = type("NoSuchKey", (Exception,), {})
+
+        with patch.dict("os.environ", {"BULK_QUEUE_URL": "https://sqs/q"}):
+            result = proc.process_manifest("bucket", "hybrid-001")
+
+        assert result["published_count"] == 1
+
+    def test_neither_text_nor_key_rejected(self, processor):
+        proc, s3_mock, _, _ = processor
+        manifest = _valid_manifest()
+        del manifest["items"][0]["s3_key"]
+        s3_mock.get_object.return_value = _s3_manifest_response(manifest)
+
+        with pytest.raises(ValidationError, match="at least one of"):
+            proc.process_manifest("bucket", "test")
+
+    def test_file_without_media_type_rejected(self, processor):
+        proc, s3_mock, _, _ = processor
+        manifest = _valid_manifest()
+        del manifest["items"][0]["media_type"]
+        s3_mock.get_object.return_value = _s3_manifest_response(manifest)
+
+        with pytest.raises(ValidationError, match="missing 'media_type'"):
+            proc.process_manifest("bucket", "test")
+
+    def test_invalid_input_text_mode_rejected(self, processor):
+        proc, s3_mock, _, _ = processor
+        manifest = _text_only_manifest()
+        manifest["items"][0]["input_text_mode"] = "bad_mode"
+        s3_mock.get_object.return_value = _s3_manifest_response(manifest)
+
+        with pytest.raises(ValidationError, match="input_text_mode"):
+            proc.process_manifest("bucket", "test")
+
+    def test_empty_requested_fields_rejected(self, processor):
+        proc, s3_mock, _, _ = processor
+        manifest = _text_only_manifest()
+        manifest["items"][0]["requested_fields"] = []
+        s3_mock.get_object.return_value = _s3_manifest_response(manifest)
+
+        with pytest.raises(ValidationError, match="non-empty"):
+            proc.process_manifest("bucket", "test")
+
+    def test_backward_compat_existing_manifest(self, processor):
+        """Standard manifests with s3_key + media_type still validate."""
+        proc, s3_mock, sqs_mock, _ = processor
+        manifest = _valid_manifest(3)
+        s3_mock.get_object.return_value = _s3_manifest_response(manifest)
+        s3_mock.exceptions.NoSuchKey = type("NoSuchKey", (Exception,), {})
+
+        with patch.dict("os.environ", {"BULK_QUEUE_URL": "https://sqs/q"}):
+            with patch("src.bulk.bulk_processor.time.sleep"):
+                result = proc.process_manifest("bucket", "bulk-test-001")
+
+        assert result["published_count"] == 3
+
+
+# --- CC3-1001: PPN required for file items, request_id no longer required ---
+
+
+class TestCC3_1001_PpnRequired:
+    """File-bearing items must carry a real product_part_number so the
+    {ou}/processed/{PPN}.{ext}, {ou}/subtitles/{PPN}.vtt, and metadata
+    paths don't collide across a batch. request_id is no longer required
+    on any item (bulk-backfill items don't point at a real IPLR request).
+    """
+
+    def test_file_item_without_ppn_rejected(self, processor):
+        proc, s3_mock, _, _ = processor
+        manifest = _valid_manifest()
+        del manifest["items"][0]["product_part_number"]
+        s3_mock.get_object.return_value = _s3_manifest_response(manifest)
+
+        with pytest.raises(ValidationError, match="product_part_number"):
+            proc.process_manifest("bucket", "test")
+
+    def test_file_item_with_empty_ppn_rejected(self, processor):
+        proc, s3_mock, _, _ = processor
+        manifest = _valid_manifest()
+        manifest["items"][0]["product_part_number"] = "   "
+        s3_mock.get_object.return_value = _s3_manifest_response(manifest)
+
+        with pytest.raises(ValidationError, match="product_part_number"):
+            proc.process_manifest("bucket", "test")
+
+    def test_file_item_with_non_string_ppn_rejected(self, processor):
+        proc, s3_mock, _, _ = processor
+        manifest = _valid_manifest()
+        manifest["items"][0]["product_part_number"] = 0
+        s3_mock.get_object.return_value = _s3_manifest_response(manifest)
+
+        with pytest.raises(ValidationError, match="product_part_number"):
+            proc.process_manifest("bucket", "test")
+
+    def test_text_only_item_without_ppn_accepted(self, processor):
+        """Text-only items don't have a canonical S3 layout to collide on,
+        so PPN is not required there.
+        """
+        proc, s3_mock, sqs_mock, _ = processor
+        manifest = _text_only_manifest()
+        # _text_only_manifest already omits product_part_number
+        s3_mock.get_object.return_value = _s3_manifest_response(manifest)
+        s3_mock.exceptions.NoSuchKey = type("NoSuchKey", (Exception,), {})
+
+        with patch.dict("os.environ", {"BULK_QUEUE_URL": "https://sqs/q"}):
+            result = proc.process_manifest("bucket", "backfill-001")
+
+        assert result["published_count"] == 1
+
+    def test_request_id_no_longer_required_on_file_item(self, processor):
+        """Drupal can drop the legacy request_id=>0 placeholder once this
+        ships. The validator must accept file items that omit it entirely.
+        """
+        proc, s3_mock, sqs_mock, _ = processor
+        manifest = _valid_manifest()
+        for item in manifest["items"]:
+            item.pop("request_id", None)
+        s3_mock.get_object.return_value = _s3_manifest_response(manifest)
+        s3_mock.exceptions.NoSuchKey = type("NoSuchKey", (Exception,), {})
+
+        with patch.dict("os.environ", {"BULK_QUEUE_URL": "https://sqs/q"}):
+            with patch("src.bulk.bulk_processor.time.sleep"):
+                result = proc.process_manifest("bucket", "bulk-test-001")
+
+        assert result["published_count"] == 2
+
+    def test_request_id_zero_still_tolerated_on_file_item(self, processor):
+        """Strictly additive deploy: Drupal's amended PR #755 keeps
+        request_id=>0 alongside the new product_part_number. The validator
+        must continue to accept items that carry both, so backend can ship
+        without coordinating Drupal deploy order.
+        """
+        proc, s3_mock, sqs_mock, _ = processor
+        manifest = _valid_manifest()
+        for item in manifest["items"]:
+            item["request_id"] = 0
+        s3_mock.get_object.return_value = _s3_manifest_response(manifest)
+        s3_mock.exceptions.NoSuchKey = type("NoSuchKey", (Exception,), {})
+
+        with patch.dict("os.environ", {"BULK_QUEUE_URL": "https://sqs/q"}):
+            with patch("src.bulk.bulk_processor.time.sleep"):
+                result = proc.process_manifest("bucket", "bulk-test-001")
+
+        assert result["published_count"] == 2
+
+
+def _strategy_a_manifest():
+    """Strategy A item: file-bearing, input_text empty by design."""
+    return {
+        "batch_id": "strategy-a-001",
+        "callback_url": "https://example.com/webhook",
+        "items": [{
+            "item_id": 400,
+            "product_part_number": "MTTIMSWEB0010",
+            "resource_center": "MTT",
+            "s3_key": "video/private/MTTIMSWEB0010/MTTIMSWEB0010.mp4",
+            "media_type": "MP4",
+            "source_bucket": "ieee-conference-cloud-content",
+            "input_text": "",
+            "input_text_mode": "",
+        }],
+    }
+
+
+class TestEmptySentinelTolerance:
+    """The Drupal builder emits empty-string sentinels for inapplicable
+    fields (Strategy A items have ``input_text=""`` by design, text-only
+    items have ``source_bucket=""`` because there's no source to fetch).
+    The validator must tolerate these without rejecting the item.
+    """
+
+    def test_strategy_a_item_with_empty_input_text_accepted(self, processor):
+        proc, s3_mock, sqs_mock, _ = processor
+        manifest = _strategy_a_manifest()
+        s3_mock.get_object.return_value = _s3_manifest_response(manifest)
+        s3_mock.exceptions.NoSuchKey = type("NoSuchKey", (Exception,), {})
+
+        with patch.dict("os.environ", {"BULK_QUEUE_URL": "https://sqs/q"}):
+            result = proc.process_manifest("bucket", "strategy-a-001")
+
+        assert result["published_count"] == 1
+
+    def test_text_only_item_with_empty_source_bucket_accepted(self, processor):
+        """No s3_key → source_bucket is irrelevant, empty value tolerated."""
+        proc, s3_mock, sqs_mock, _ = processor
+        manifest = _text_only_manifest()
+        manifest["items"][0]["source_bucket"] = ""
+        s3_mock.get_object.return_value = _s3_manifest_response(manifest)
+        s3_mock.exceptions.NoSuchKey = type("NoSuchKey", (Exception,), {})
+
+        with patch.dict("os.environ", {"BULK_QUEUE_URL": "https://sqs/q"}):
+            result = proc.process_manifest("bucket", "backfill-001")
+
+        assert result["published_count"] == 1
+
+    def test_file_item_with_empty_source_bucket_rejected(self, processor):
+        """Has s3_key → source_bucket must be non-empty (worker uses it)."""
+        proc, s3_mock, _, _ = processor
+        manifest = _strategy_a_manifest()
+        manifest["items"][0]["source_bucket"] = ""
+        s3_mock.get_object.return_value = _s3_manifest_response(manifest)
+        s3_mock.exceptions.NoSuchKey = type("NoSuchKey", (Exception,), {})
+
+        with pytest.raises(ValidationError, match="source_bucket.*non-empty"):
+            proc.process_manifest("bucket", "test")
+
+    def test_empty_input_text_mode_treated_as_absent(self, processor):
+        """input_text_mode="" must not trigger 'invalid input_text_mode'."""
+        proc, s3_mock, sqs_mock, _ = processor
+        manifest = _strategy_a_manifest()  # input_text_mode="" already
+        s3_mock.get_object.return_value = _s3_manifest_response(manifest)
+        s3_mock.exceptions.NoSuchKey = type("NoSuchKey", (Exception,), {})
+
+        with patch.dict("os.environ", {"BULK_QUEUE_URL": "https://sqs/q"}):
+            result = proc.process_manifest("bucket", "strategy-a-001")
+
+        assert result["published_count"] == 1
+
+    def test_input_text_mode_still_rejected_when_set_invalid(self, processor):
+        """Non-empty invalid input_text_mode is still rejected."""
+        proc, s3_mock, _, _ = processor
+        manifest = _text_only_manifest()
+        manifest["items"][0]["input_text_mode"] = "garbage"
+        s3_mock.get_object.return_value = _s3_manifest_response(manifest)
+        s3_mock.exceptions.NoSuchKey = type("NoSuchKey", (Exception,), {})
+
+        with pytest.raises(ValidationError, match="input_text_mode"):
+            proc.process_manifest("bucket", "test")
+
+    def test_empty_input_text_mode_rejected_when_text_present(self, processor):
+        """Hybrid item with input_text but empty mode must fail —
+        worker would otherwise pass empty mode through to orchestrator.
+        """
+        proc, s3_mock, _, _ = processor
+        manifest = _text_only_manifest()
+        manifest["items"][0]["input_text_mode"] = ""
+        s3_mock.get_object.return_value = _s3_manifest_response(manifest)
+        s3_mock.exceptions.NoSuchKey = type("NoSuchKey", (Exception,), {})
+
+        with pytest.raises(ValidationError, match="input_text_mode"):
+            proc.process_manifest("bucket", "test")
+
+    def test_null_source_bucket_rejected(self, processor):
+        """null source_bucket would propagate via worker.get(...,bucket)
+        as None and break S3 CopyObject.
+        """
+        proc, s3_mock, _, _ = processor
+        manifest = _strategy_a_manifest()
+        manifest["items"][0]["source_bucket"] = None
+        s3_mock.get_object.return_value = _s3_manifest_response(manifest)
+        s3_mock.exceptions.NoSuchKey = type("NoSuchKey", (Exception,), {})
+
+        with pytest.raises(ValidationError, match="source_bucket.*string"):
+            proc.process_manifest("bucket", "test")
+
+    def test_non_string_input_text_rejected(self, processor):
+        """input_text must be a string when present (not int/list/dict).
+        Without this check, a truthy non-string value would pass the
+        'has_text' falsy guard but still propagate to the worker via
+        `item.get('input_text')` truthy checks.
+        """
+        proc, s3_mock, _, _ = processor
+        manifest = _strategy_a_manifest()
+        manifest["items"][0]["input_text"] = 42
+        s3_mock.get_object.return_value = _s3_manifest_response(manifest)
+        s3_mock.exceptions.NoSuchKey = type("NoSuchKey", (Exception,), {})
+
+        with pytest.raises(ValidationError, match="input_text.*string"):
+            proc.process_manifest("bucket", "test")
+
+
 # --- Cost estimation ---
 
 
@@ -113,13 +432,23 @@ class TestCostEstimation:
 
     def test_mixed_batch(self):
         items = [
-            {"item_id": 1, "media_type": "PDF", "s3_key": "a", "request_id": 0, "resource_center": "PES"},
-            {"item_id": 2, "media_type": "MP4", "s3_key": "b", "request_id": 0, "resource_center": "PES"},
+            {"item_id": 1, "media_type": "PDF", "s3_key": "a", "product_part_number": "PES001", "resource_center": "PES"},
+            {"item_id": 2, "media_type": "MP4", "s3_key": "b", "product_part_number": "PES002", "resource_center": "PES"},
         ]
         estimate = BulkProcessor._estimate_cost(items)
 
         assert estimate["breakdown"] == {"PDF": 1, "MP4": 1}
         assert estimate["total_usd"] == 0.04  # 0.01 + 0.03
+
+    def test_text_only_cost(self):
+        items = [
+            {"item_id": 1, "resource_center": "PES", "input_text": "text"},
+            {"item_id": 2, "resource_center": "PES", "input_text": "text"},
+        ]
+        estimate = BulkProcessor._estimate_cost(items)
+
+        assert estimate["breakdown"] == {"text": 2}
+        assert estimate["total_usd"] == 0.01  # 2 * 0.005
 
 
 # --- Publish items ---
@@ -251,3 +580,114 @@ class TestBulkProcessorHandler:
 
         assert result["statusCode"] == 400
         assert result["body"]["error_type"] == "ValidationError"
+
+    def test_s3_event_invocation(self):
+        """S3 PutObject on bulk/manifests/<batch_id>.json dispatches the batch."""
+        s3_event = {
+            "Records": [{
+                "s3": {
+                    "bucket": {"name": "dev-ieee-conference-cloud-bulk-uploads"},
+                    "object": {"key": "bulk/manifests/strategic-test-001.json"},
+                },
+            }],
+        }
+        with patch("src.handlers.bulk_processor_handler.processor") as mock_proc:
+            mock_proc.process_manifest.return_value = {
+                "batch_id": "strategic-test-001",
+                "total_items": 5,
+                "published_count": 5,
+                "estimated_cost": {"breakdown": {"PDF": 5}, "total_usd": 0.05},
+                "status": "dispatched",
+            }
+            result = handler(s3_event, None)
+
+        mock_proc.process_manifest.assert_called_once_with(
+            bucket="dev-ieee-conference-cloud-bulk-uploads",
+            batch_id="strategic-test-001",
+        )
+        assert result["statusCode"] == 200
+        assert result["body"]["results"][0]["batch_id"] == "strategic-test-001"
+
+    def test_s3_event_multiple_records(self):
+        """S3 may batch multiple PutObject events; handler must process all."""
+        s3_event = {
+            "Records": [
+                {"s3": {"bucket": {"name": "b"},
+                        "object": {"key": "bulk/manifests/batch-a.json"}}},
+                {"s3": {"bucket": {"name": "b"},
+                        "object": {"key": "bulk/manifests/batch-b.json"}}},
+                {"s3": {"bucket": {"name": "b"},
+                        "object": {"key": "bulk/manifests/batch-c.json"}}},
+            ],
+        }
+        with patch("src.handlers.bulk_processor_handler.processor") as mock_proc:
+            mock_proc.process_manifest.side_effect = lambda bucket, batch_id: {
+                "batch_id": batch_id,
+                "total_items": 1,
+                "published_count": 1,
+                "estimated_cost": {"breakdown": {}, "total_usd": 0.0},
+                "status": "dispatched",
+            }
+            result = handler(s3_event, None)
+
+        assert mock_proc.process_manifest.call_count == 3
+        dispatched = [r["batch_id"] for r in result["body"]["results"]]
+        assert dispatched == ["batch-a", "batch-b", "batch-c"]
+        assert result["statusCode"] == 200
+
+    def test_s3_event_partial_failure_does_not_raise(self):
+        """One record failing must not block others or trigger a Lambda retry."""
+        s3_event = {
+            "Records": [
+                {"s3": {"bucket": {"name": "b"},
+                        "object": {"key": "bulk/manifests/good.json"}}},
+                {"s3": {"bucket": {"name": "b"},
+                        "object": {"key": "bulk/manifests/bad.json"}}},
+            ],
+        }
+
+        def fake_process(bucket, batch_id):
+            if batch_id == "bad":
+                raise ValidationError("boom")
+            return {
+                "batch_id": batch_id, "total_items": 1, "published_count": 1,
+                "estimated_cost": {"breakdown": {}, "total_usd": 0.0},
+                "status": "dispatched",
+            }
+
+        with patch("src.handlers.bulk_processor_handler.processor") as mock_proc:
+            mock_proc.process_manifest.side_effect = fake_process
+            result = handler(s3_event, None)
+
+        assert result["statusCode"] == 200
+        results = result["body"]["results"]
+        assert results[0]["batch_id"] == "good"
+        assert results[1]["status"] == "failed"
+
+    def test_s3_event_wrong_prefix_skipped(self):
+        s3_event = {
+            "Records": [{
+                "s3": {
+                    "bucket": {"name": "bucket"},
+                    "object": {"key": "actions/some-job.json"},
+                },
+            }],
+        }
+        result = handler(s3_event, None)
+        assert result["statusCode"] == 200
+        assert result["body"]["results"][0]["status"] == "skipped"
+        assert "does not match" in result["body"]["results"][0]["error"]
+
+    def test_s3_event_wrong_suffix_skipped(self):
+        s3_event = {
+            "Records": [{
+                "s3": {
+                    "bucket": {"name": "bucket"},
+                    "object": {"key": "bulk/manifests/something.txt"},
+                },
+            }],
+        }
+        result = handler(s3_event, None)
+        assert result["statusCode"] == 200
+        assert result["body"]["results"][0]["status"] == "skipped"
+        assert "does not match" in result["body"]["results"][0]["error"]

@@ -15,8 +15,9 @@ import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
 
+from src.ai.bedrock_inference import ALL_FIELDS
 from src.common.dlq import build_dlq_message
-from src.orchestrator.ai_orchestrator import AIOrchestrator
+from src.orchestrator.ai_orchestrator import AIOrchestrator, VALID_INPUT_TEXT_MODES
 
 logger = logging.getLogger()
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
@@ -48,32 +49,71 @@ def handler(event: dict, context) -> dict:
     retry_count = event.get("retry_count", 0)
 
     try:
-        bucket, key = _parse_event(event)
+        if "meta" in event:
+            # Direct invocation with inline meta (text-only, no S3 file)
+            bucket = event.get("bucket", os.environ.get("S3_BUCKET", ""))
+            meta = event["meta"]
+            _validate_direct_meta(meta)
+            bucket_parsed, key_parsed, meta_parsed = bucket, None, meta
+        else:
+            bucket_parsed, key_parsed = _parse_event(event)
+            meta_parsed = None
+            # Short-circuit: bulk-uploads-transfer's get-video-info Lambda
+            # writes {ou}/pending/metadata/{filename}.json as a side effect
+            # of mp4 processing. The */pending/* EventBridge rule matches
+            # this side-effect, but the file isn't a pending media file we
+            # should process. Tightening the rule to exclude pending/metadata/
+            # was attempted but composite wildcard patterns exceed EB's
+            # complexity limit, so the defensive check lives here.
+            # CC3-995.
+            parts = key_parsed.split("/")
+            if len(parts) >= 3 and parts[2] == "metadata":
+                logger.info(
+                    "Skipping non-media event in pending/metadata/: s3://%s/%s "
+                    "(get-video-info Lambda byproduct, not a pending media file)",
+                    bucket_parsed,
+                    key_parsed,
+                )
+                return {
+                    "statusCode": 200,
+                    "body": {
+                        "action": "skipped",
+                        "reason": "key is in pending/metadata/ (Lambda byproduct, not media)",
+                        "bucket": bucket_parsed,
+                        "key": key_parsed,
+                    },
+                }
     except (KeyError, ValueError) as exc:
         logger.error("Bad request: %s", exc)
         return {"statusCode": 400, "body": {"error": str(exc)}}
 
     try:
         result = _orchestrator.process(
-            bucket=bucket,
-            key=key,
+            bucket=bucket_parsed,
+            key=key_parsed,
             request_id=request_id,
+            meta=meta_parsed,
         )
     except ValueError as exc:
         logger.error("Validation error: %s", exc)
+        # CC3-1049: notify Drupal so a known item isn't left stuck in awaiting_*.
+        _orchestrator.send_failure_webhook(exc)
         return {"statusCode": 400, "body": {"error": str(exc)}}
     except ClientError as exc:
         code = exc.response["Error"]["Code"]
         msg = exc.response["Error"]["Message"]
         logger.error("AWS error (%s): %s", code, msg)
+        _orchestrator.send_failure_webhook(exc)
         _publish_to_dlq(event, exc, request_id, retry_count)
         return {"statusCode": 500, "body": {"error": f"{code}: {msg}"}}
     except RuntimeError as exc:
         logger.error("Processing error: %s", exc)
+        _orchestrator.send_failure_webhook(exc)
         _publish_to_dlq(event, exc, request_id, retry_count)
         return {"statusCode": 500, "body": {"error": str(exc)}}
     except Exception as exc:
         logger.exception("Unexpected error")
+        _orchestrator.send_failure_webhook(exc)
         _publish_to_dlq(event, exc, request_id, retry_count)
         return {
             "statusCode": 500,
@@ -117,19 +157,26 @@ def _parse_event(event: dict) -> tuple[str, str]:
     """Extract bucket and key from event.
 
     Supports:
-        1. S3 event: {Records[0].s3...}
-        2. Direct: {bucket, key}
+        1. S3 event:       {Records[0].s3...}
+        2. EventBridge S3: {source: "aws.s3", detail: {bucket.name, object.key}}
+        3. Direct:         {bucket, key}
     """
     if "Records" in event:
         record = event["Records"][0]
         bucket = record["s3"]["bucket"]["name"]
         key = record["s3"]["object"]["key"]
+    elif event.get("source") == "aws.s3" and "detail" in event:
+        detail = event["detail"]
+        bucket = detail["bucket"]["name"]
+        key = detail["object"]["key"]
     elif "bucket" in event and "key" in event:
         bucket = event["bucket"]
         key = event["key"]
     else:
         raise KeyError(
-            "Event must contain 'Records' (S3 trigger) or 'bucket'/'key' (direct)"
+            "Event must contain 'Records' (S3 trigger), "
+            "'source=aws.s3' with 'detail' (EventBridge), "
+            "or 'bucket'/'key' (direct)"
         )
 
     # Validate key pattern
@@ -140,3 +187,40 @@ def _parse_event(event: dict) -> tuple[str, str]:
         )
 
     return bucket, key
+
+
+def _validate_direct_meta(meta: dict) -> None:
+    """Validate meta dict for direct invocation (text-only path)."""
+    if not isinstance(meta, dict):
+        raise ValueError("meta must be a JSON object")
+
+    input_text = meta.get("input_text")
+    if not isinstance(input_text, str) or not input_text.strip():
+        raise ValueError(
+            "Direct invocation requires 'input_text' to be a non-empty string"
+        )
+
+    for field in ("item_id", "ai_enrichment_enabled"):
+        if field not in meta:
+            raise ValueError(f"Direct invocation meta missing required field: {field}")
+
+    # Validate content.media_type is present
+    content = meta.get("content")
+    if not isinstance(content, dict) or "media_type" not in content:
+        raise ValueError("Direct invocation meta must include content.media_type")
+
+    mode = meta.get("input_text_mode", "as_source")
+    if mode not in VALID_INPUT_TEXT_MODES:
+        raise ValueError(
+            f"Invalid input_text_mode: {mode!r}. Must be one of {sorted(VALID_INPUT_TEXT_MODES)}"
+        )
+
+    requested_fields = meta.get("requested_fields")
+    if requested_fields is not None:
+        if not isinstance(requested_fields, list) or not requested_fields:
+            raise ValueError("requested_fields must be a non-empty array")
+        if any(not isinstance(field, str) for field in requested_fields):
+            raise ValueError("requested_fields must contain only strings")
+        invalid = set(requested_fields) - ALL_FIELDS
+        if invalid:
+            raise ValueError(f"Invalid requested_fields: {sorted(invalid)}")

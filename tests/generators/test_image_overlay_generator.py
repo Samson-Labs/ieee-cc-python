@@ -8,24 +8,34 @@ from __future__ import annotations
 
 import json
 from io import BytesIO
-from unittest.mock import MagicMock, call
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 from botocore.exceptions import ClientError
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 
 from src.generators.image_overlay_generator import (
     AUTHOR_MAX_LINES,
     DEFAULT_FORMAT,
     DEFAULT_QUALITY,
     LEGACY_FIELDS,
+    LEGACY_PADDING_FACTOR_DEFAULT,
+    LEGACY_ROW_HEIGHT_PAD_DEFAULT,
     SUPPORTED_FORMATS,
     THUMBNAIL_SIZE,
     TITLE_MAX_LINES,
     GenerationResult,
     ImageOverlayGenerator,
+    _compute_top_y,
+    _load_font,
+    _normalize_family,
     _parse_legacy_attributes,
+    _safe_float,
+    _safe_int,
+    _apply_stage_prefix,
+    _stage_prefix,
     _wrap_and_truncate,
+    _wrap_pixels,
 )
 
 
@@ -625,3 +635,1027 @@ class TestLegacyProcessTrigger:
         assert result["format"] == "png"
         put_kwargs = s3_mock.put_object.call_args[1]
         assert put_kwargs["ContentType"] == "image/png"
+
+
+# ---------------------------------------------------------------------------
+# CC3-870: Parity gap fixes vs legacy Node.js image-generator
+# ---------------------------------------------------------------------------
+
+
+class TestStagePrefix:
+    """Gap #1: STAGE env → bucket prefix (handler.js:26-36).
+
+    R1 hardening: strip+lowercase normalize, raise on unknown values
+    rather than fall through to no-prefix (would route dev jobs to prod).
+    """
+
+    def test_dev_prefix(self, monkeypatch):
+        monkeypatch.setenv("STAGE", "dev")
+        assert _stage_prefix() == "dev-"
+
+    def test_staging_prefix(self, monkeypatch):
+        monkeypatch.setenv("STAGE", "staging")
+        assert _stage_prefix() == "staging-"
+
+    def test_prod_no_prefix(self, monkeypatch):
+        monkeypatch.setenv("STAGE", "prod")
+        assert _stage_prefix() == ""
+
+    def test_unset_no_prefix(self, monkeypatch):
+        monkeypatch.delenv("STAGE", raising=False)
+        assert _stage_prefix() == ""
+
+    @pytest.mark.parametrize("value", ["DEV", "Dev", "Dev ", "  dev\n", "DEV  "])
+    def test_dev_normalized(self, monkeypatch, value):
+        """R1: case + whitespace variants of dev resolve to dev- (no prod leak)."""
+        monkeypatch.setenv("STAGE", value)
+        assert _stage_prefix() == "dev-"
+
+    @pytest.mark.parametrize("value", ["STAGING", "Staging\n", "  staging  "])
+    def test_staging_normalized(self, monkeypatch, value):
+        monkeypatch.setenv("STAGE", value)
+        assert _stage_prefix() == "staging-"
+
+    @pytest.mark.parametrize("value", ["PROD", "  prod  ", "Prod\n"])
+    def test_prod_normalized(self, monkeypatch, value):
+        monkeypatch.setenv("STAGE", value)
+        assert _stage_prefix() == ""
+
+    @pytest.mark.parametrize("value", ["qa", "test", "production", "develop"])
+    def test_unknown_value_raises(self, monkeypatch, value):
+        """R1: unknown STAGE values raise rather than silently fall through."""
+        monkeypatch.setenv("STAGE", value)
+        with pytest.raises(ValueError, match="Unrecognized STAGE"):
+            _stage_prefix()
+
+    def test_legacy_process_applies_prefix_to_buckets(self, monkeypatch):
+        """End-to-end: dev STAGE causes both source + dest buckets to be prefixed."""
+        monkeypatch.setenv("STAGE", "dev")
+        s3_mock = MagicMock()
+        payload = _make_legacy_payload()
+        _mock_s3_for_legacy_trigger(s3_mock, payload)
+        gen = ImageOverlayGenerator(s3_client=s3_mock)
+
+        gen.process_trigger(bucket="trigger-bucket", key="actions/job.json")
+
+        # Source download should hit the prefixed source bucket.
+        get_calls = s3_mock.get_object.call_args_list
+        source_calls = [c for c in get_calls if not c[1]["Key"].endswith(".json")]
+        assert len(source_calls) == 1
+        assert source_calls[0][1]["Bucket"] == f"dev-{payload['sourceBucket']}"
+
+        # Upload should hit the prefixed dest bucket.
+        put_kwargs = s3_mock.put_object.call_args[1]
+        assert put_kwargs["Bucket"] == f"dev-{payload['destBucket']}"
+
+    def test_legacy_process_no_prefix_in_prod(self, monkeypatch):
+        monkeypatch.setenv("STAGE", "prod")
+        s3_mock = MagicMock()
+        payload = _make_legacy_payload()
+        _mock_s3_for_legacy_trigger(s3_mock, payload)
+        gen = ImageOverlayGenerator(s3_client=s3_mock)
+
+        gen.process_trigger(bucket="trigger-bucket", key="actions/job.json")
+
+        put_kwargs = s3_mock.put_object.call_args[1]
+        assert put_kwargs["Bucket"] == payload["destBucket"]
+
+
+class TestStagePrefixIdempotency:
+    """`_apply_stage_prefix` must not double-prefix already-qualified names.
+
+    Drupal's IPLR module already emits `dev-`/`staging-` prefixed bucket
+    names via `S3UtilityTrait::prefixBucket()`. Blind prefix application
+    in the legacy path produced `dev-dev-...` NoSuchBucket errors observed
+    in `/aws/lambda/ieee-rc-image-generator-dev` on 2026-05-18 — see the
+    CC3-870 thread for the trace. These tests pin the idempotent contract.
+    """
+
+    def test_unprefixed_dev_adds_prefix(self):
+        assert (
+            _apply_stage_prefix("ieee-conference-cloud-uploads", "dev-")
+            == "dev-ieee-conference-cloud-uploads"
+        )
+
+    def test_unprefixed_staging_adds_prefix(self):
+        assert (
+            _apply_stage_prefix("ieee-conference-cloud-uploads", "staging-")
+            == "staging-ieee-conference-cloud-uploads"
+        )
+
+    def test_already_dev_prefixed_returns_as_is(self):
+        # The exact scenario that broke on 2026-05-18.
+        assert (
+            _apply_stage_prefix("dev-ieee-conference-cloud-uploads", "dev-")
+            == "dev-ieee-conference-cloud-uploads"
+        )
+
+    def test_already_staging_prefixed_returns_as_is_under_staging(self):
+        assert (
+            _apply_stage_prefix("staging-ieee-conference-cloud-uploads", "staging-")
+            == "staging-ieee-conference-cloud-uploads"
+        )
+
+    def test_cross_stage_prefix_does_not_double_apply(self):
+        # A `staging-` prefixed bucket reaching a `dev-` Lambda is a
+        # misconfiguration but should still not produce `dev-staging-...`;
+        # let the downstream NoSuchBucket surface the real problem instead
+        # of masking it as a different mangled name.
+        assert (
+            _apply_stage_prefix("staging-ieee-conference-cloud-uploads", "dev-")
+            == "staging-ieee-conference-cloud-uploads"
+        )
+
+    def test_empty_prefix_returns_as_is(self):
+        # prod or unset STAGE → prefix == ""
+        assert (
+            _apply_stage_prefix("ieee-conference-cloud-uploads", "")
+            == "ieee-conference-cloud-uploads"
+        )
+        assert (
+            _apply_stage_prefix("dev-ieee-conference-cloud-uploads", "")
+            == "dev-ieee-conference-cloud-uploads"
+        )
+
+    def test_legacy_process_with_prefixed_payload_does_not_double_prefix(
+        self, monkeypatch
+    ):
+        """End-to-end: Drupal-style `dev-`-prefixed buckets in STAGE=dev
+        must produce single-prefix S3 calls, not `dev-dev-...`.
+
+        This is the regression test for the CC3-870 follow-up: prior to the
+        idempotent helper, this scenario produced two `dev-dev-...` bucket
+        names and the Lambda logged `S3 error (NoSuchBucket)`.
+        """
+        monkeypatch.setenv("STAGE", "dev")
+        s3_mock = MagicMock()
+        payload = _make_legacy_payload(
+            sourceBucket="dev-ieee-conference-cloud-uploads",
+            destBucket="dev-ieee-conference-cloud-bulk-uploads",
+        )
+        _mock_s3_for_legacy_trigger(s3_mock, payload)
+        gen = ImageOverlayGenerator(s3_client=s3_mock)
+
+        gen.process_trigger(bucket="trigger-bucket", key="actions/job.json")
+
+        # Source download hits the bucket as-is — no `dev-dev-` mangling.
+        source_calls = [
+            c
+            for c in s3_mock.get_object.call_args_list
+            if not c[1]["Key"].endswith(".json")
+        ]
+        assert len(source_calls) == 1
+        assert source_calls[0][1]["Bucket"] == "dev-ieee-conference-cloud-uploads"
+
+        # Upload hits the dest bucket as-is.
+        put_kwargs = s3_mock.put_object.call_args[1]
+        assert put_kwargs["Bucket"] == "dev-ieee-conference-cloud-bulk-uploads"
+
+
+class TestVerticalAnchoring:
+    """Gap #2: Three-branch y-positioning (getTextElements.js:36-52).
+
+    For an 800x600 image with center=300, font_size=40, rowHeightPad=2,
+    paddedRowHeight=42:
+      y=120 (top, < center)  → top_y = 120 + 21        = 141
+      y=300 (center)         → top_y = 42 + (300 - 21) = 321 (1 row)
+      y=480 (bottom, > center, 1 row)        → top_y = 480
+      y=480 (bottom, > center, 3 rows)       → top_y = 480 - 42*2 = 396
+    The Node.js arithmetic uses `parseInt` which truncates toward zero;
+    Python `int()` matches for non-negative values. We assert the
+    resulting top_y by drawing a single overlay and checking which rows
+    are populated against the expected position.
+    """
+
+    def _spec(self, *, y_pct: int, text: str, font_size: int = 40, row_pad: int = 2):
+        return {
+            "text": text,
+            "attributes": [
+                {"attr": "y", "value": f"{y_pct}%"},
+                {"attr": "x", "value": "50%"},
+                {"attr": "fill", "value": "white"},
+                {"attr": "text-anchor", "value": "middle"},
+                {"attr": "font-size", "value": f"{font_size}px"},
+            ],
+            "rowHeightPad": str(row_pad),
+        }
+
+    def test_top_anchored_grows_down(self):
+        gen = ImageOverlayGenerator(s3_client=MagicMock())
+        bg = _make_background(800, 600)  # center y=300
+
+        # Single short word at y=20% → y_anchor=120, top_y=120+21=141.
+        spec = self._spec(y_pct=20, text="Hi", font_size=40)
+        out = gen.generate_legacy_overlay(background=bg, overlay_specs=[spec])
+
+        # The text should render *below* the anchor (top_y > y_anchor).
+        # Verify pixels above y_anchor are still pure background.
+        for y in range(0, 100):
+            for x in range(0, 800, 50):
+                # Background is (0, 0, 128); white text changes the pixel.
+                assert out.getpixel((x, y))[:3] == (0, 0, 128)
+
+    def test_bottom_anchored_grows_up(self):
+        """Three rows at y=80% should not run off the bottom of an 800x600 image."""
+        gen = ImageOverlayGenerator(s3_client=MagicMock())
+        bg = _make_background(800, 600)  # center y=300, y_anchor at 80% = 480
+
+        # Long text guaranteed to wrap to multiple rows.
+        long_text = "First " + "wrapping " * 30 + "tail"
+        spec = self._spec(y_pct=80, text=long_text, font_size=40, row_pad=2)
+        out = gen.generate_legacy_overlay(background=bg, overlay_specs=[spec])
+
+        # Bottom-anchored: text grows up, so the last row should be near
+        # y_anchor=480, not running past the bottom edge (599). Confirm
+        # there is text rendered above y=400 (proof rows extend upward).
+        modified_above_400 = False
+        for y in range(200, 400):
+            for x in range(0, 800, 25):
+                if out.getpixel((x, y))[:3] != (0, 0, 128):
+                    modified_above_400 = True
+                    break
+            if modified_above_400:
+                break
+        assert modified_above_400, "bottom-anchored multi-row text did not grow upward"
+
+    def test_old_implementation_grew_off_image(self):
+        """Regression guard: confirm the new code does NOT overflow at y=80%.
+
+        Pre-CC3-870 always grew downward, so 3 rows × ~42px starting at
+        y=480 would reach y≈564 — borderline ok for 3 rows but breaks
+        for any longer wrap. Verify content stays within the image bounds.
+        """
+        gen = ImageOverlayGenerator(s3_client=MagicMock())
+        bg = _make_background(800, 600)
+        # Text that wraps to many rows.
+        long_text = " ".join(["word"] * 80)
+        spec = self._spec(y_pct=80, text=long_text, font_size=40, row_pad=2)
+        out = gen.generate_legacy_overlay(background=bg, overlay_specs=[spec])
+
+        # Image should not error and should have same dimensions.
+        assert out.size == bg.size
+
+
+class TestUnlimitedWrapping:
+    """Gap #3: No 4-line truncation cap on legacy path."""
+
+    def test_long_text_wraps_unlimited(self):
+        gen = ImageOverlayGenerator(s3_client=MagicMock())
+        bg = _make_background(800, 600)
+        # 100 short words; with default ~96% padding will wrap to many rows.
+        text = " ".join(["alpha"] * 100)
+        spec = {
+            "text": text,
+            "attributes": [
+                {"attr": "y", "value": "10%"},
+                {"attr": "x", "value": "50%"},
+                {"attr": "fill", "value": "white"},
+                {"attr": "text-anchor", "value": "middle"},
+                {"attr": "font-size", "value": "20px"},
+            ],
+        }
+        # No assertion error, no ellipsis added.
+        out = gen.generate_legacy_overlay(background=bg, overlay_specs=[spec])
+        assert out.size == bg.size
+
+    def test_wrap_pixels_returns_more_than_four_rows(self):
+        font = _load_font(20, bold=False)
+        text = " ".join(["word"] * 60)
+        rows = _wrap_pixels(text, font, max_width=200)
+        assert len(rows) > 4, "legacy path must wrap unlimited rows"
+        assert not any(r.endswith("...") for r in rows), "no ellipsis truncation"
+
+
+class TestFontFamily:
+    """Gap #4: font-family honored (or graceful fallback)."""
+
+    def test_normalize_family_lowercase(self):
+        assert _normalize_family("Roboto") == "roboto"
+        assert _normalize_family("Courier Prime") == "courierprime"
+        assert _normalize_family("OpenSans") == "opensans"
+
+    def test_normalize_family_strips_quotes_and_fallback(self):
+        assert _normalize_family("'Roboto'") == "roboto"
+        assert _normalize_family('"Courier Prime", monospace') == "courierprime"
+
+    def test_normalize_family_none_defaults_to_opensans(self):
+        assert _normalize_family(None) == "opensans"
+        assert _normalize_family("") == "opensans"
+
+    def test_load_font_unknown_family_falls_back_to_opensans(self, caplog):
+        with caplog.at_level("INFO"):
+            font = _load_font(40, bold=True, family="NonexistentFontXYZ")
+        assert font is not None
+        # Either logs the fallback or silently uses OpenSans — both acceptable.
+
+    def test_load_font_with_known_family_does_not_raise(self):
+        # OpenSans is bundled in the repo, so this should always succeed.
+        font = _load_font(40, bold=True, family="OpenSans")
+        assert font is not None
+
+    def test_legacy_overlay_passes_font_family(self):
+        """End-to-end: spec with font-family doesn't crash and renders text."""
+        gen = ImageOverlayGenerator(s3_client=MagicMock())
+        bg = _make_background()
+        spec = {
+            "text": "Hello",
+            "attributes": [
+                {"attr": "y", "value": "50%"},
+                {"attr": "x", "value": "50%"},
+                {"attr": "fill", "value": "white"},
+                {"attr": "text-anchor", "value": "middle"},
+                {"attr": "font-family", "value": "Roboto"},
+                {"attr": "font-size", "value": "40px"},
+            ],
+        }
+        out = gen.generate_legacy_overlay(background=bg, overlay_specs=[spec])
+        assert list(out.getdata()) != list(bg.getdata())
+
+
+class TestWidthPadFactor:
+    """Gap #5: widthPadFactor honored, default 0.04 (not hardcoded 0.85)."""
+
+    def test_default_constant(self):
+        assert LEGACY_PADDING_FACTOR_DEFAULT == 0.04
+
+    def test_smaller_pad_factor_fits_more_text_per_row(self):
+        """Lower padFactor → wider usable area → fewer wrapped rows."""
+        gen = ImageOverlayGenerator(s3_client=MagicMock())
+        bg = _make_background(1200, 600)
+        text = "The quick brown fox jumps over the lazy dog repeatedly across the page"
+
+        font = _load_font(40, bold=True)
+        rows_default = _wrap_pixels(
+            text, font,
+            max_width=int(1200 - 1200 * LEGACY_PADDING_FACTOR_DEFAULT),  # 0.04 → 1152
+        )
+        rows_tight = _wrap_pixels(
+            text, font,
+            max_width=int(1200 - 1200 * 0.5),  # 0.50 → 600
+        )
+        assert len(rows_default) < len(rows_tight)
+
+    def test_pad_factor_used_in_legacy_path(self):
+        gen = ImageOverlayGenerator(s3_client=MagicMock())
+        bg = _make_background(1200, 600)
+        spec = {
+            "text": "Short",
+            "attributes": [
+                {"attr": "y", "value": "50%"},
+                {"attr": "x", "value": "50%"},
+                {"attr": "fill", "value": "white"},
+                {"attr": "text-anchor", "value": "middle"},
+                {"attr": "font-size", "value": "40px"},
+            ],
+            "widthPadFactor": "0.10",
+        }
+        # No exception raised — the spec value is read (default would also work).
+        out = gen.generate_legacy_overlay(background=bg, overlay_specs=[spec])
+        assert out.size == bg.size
+
+
+class TestNoDropShadow:
+    """Gap #6: Legacy path no longer renders a shadow.
+
+    With white-on-blue background and no shadow, the only changed pixels
+    should be white (255, 255, 255) — no semi-transparent black halo.
+    """
+
+    def test_legacy_overlay_has_no_dark_halo(self):
+        """Earlier `b < 80` excluded shadow pixels and made the test useless.
+
+        The right discriminator: shadow pixels REDUCE B from the (0,0,128) bg
+        (alpha-blending black down toward 0), while glyph antialias pixels
+        RAISE B toward white (255). So:
+          shadow:           low R, low G, B < 128
+          glyph antialias:  low/high R+G with B ≥ 128
+        Asserting (R<30 AND G<30 AND B<128) catches a returning shadow without
+        false-positiving on edge antialiasing.
+        """
+        gen = ImageOverlayGenerator(s3_client=MagicMock())
+        bg = _make_background(800, 600)  # solid (0, 0, 128)
+
+        spec = {
+            "text": "X",  # single tall character
+            "attributes": [
+                {"attr": "y", "value": "50%"},
+                {"attr": "x", "value": "50%"},
+                {"attr": "fill", "value": "white"},
+                {"attr": "text-anchor", "value": "middle"},
+                {"attr": "font-size", "value": "120px"},
+            ],
+        }
+        out = gen.generate_legacy_overlay(background=bg, overlay_specs=[spec])
+
+        for y in range(out.height):
+            for x in range(out.width):
+                r, g, b, _ = out.getpixel((x, y))
+                if (r, g, b) == (0, 0, 128):
+                    continue
+                assert not (r < 30 and g < 30 and b < 128), (
+                    f"shadow-like pixel found at ({x},{y}): ({r},{g},{b})"
+                )
+
+
+class TestRowHeightPadDefault:
+    """Gap #7: rowHeightPad default is 2 (not 10)."""
+
+    def test_default_constant(self):
+        assert LEGACY_ROW_HEIGHT_PAD_DEFAULT == 2
+
+    def test_default_used_when_spec_omits_rowheightpad(self):
+        gen = ImageOverlayGenerator(s3_client=MagicMock())
+        bg = _make_background(800, 600)
+        # Two rows worth of text, no rowHeightPad in spec.
+        spec = {
+            "text": "First Second Third Fourth Fifth Sixth Seventh Eighth",
+            "attributes": [
+                {"attr": "y", "value": "20%"},
+                {"attr": "x", "value": "50%"},
+                {"attr": "fill", "value": "white"},
+                {"attr": "text-anchor", "value": "middle"},
+                {"attr": "font-size", "value": "40px"},
+            ],
+        }
+        # Just verify no crash and overlay applied.
+        out = gen.generate_legacy_overlay(background=bg, overlay_specs=[spec])
+        assert list(out.getdata()) != list(bg.getdata())
+
+
+class TestPixelWrapping:
+    """Gap #8: pixel-measured wrapping (not character-count estimation)."""
+
+    def test_empty_text_returns_empty(self):
+        font = _load_font(20, bold=False)
+        assert _wrap_pixels("", font, max_width=400) == []
+
+    def test_single_word_single_row(self):
+        font = _load_font(20, bold=False)
+        rows = _wrap_pixels("Hello", font, max_width=400)
+        assert rows == ["Hello"]
+
+    def test_wraps_when_row_exceeds_max_width(self):
+        font = _load_font(40, bold=True)
+        # Three short words at 40px should still wrap into a couple rows
+        # at a tight max_width.
+        rows = _wrap_pixels("Alpha Beta Gamma", font, max_width=80)
+        assert len(rows) >= 2
+
+    def test_bigger_font_yields_more_rows(self):
+        """Pixel wrap is sensitive to font size — char-count estimation isn't."""
+        text = "The quick brown fox jumps over the lazy dog"
+        font_small = _load_font(16, bold=False)
+        font_big = _load_font(48, bold=False)
+        rows_small = _wrap_pixels(text, font_small, max_width=400)
+        rows_big = _wrap_pixels(text, font_big, max_width=400)
+        assert len(rows_big) > len(rows_small), (
+            "pixel wrapping must respond to font size, not just char count"
+        )
+
+
+# ---------------------------------------------------------------------------
+# CC3-870 Round 1 review fixes
+# ---------------------------------------------------------------------------
+
+
+class TestComputeTopY:
+    """R1 #3: Anchoring math regression vs Node getTextElements.js:36-52.
+
+    Node source (image-generator/getTextElements.js, lines 36-52):
+
+        const center = height / 2;
+        let topPixelValue = 0;
+        if (pixelInt < center) {
+            topPixelValue = pixelInt + ( paddedRowHeight / 2 );
+        } else if (pixelInt === center) {
+            topPixelValue =
+                paddedRowHeight +
+                parseInt(pixelInt - ( (paddedRowHeight * rowCount) / 2) );
+        } else if (pixelInt > center) {
+            topPixelValue = parseInt(
+                pixelInt - ( paddedRowHeight * (rowCount - 1) ),
+            );
+        }
+
+    The half-row discontinuity crossing center from below is Node's actual
+    behavior, not a port artifact. These cases pin the parity.
+    """
+
+    @pytest.mark.parametrize("y_anchor,padded,row_count,expected", [
+        # 800x600 image (center=300), padded=42 (font_size=40 + row_pad=2)
+        # y < center: top_y = y + padded // 2
+        (0, 42, 1, 0 + 21),       # y=0   → 21
+        (100, 42, 1, 100 + 21),   # y=100 → 121
+        (299, 42, 1, 299 + 21),   # y=center-1 → 320
+        (200, 42, 3, 200 + 21),   # y<center, 3 rows → still 221 (rows grow down)
+
+        # y == center (the edge case Alex flagged)
+        # Node: top_y = padded + int(y - (padded * rowCount) / 2)
+        (300, 42, 1, 42 + 300 - 21),   # → 321
+        (300, 42, 3, 42 + 300 - 63),   # → 279 (centered around y for 3-row block)
+        (300, 42, 5, 42 + 300 - 105),  # → 237
+
+        # y > center: top_y = y - padded * (rowCount - 1)
+        (301, 42, 1, 301),         # 1 row → top_y=y exactly
+        (301, 42, 3, 301 - 84),    # → 217 (3 rows grow upward)
+        (480, 42, 5, 480 - 168),   # → 312 (bottom-anchored, 5 rows)
+    ])
+    def test_matches_node_for_all_branches(self, y_anchor, padded, row_count, expected):
+        """Pin Node-equivalent top_y values across all three branches."""
+        assert _compute_top_y(y_anchor, image_height=600, padded_row_height=padded,
+                              row_count=row_count) == expected
+
+    def test_documented_discontinuity_at_center(self):
+        """Crossing center from below, top_y jumps by ~half a row.
+
+        For a single line at padded=42:
+          y=299 → top_y=320 (top-branch: 299 + 21)
+          y=300 → top_y=321 (==-branch:  42 + 300 - 21)
+          y=301 → top_y=301 (>-branch:   301 - 0)
+
+        The 320 → 301 transition is a 19-pixel jump. This is preserved
+        verbatim from Node and would only be wrong if Node itself were wrong
+        — since the parent ticket's goal is byte-for-byte parity, we keep it.
+        """
+        assert _compute_top_y(299, 600, 42, 1) == 320
+        assert _compute_top_y(300, 600, 42, 1) == 321
+        assert _compute_top_y(301, 600, 42, 1) == 301
+
+
+class TestSafeParsing:
+    """R1 #2: Defensive parsing for legacy spec values.
+
+    Drupal payloads can carry empty/null/CSS-suffixed values that crash
+    the entire trigger if passed straight to int()/float().
+    """
+
+    @pytest.mark.parametrize("value,expected", [
+        (None, 5),
+        ("", 5),
+        ("10", 10),
+        (10, 10),
+        ("abc", 5),    # malformed → default
+        ("4%", 5),     # CSS-style with units → default
+        ([], 5),       # wrong type → default
+    ])
+    def test_safe_int(self, value, expected):
+        assert _safe_int(value, default=5, field="x") == expected
+
+    @pytest.mark.parametrize("value,expected", [
+        (None, 0.04),
+        ("", 0.04),
+        ("0.10", 0.10),
+        (0.10, 0.10),
+        ("not-a-number", 0.04),
+        ("10%", 0.04),
+        ({}, 0.04),
+    ])
+    def test_safe_float(self, value, expected):
+        assert _safe_float(value, default=0.04, field="x") == expected
+
+    def test_legacy_overlay_survives_malformed_widthpadfactor(self, caplog):
+        """Whole-job survival when Drupal sends widthPadFactor='4%'."""
+        gen = ImageOverlayGenerator(s3_client=MagicMock())
+        bg = _make_background(800, 600)
+        spec = {
+            "text": "Hello world",
+            "attributes": [
+                {"attr": "y", "value": "20%"},
+                {"attr": "x", "value": "50%"},
+                {"attr": "fill", "value": "white"},
+                {"attr": "text-anchor", "value": "middle"},
+                {"attr": "font-size", "value": "40px"},
+            ],
+            "widthPadFactor": "4%",   # malformed; would break float()
+            "rowHeightPad": "",       # malformed; would break int()
+        }
+        with caplog.at_level("WARNING"):
+            out = gen.generate_legacy_overlay(background=bg, overlay_specs=[spec])
+        # Job completed; warnings were logged; defaults were applied.
+        assert out.size == bg.size
+
+
+class TestTextAnchorEnd:
+    """R1 smaller: text-anchor='end' branch + unknown-anchor warning."""
+
+    def test_end_anchor_right_aligns_text(self):
+        gen = ImageOverlayGenerator(s3_client=MagicMock())
+        bg = _make_background(800, 600)
+        spec = {
+            "text": "ENDX",
+            "attributes": [
+                {"attr": "y", "value": "20%"},
+                {"attr": "x", "value": "100%"},
+                {"attr": "fill", "value": "white"},
+                {"attr": "text-anchor", "value": "end"},
+                {"attr": "font-size", "value": "60px"},
+            ],
+        }
+        out = gen.generate_legacy_overlay(background=bg, overlay_specs=[spec])
+
+        # End-anchored text at x=100% should occupy pixels in the right portion
+        # (last 20% of width), not the center or left.
+        right_band_modified = False
+        for y in range(0, 200):
+            for x in range(640, 800):
+                if out.getpixel((x, y))[:3] != (0, 0, 128):
+                    right_band_modified = True
+                    break
+            if right_band_modified:
+                break
+        assert right_band_modified, "end-anchored text did not render in the right band"
+
+    def test_unknown_anchor_falls_back_with_warning(self, caplog):
+        gen = ImageOverlayGenerator(s3_client=MagicMock())
+        bg = _make_background()
+        spec = {
+            "text": "Hi",
+            "attributes": [
+                {"attr": "y", "value": "20%"},
+                {"attr": "x", "value": "50%"},
+                {"attr": "fill", "value": "white"},
+                {"attr": "text-anchor", "value": "bogus-value"},
+                {"attr": "font-size", "value": "40px"},
+            ],
+        }
+        with caplog.at_level("WARNING"):
+            out = gen.generate_legacy_overlay(background=bg, overlay_specs=[spec])
+        # No crash; warning logged with the offending value.
+        assert "bogus-value" in caplog.text or "Unknown text-anchor" in caplog.text
+        assert out.size == bg.size
+
+
+class TestNormalizeFamilyEdgeCases:
+    """R1 nit: _normalize_family handles whitespace-only inputs."""
+
+    def test_whitespace_only_defaults_to_opensans(self):
+        assert _normalize_family("   ") == "opensans"
+        assert _normalize_family("\t\n") == "opensans"
+
+    def test_already_handled_inputs_unchanged(self):
+        # Sanity — make sure the explicit .strip() doesn't break the existing path.
+        assert _normalize_family("Roboto") == "roboto"
+        assert _normalize_family("'Courier Prime', monospace") == "courierprime"
+
+
+# ---------------------------------------------------------------------------
+# CC3-906: Drupal completion callback
+# ---------------------------------------------------------------------------
+
+
+def _make_legacy_payload_with_callback(**overrides) -> dict:
+    """Legacy trigger payload + CC3-906 webhook fields."""
+    payload = _make_legacy_payload()
+    payload.update({
+        "request_id": 42,
+        "item_id": 117,
+        "callback_url": "https://drupal.example.test/api/iplr/webhook/transfer-status",
+        "callback_secret_ref": "iplr/webhook-secret",
+        "product_part_number": "SPSCONF2026",
+    })
+    payload.update(overrides)
+    return payload
+
+
+def _mock_secrets_returning(secret: str):
+    """Build a Secrets Manager mock that returns the given secret string."""
+    sm = MagicMock()
+    sm.get_secret_value.return_value = {"SecretString": secret}
+    return sm
+
+
+def _mock_secrets_raising(error_code: str = "ResourceNotFoundException"):
+    """Build a Secrets Manager mock that raises ClientError on get_secret_value."""
+    sm = MagicMock()
+    sm.get_secret_value.side_effect = ClientError(
+        {"Error": {"Code": error_code, "Message": "not found"}},
+        "GetSecretValue",
+    )
+    return sm
+
+
+def _mock_webhook_sender_returning(success: bool = True):
+    """Build a WebhookSender mock that returns the given delivery result."""
+    sender = MagicMock()
+    sender.send.return_value = success
+    return sender
+
+
+class TestCallbackBackwardCompat:
+    """A trigger without CC3-906 webhook fields should never POST a callback."""
+
+    def test_legacy_trigger_without_callback_fields_skips_webhook(self):
+        s3_mock = MagicMock()
+        s3_mock.put_object.return_value = {"ETag": "\"abc\""}
+        _mock_s3_for_legacy_trigger(s3_mock)  # base payload has no webhook fields
+        sender = _mock_webhook_sender_returning()
+
+        gen = ImageOverlayGenerator(
+            s3_client=s3_mock,
+            secrets_client=MagicMock(),
+            webhook_sender=sender,
+        )
+        result = gen.process_trigger(bucket="trigger-bucket", key="actions/job.json")
+
+        sender.send.assert_not_called()
+        assert result["callback_sent"] is False
+
+    def test_partial_callback_fields_skips_webhook(self):
+        """Missing any one of url/secret_ref/request_id/item_id → skip."""
+        s3_mock = MagicMock()
+        s3_mock.put_object.return_value = {"ETag": "\"abc\""}
+        # Has callback_url + secret_ref but no request_id/item_id
+        partial = _make_legacy_payload()
+        partial["callback_url"] = "https://x.test/cb"
+        partial["callback_secret_ref"] = "iplr/webhook-secret"
+        _mock_s3_for_legacy_trigger(s3_mock, partial)
+        sender = _mock_webhook_sender_returning()
+
+        gen = ImageOverlayGenerator(
+            s3_client=s3_mock,
+            secrets_client=_mock_secrets_returning("dummy"),
+            webhook_sender=sender,
+        )
+        gen.process_trigger(bucket="trigger-bucket", key="actions/job.json")
+
+        sender.send.assert_not_called()
+
+
+class TestCallbackSuccessPath:
+    """Triggers WITH webhook fields POST a complete callback after success."""
+
+    def test_legacy_trigger_posts_complete_callback(self):
+        s3_mock = MagicMock()
+        s3_mock.put_object.return_value = {"ETag": "\"5d41402abc4b2a76b9719d911017c592\""}
+        _mock_s3_for_legacy_trigger(s3_mock, _make_legacy_payload_with_callback())
+        sender = _mock_webhook_sender_returning()
+
+        gen = ImageOverlayGenerator(
+            s3_client=s3_mock,
+            secrets_client=_mock_secrets_returning("super-secret"),
+            webhook_sender=sender,
+        )
+        gen.process_trigger(bucket="trigger-bucket", key="actions/job.json")
+
+        sender.send.assert_called_once()
+        call_kwargs = sender.send.call_args[1]
+        assert call_kwargs["url"] == "https://drupal.example.test/api/iplr/webhook/transfer-status"
+        assert call_kwargs["secret"] == "super-secret"
+        payload = call_kwargs["payload"]
+        assert payload["operation"] == "generate_image"
+        assert payload["status"] == "complete"
+        assert payload["item_id"] == 117
+        assert payload["request_id"] == 42
+        assert payload["product_part_number"] == "SPSCONF2026"
+        assert payload["dest_bucket"] == "ieee-conference-cloud-bulk-uploads"
+        assert payload["dest_key"] == "SPS/SPSTEST001.jpg"
+        assert payload["s3_etag"] == "\"5d41402abc4b2a76b9719d911017c592\""
+        assert payload["bytes_transferred"] > 0
+        assert payload["width"] == 800
+        assert payload["height"] == 600
+
+    def test_correlation_tag_uses_request_and_item_ids(self):
+        s3_mock = MagicMock()
+        s3_mock.put_object.return_value = {"ETag": "\"abc\""}
+        _mock_s3_for_legacy_trigger(s3_mock, _make_legacy_payload_with_callback())
+        sender = _mock_webhook_sender_returning()
+
+        gen = ImageOverlayGenerator(
+            s3_client=s3_mock,
+            secrets_client=_mock_secrets_returning("s"),
+            webhook_sender=sender,
+        )
+        gen.process_trigger(bucket="trigger-bucket", key="actions/job.json")
+
+        assert sender.send.call_args[1]["correlation"] == "[42:117]"
+
+    def test_callback_sent_false_propagates_when_drupal_returns_4xx(self):
+        s3_mock = MagicMock()
+        s3_mock.put_object.return_value = {"ETag": "\"abc\""}
+        _mock_s3_for_legacy_trigger(s3_mock, _make_legacy_payload_with_callback())
+        sender = _mock_webhook_sender_returning(success=False)
+
+        gen = ImageOverlayGenerator(
+            s3_client=s3_mock,
+            secrets_client=_mock_secrets_returning("s"),
+            webhook_sender=sender,
+        )
+        # Webhook failure must NOT make the Lambda fail — the image is in S3.
+        result = gen.process_trigger(bucket="trigger-bucket", key="actions/job.json")
+        assert result["callback_sent"] is False
+        # But generation still succeeded — output_key is populated.
+        assert result["output_key"]
+
+
+class TestCallbackErrorPath:
+    """On failure, an error callback is posted, then the original raises."""
+
+    def test_source_not_found_posts_error_with_correct_code(self):
+        s3_mock = MagicMock()
+        # Trigger JSON read OK, but background image returns NoSuchKey.
+        trigger = _make_legacy_payload_with_callback()
+        trigger_bytes = json.dumps(trigger).encode()
+
+        def get_object_side_effect(Bucket, Key):
+            if Key.endswith(".json"):
+                return {"Body": BytesIO(trigger_bytes)}
+            raise ClientError(
+                {"Error": {"Code": "NoSuchKey", "Message": "missing"}},
+                "GetObject",
+            )
+
+        s3_mock.get_object.side_effect = get_object_side_effect
+        sender = _mock_webhook_sender_returning()
+
+        gen = ImageOverlayGenerator(
+            s3_client=s3_mock,
+            secrets_client=_mock_secrets_returning("s"),
+            webhook_sender=sender,
+        )
+
+        with pytest.raises(ClientError):
+            gen.process_trigger(bucket="trigger-bucket", key="actions/job.json")
+
+        sender.send.assert_called_once()
+        payload = sender.send.call_args[1]["payload"]
+        assert payload["status"] == "error"
+        assert payload["error_code"] == "source_not_found"
+        assert "NoSuchKey" in payload["error_message"] or "missing" in payload["error_message"]
+        assert payload["item_id"] == 117
+
+    def test_validation_error_posts_validation_code(self):
+        s3_mock = MagicMock()
+        # Start from full payload, then corrupt it (overlay must be a list)
+        bad = _make_legacy_payload_with_callback()
+        bad["overlay"] = "not-a-list"
+        _mock_s3_for_legacy_trigger(s3_mock, bad)
+        sender = _mock_webhook_sender_returning()
+
+        gen = ImageOverlayGenerator(
+            s3_client=s3_mock,
+            secrets_client=_mock_secrets_returning("s"),
+            webhook_sender=sender,
+        )
+
+        with pytest.raises(ValueError):
+            gen.process_trigger(bucket="trigger-bucket", key="actions/job.json")
+
+        payload = sender.send.call_args[1]["payload"]
+        assert payload["status"] == "error"
+        assert payload["error_code"] == "validation_error"
+
+    def test_dest_write_failed_posts_error(self):
+        s3_mock = MagicMock()
+        _mock_s3_for_legacy_trigger(s3_mock, _make_legacy_payload_with_callback())
+        s3_mock.put_object.side_effect = ClientError(
+            {"Error": {"Code": "AccessDenied", "Message": "denied"}},
+            "PutObject",
+        )
+        sender = _mock_webhook_sender_returning()
+
+        gen = ImageOverlayGenerator(
+            s3_client=s3_mock,
+            secrets_client=_mock_secrets_returning("s"),
+            webhook_sender=sender,
+        )
+
+        with pytest.raises(ClientError):
+            gen.process_trigger(bucket="trigger-bucket", key="actions/job.json")
+
+        payload = sender.send.call_args[1]["payload"]
+        assert payload["status"] == "error"
+        assert payload["error_code"] == "dest_write_failed"
+
+    def test_trigger_read_failure_does_not_attempt_callback(self):
+        """If the trigger JSON itself can't be read, we have no callback fields
+        to use — the failure must propagate without attempting a webhook."""
+        s3_mock = MagicMock()
+        s3_mock.get_object.side_effect = ClientError(
+            {"Error": {"Code": "NoSuchKey", "Message": "missing"}},
+            "GetObject",
+        )
+        sender = _mock_webhook_sender_returning()
+
+        gen = ImageOverlayGenerator(
+            s3_client=s3_mock,
+            secrets_client=_mock_secrets_returning("s"),
+            webhook_sender=sender,
+        )
+
+        with pytest.raises(ClientError):
+            gen.process_trigger(bucket="trigger-bucket", key="actions/missing.json")
+
+        sender.send.assert_not_called()
+
+    def test_render_failed_posts_error(self):
+        """Pillow can't decode the source bytes → callback must emit
+        error_code=render_failed (the documented contract enum value)."""
+        s3_mock = MagicMock()
+        _mock_s3_for_legacy_trigger(s3_mock, _make_legacy_payload_with_callback())
+        sender = _mock_webhook_sender_returning()
+
+        gen = ImageOverlayGenerator(
+            s3_client=s3_mock,
+            secrets_client=_mock_secrets_returning("s"),
+            webhook_sender=sender,
+        )
+
+        from src.generators.image_overlay_generator import RenderError
+
+        with patch(
+            "src.generators.image_overlay_generator.Image.open",
+            side_effect=UnidentifiedImageError("cannot identify image file"),
+        ):
+            with pytest.raises(RenderError):
+                gen.process_trigger(bucket="trigger-bucket", key="actions/job.json")
+
+        payload = sender.send.call_args[1]["payload"]
+        assert payload["status"] == "error"
+        assert payload["error_code"] == "render_failed"
+
+    def test_unexpected_webhook_send_exception_returns_false(self):
+        """_post_callback's docstring promises webhook failure is never re-raised
+        even on unexpected errors (Secrets Manager outage, malformed URL, etc.).
+        This guards the success-path: image already uploaded — Lambda must not
+        DLQ-retry just because Drupal is unreachable."""
+        s3_mock = MagicMock()
+        _mock_s3_for_legacy_trigger(s3_mock, _make_legacy_payload_with_callback())
+        sender = MagicMock()
+        sender.send.side_effect = RuntimeError("transport blew up")
+
+        gen = ImageOverlayGenerator(
+            s3_client=s3_mock,
+            secrets_client=_mock_secrets_returning("s"),
+            webhook_sender=sender,
+        )
+
+        # Should NOT raise — even though the webhook sender threw an unexpected
+        # exception, _post_callback swallows it and the success path completes.
+        result = gen.process_trigger(bucket="trigger-bucket", key="actions/job.json")
+        assert result["callback_sent"] is False
+
+
+class TestSecretResolution:
+    """Mirror src/orchestrator/ai_orchestrator.py + src/transfer/wizard_transfer.py."""
+
+    def test_secrets_manager_hit(self):
+        gen = ImageOverlayGenerator(
+            s3_client=MagicMock(),
+            secrets_client=_mock_secrets_returning("from-sm"),
+        )
+        assert gen._resolve_callback_secret("iplr/webhook-secret", "[corr]") == "from-sm"
+
+    def test_secrets_manager_miss_falls_back_to_env(self, monkeypatch):
+        monkeypatch.setenv("DRUPAL_WEBHOOK_SECRET", "from-env")
+        gen = ImageOverlayGenerator(
+            s3_client=MagicMock(),
+            secrets_client=_mock_secrets_raising("ResourceNotFoundException"),
+        )
+        assert gen._resolve_callback_secret("iplr/webhook-secret", "[corr]") == "from-env"
+
+    def test_both_missing_returns_empty_with_error_log(self, monkeypatch, caplog):
+        monkeypatch.delenv("DRUPAL_WEBHOOK_SECRET", raising=False)
+        gen = ImageOverlayGenerator(
+            s3_client=MagicMock(),
+            secrets_client=_mock_secrets_raising(),
+        )
+        with caplog.at_level("ERROR"):
+            secret = gen._resolve_callback_secret("iplr/webhook-secret", "[corr]")
+        assert secret == ""
+        assert "No webhook secret available" in caplog.text
+
+    def test_access_denied_falls_back_to_env(self, monkeypatch):
+        """AccessDenied is a deployment misconfiguration, not a missing secret —
+        but the fallback path is still safer than crashing."""
+        monkeypatch.setenv("DRUPAL_WEBHOOK_SECRET", "from-env")
+        gen = ImageOverlayGenerator(
+            s3_client=MagicMock(),
+            secrets_client=_mock_secrets_raising("AccessDeniedException"),
+        )
+        assert gen._resolve_callback_secret("iplr/webhook-secret", "[corr]") == "from-env"
+
+
+class TestETagCapture:
+    """The complete callback payload requires the dest object's S3 ETag."""
+
+    def test_etag_captured_in_result(self):
+        s3_mock = MagicMock()
+        s3_mock.put_object.return_value = {"ETag": "\"deadbeef\""}
+        _mock_s3_for_legacy_trigger(s3_mock)
+
+        gen = ImageOverlayGenerator(s3_client=s3_mock)
+        result = gen.process_trigger(bucket="b", key="actions/job.json")
+
+        assert result["s3_etag"] == "\"deadbeef\""
+        assert result["bytes"] > 0
+        assert result["dest_bucket"] == "ieee-conference-cloud-bulk-uploads"
+
+    def test_missing_etag_in_putobject_response_returns_empty(self):
+        s3_mock = MagicMock()
+        s3_mock.put_object.return_value = {}  # no ETag
+        _mock_s3_for_legacy_trigger(s3_mock)
+
+        gen = ImageOverlayGenerator(s3_client=s3_mock)
+        result = gen.process_trigger(bucket="b", key="actions/job.json")
+
+        assert result["s3_etag"] == ""

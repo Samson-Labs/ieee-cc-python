@@ -26,7 +26,7 @@ The PDF Text Extractor (`ieee-cc-pdf-extractor`) is a reusable Lambda module tha
 - [x] Extracts text from single-column and multi-column PDFs
 - [x] Handles scanned PDFs gracefully (returns empty text with warning, no crash)
 - [x] Strips headers, footers, and page numbers where possible
-- [x] Returns structured result: `{"text": "...", "page_count": N, "extraction_method": "text|ocr|failed"}`
+- [x] Returns structured result: `{"text": "...", "page_count": N, "extraction_method": "extract_text|ocr|failed"}`
 - [x] Truncates text to 180,000 characters (fits within Claude Sonnet context window)
 - [x] Returns page_count for the MetadataExtractor on Drupal side
 - [x] Writes page count JSON to `{ou}/metadata/{product_part_number}.pdf.json`
@@ -44,7 +44,7 @@ The PDF Text Extractor (`ieee-cc-pdf-extractor`) is a reusable Lambda module tha
 ```json
 {
   "pageCount": 42,
-  "extractionMethod": "text",
+  "extractionMethod": "extract_text",
   "extractedAt": "2026-03-15T14:30:00.123456Z"
 }
 ```
@@ -65,7 +65,7 @@ The PDF Text Extractor (`ieee-cc-pdf-extractor`) is a reusable Lambda module tha
 
 **Expected:**
 - `statusCode: 200`
-- `extraction_method: "text"`
+- `extraction_method: "extract_text"`
 - `page_count` matches actual PDF page count
 - `text` contains meaningful extracted content
 - Metadata JSON written to `PES/metadata/PES_TR_TR139_ITSLC_012826.pdf.json`
@@ -89,7 +89,7 @@ aws s3 cp s3://dev-ieee-conference-cloud-bulk-uploads/PES/metadata/PES_TR_TR139_
 
 **Expected:**
 - `statusCode: 200`
-- `extraction_method: "text"`
+- `extraction_method: "extract_text"`
 - `text` length is exactly 180,000 characters (truncated)
 - No errors or crashes
 
@@ -107,7 +107,7 @@ aws s3 cp s3://dev-ieee-conference-cloud-bulk-uploads/PES/metadata/PES_TR_TR139_
 
 **Expected:**
 - `statusCode: 200`
-- `extraction_method: "text"`
+- `extraction_method: "extract_text"`
 - Text from both columns extracted (not garbled/merged)
 - `page_count` matches actual page count
 
@@ -144,7 +144,7 @@ aws s3 cp s3://dev-ieee-conference-cloud-bulk-uploads/PES/metadata/PES_TR_TR139_
 
 **Expected:**
 - `statusCode: 200`
-- `extraction_method: "text"`
+- `extraction_method: "extract_text"`
 - Text length less than 180,000 (no truncation needed)
 - Content is readable and meaningful
 
@@ -195,20 +195,20 @@ aws lambda invoke \
 ### Test 1: Normal Single-Column PDF (43 pages, 1.6 MB)
 - **File:** `PES/pending/PES_TR_TR139_ITSLC_012826.pdf`
 - **Result:** PASSED
-- **Response:** `statusCode: 200`, `page_count: 43`, `extraction_method: "text"`, `text_length: 180,000` (truncated)
-- **Metadata:** `{"pageCount": 43, "extractionMethod": "text", "extractedAt": "2026-03-18T15:20:36.049466Z"}`
+- **Response:** `statusCode: 200`, `page_count: 43`, `extraction_method: "extract_text"`, `text_length: 180,000` (truncated)
+- **Metadata:** `{"pageCount": 43, "extractionMethod": "extract_text", "extractedAt": "2026-03-18T15:20:36.049466Z"}`
 
 ### Test 2: Large Technical Report (89 pages, 3.1 MB)
 - **File:** `PES/pending/PES_TR_138_SBLCS_011726.pdf`
 - **Result:** PASSED
-- **Response:** `statusCode: 200`, `page_count: 89`, `extraction_method: "text"`, `text_length: 180,000` (truncated)
+- **Response:** `statusCode: 200`, `page_count: 89`, `extraction_method: "extract_text"`, `text_length: 180,000` (truncated)
 - **Verification:** Text correctly truncated to 180k char limit
 
 ### Test 3: Multi-Column Magazine (92 pages, 70 MB)
 - **File:** `PES/pending/PES_MAG_ELE_13-4.pdf`
 - **Result:** PASSED
-- **Response:** `statusCode: 200`, `page_count: 92`, `extraction_method: "text"`, `text_length: 180,000` (truncated)
-- **Metadata:** `{"pageCount": 92, "extractionMethod": "text", "extractedAt": "2026-03-16T17:00:14.623358Z"}`
+- **Response:** `statusCode: 200`, `page_count: 92`, `extraction_method: "extract_text"`, `text_length: 180,000` (truncated)
+- **Metadata:** `{"pageCount": 92, "extractionMethod": "extract_text", "extractedAt": "2026-03-16T17:00:14.623358Z"}`
 
 ### Test 4: Scanned PDF / Image-Only (187 pages, 94 MB)
 - **File:** `PES/pending/PES_PUB_TP_TP101_101995.pdf`
@@ -219,7 +219,7 @@ aws lambda invoke \
 ### Test 5: Small Whitepaper (34 pages, 1.5 MB)
 - **File:** `PES/pending/pes_wp_peswfi_wfi_022025.pdf`
 - **Result:** PASSED
-- **Response:** `statusCode: 200`, `page_count: 34`, `extraction_method: "text"`, `text_length: 71,971`
+- **Response:** `statusCode: 200`, `page_count: 34`, `extraction_method: "extract_text"`, `text_length: 71,971`
 - **Notes:** No truncation needed (under 180k limit)
 
 ### Results Summary

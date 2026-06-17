@@ -1,0 +1,111 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ieee.org/schemas/transfer-trigger-v1.json",
+  "title": "Wizard async transfer trigger (CC3-898 / CC3-896)",
+  "description": "Per-item trigger JSON written by Drupal to s3://{trigger-bucket}/transfer-actions/{request_id}-{item_id}-{operation}.json. Read by the ieee-rc-wizard-transfer Lambda, which streams the source bytes (Google Drive or URL) into S3 via multipart upload and POSTs an HMAC-signed callback to Drupal. This file MUST be byte-identical in Samson-Labs/ieee-cc and Samson-Labs/ieee-cc-python.",
+  "type": "object",
+  "required": [
+    "version",
+    "source_type",
+    "source_ref",
+    "dest_bucket",
+    "dest_key",
+    "item_id",
+    "request_id",
+    "operation",
+    "callback_url",
+    "callback_secret_ref"
+  ],
+  "properties": {
+    "version": {
+      "const": 1,
+      "description": "Schema version. Bump when introducing breaking changes."
+    },
+    "source_type": {
+      "enum": ["google_drive", "url"],
+      "description": "google_drive uses drive_oauth_token_ref + Drive API; url is a plain HTTPS GET."
+    },
+    "source_ref": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Drive file ID (when source_type=google_drive) or absolute https:// URL (when source_type=url)."
+    },
+    "drive_oauth_token_ref": {
+      "type": "string",
+      "minLength": 1,
+      "description": "AWS Secrets Manager secret name holding the user's Drive OAuth access token. Required when source_type=google_drive. Naming convention: iplr/drive-tokens/{request_id}-{item_id}. Drupal mints the secret per dispatch (s3fs role needs CreateSecret/PutSecretValue/DeleteSecret on iplr/drive-tokens/*); Lambda only reads it."
+    },
+    "dest_bucket": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Destination S3 bucket. Lambda needs s3:PutObject/s3:AbortMultipartUpload on this bucket."
+    },
+    "dest_key": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Full destination S3 key including any OU prefix (e.g. ou-bps/pending/{filename}.mp4). Lambda does not transform this."
+    },
+    "item_id": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Drupal ProductLoadItem entity id; echoed back in the callback."
+    },
+    "request_id": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Drupal correlation id (a per-dispatch counter); echoed back in the callback. Used in CloudWatch logs."
+    },
+    "operation": {
+      "enum": ["transfer_media", "transfer_image"],
+      "description": "Discriminator for downstream handling on the Drupal side. Lambda treats both identically (raw byte transfer)."
+    },
+    "callback_url": {
+      "type": "string",
+      "format": "uri",
+      "description": "Drupal endpoint Lambda POSTs the result to (e.g. https://cc-ieee.lndo.site/api/iplr/webhook/media-transfer)."
+    },
+    "callback_secret_ref": {
+      "type": "string",
+      "minLength": 1,
+      "description": "AWS Secrets Manager secret name holding the HMAC-SHA256 signing key (shared with the existing AI webhook secret today)."
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "source_type": { "const": "google_drive" } }
+      },
+      "then": {
+        "required": ["drive_oauth_token_ref"]
+      }
+    }
+  ],
+  "additionalProperties": false,
+  "examples": [
+    {
+      "version": 1,
+      "source_type": "google_drive",
+      "source_ref": "1AbCdEfGhIjKlMnOpQrStUvWxYz0123456",
+      "drive_oauth_token_ref": "iplr/drive-tokens/42-117",
+      "dest_bucket": "dev-ieee-conference-cloud-bulk-uploads",
+      "dest_key": "ou-bps/pending/conference-keynote.mp4",
+      "item_id": 117,
+      "request_id": 42,
+      "operation": "transfer_media",
+      "callback_url": "https://cc-ieee.lndo.site/api/iplr/webhook/media-transfer",
+      "callback_secret_ref": "iplr/webhook-secret"
+    },
+    {
+      "version": 1,
+      "source_type": "url",
+      "source_ref": "https://example.com/uploads/poster.jpg",
+      "dest_bucket": "dev-ieee-conference-cloud-bulk-uploads",
+      "dest_key": "ou-bps/pending/poster.jpg",
+      "item_id": 118,
+      "request_id": 42,
+      "operation": "transfer_image",
+      "callback_url": "https://cc-ieee.lndo.site/api/iplr/webhook/media-transfer",
+      "callback_secret_ref": "iplr/webhook-secret"
+    }
+  ]
+}

@@ -1,0 +1,111 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ieee.org/schemas/image-overlay-callback-v1.json",
+  "title": "Image Overlay Callback v1 (CC3-906)",
+  "description": "Wire format for the webhook the ieee-rc-image-generator Lambda POSTs to Drupal once an image-generation job reaches a terminal state. Body is signed with HMAC-SHA256 (hex-encoded) using the secret resolved from callback_secret_ref in the trigger; signature lives in X-Webhook-Signature. Drupal updates the corresponding ProductLoadItem's image_transfer_status (and related media_metadata) on receipt — replacing the S3 HeadObject polling loop introduced in CC3-905.",
+  "type": "object",
+  "required": ["item_id", "request_id", "operation", "status"],
+  "additionalProperties": false,
+  "properties": {
+    "item_id": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Echoed from the trigger. Drupal loads ProductLoadItem by this id."
+    },
+    "request_id": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Echoed from the trigger. Drupal verifies the item belongs to this request before updating."
+    },
+    "operation": {
+      "type": "string",
+      "const": "generate_image",
+      "description": "Constant 'generate_image' so Drupal's WebhookController can multiplex this callback alongside transfer_media / transfer_image."
+    },
+    "status": {
+      "type": "string",
+      "enum": ["complete", "error"],
+      "description": "Terminal state only. Lambda must not POST 'pending' or 'in_progress' callbacks."
+    },
+    "product_part_number": {
+      "type": "string",
+      "description": "Echoed for log/debug context. Drupal already has this on the item."
+    },
+    "dest_bucket": {
+      "type": "string",
+      "description": "Required on status=complete. Final S3 bucket the output landed in (with STAGE prefix applied). Stored on media_metadata for audit."
+    },
+    "dest_key": {
+      "type": "string",
+      "description": "Required on status=complete. Final S3 key of the rendered image."
+    },
+    "bytes_transferred": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Required on status=complete. Size of the rendered image in bytes. Field name matches transfer-callback-v1.json so Drupal's WebhookController can validate both callbacks uniformly."
+    },
+    "s3_etag": {
+      "type": "string",
+      "description": "Required on status=complete. ETag of the dest object from the PutObject response. Stored for audit."
+    },
+    "width": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Required on status=complete. Pixel width of the rendered image."
+    },
+    "height": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Required on status=complete. Pixel height of the rendered image."
+    },
+    "error_code": {
+      "type": "string",
+      "enum": [
+        "source_not_found",
+        "dest_write_failed",
+        "validation_error",
+        "render_failed",
+        "internal"
+      ],
+      "description": "Required when status=error. Machine-readable failure mode. Drupal surfaces a user-facing message keyed off this; 'internal' is the catch-all and should be rare."
+    },
+    "error_message": {
+      "type": "string",
+      "description": "Free-text detail. Logged to watchdog and stored on the item's media_metadata. Not user-facing."
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "status": { "const": "complete" } } },
+      "then": { "required": ["dest_bucket", "dest_key", "bytes_transferred", "s3_etag", "width", "height"] }
+    },
+    {
+      "if": { "properties": { "status": { "const": "error" } } },
+      "then": { "required": ["error_code", "error_message"] }
+    }
+  ],
+  "examples": [
+    {
+      "item_id": 117,
+      "request_id": 42,
+      "operation": "generate_image",
+      "status": "complete",
+      "product_part_number": "SPSCONF2026",
+      "dest_bucket": "dev-ieee-conference-cloud-bulk-uploads",
+      "dest_key": "SPS/SPSCONF2026.jpg",
+      "bytes_transferred": 184293,
+      "s3_etag": "\"5d41402abc4b2a76b9719d911017c592\"",
+      "width": 1920,
+      "height": 1080
+    },
+    {
+      "item_id": 118,
+      "request_id": 42,
+      "operation": "generate_image",
+      "status": "error",
+      "product_part_number": "SPSCONF2026",
+      "error_code": "source_not_found",
+      "error_message": "GET s3://dev-ieee-conference-cloud-uploads/video-image-backgrounds/conferences/missing.jpg returned NoSuchKey"
+    }
+  ]
+}

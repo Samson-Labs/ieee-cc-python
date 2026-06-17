@@ -15,18 +15,24 @@ import pytest
 from botocore.exceptions import ClientError
 
 from src.ai.bedrock_inference import (
+    ALL_FIELDS,
     BACKOFF_BASE,
     DEFAULT_MODEL_ID,
     MAX_RETRIES,
     MAX_TOKENS,
+    MAX_TOOL_ITERATIONS,
     SYSTEM_PROMPT,
+    SYSTEM_PROMPT_NO_TOOL,
     TEMPERATURE,
     TEXT_TRUNCATION_LIMIT,
+    THESAURUS_TOOL,
     VALID_AUDIENCES,
     VALID_CATEGORIES,
     VALID_LEARNING_LEVELS,
     BedrockInference,
+    _build_system_prompt,
 )
+from src.ai.thesaurus import ThesaurusSearch
 
 
 # ---------------------------------------------------------------------------
@@ -86,8 +92,16 @@ def bedrock_mock():
 
 
 @pytest.fixture
-def inference(bedrock_mock):
-    return BedrockInference(bedrock_client=bedrock_mock)
+def empty_thesaurus(tmp_path):
+    """Thesaurus with no data — disables tool use for legacy tests."""
+    path = tmp_path / "empty.json"
+    path.write_text('{"terms": []}')
+    return ThesaurusSearch(data_path=str(path))
+
+
+@pytest.fixture
+def inference(bedrock_mock, empty_thesaurus):
+    return BedrockInference(bedrock_client=bedrock_mock, thesaurus=empty_thesaurus)
 
 
 # ---------------------------------------------------------------------------
@@ -126,7 +140,8 @@ class TestGenerateMetadata:
         body = json.loads(call_kwargs["body"])
         assert body["max_tokens"] == MAX_TOKENS
         assert body["temperature"] == TEMPERATURE
-        assert body["system"] == SYSTEM_PROMPT
+        # Empty thesaurus → no-tool prompt (tool references not sent without thesaurus)
+        assert body["system"] == SYSTEM_PROMPT_NO_TOOL
         assert body["messages"][0]["role"] == "user"
         assert body["messages"][0]["content"] == "Document text here"
 
@@ -155,9 +170,9 @@ class TestGenerateMetadata:
         body = json.loads(bedrock_mock.invoke_model.call_args[1]["body"])
         assert len(body["messages"][0]["content"]) == TEXT_TRUNCATION_LIMIT
 
-    def test_uses_env_model_id(self, bedrock_mock):
+    def test_uses_env_model_id(self, bedrock_mock, empty_thesaurus):
         with patch.dict("os.environ", {"BEDROCK_MODEL_ID": "custom-model-v2"}):
-            inf = BedrockInference(bedrock_client=bedrock_mock)
+            inf = BedrockInference(bedrock_client=bedrock_mock, thesaurus=empty_thesaurus)
 
         metadata = _valid_metadata()
         bedrock_mock.invoke_model.return_value = _bedrock_response(
@@ -294,54 +309,73 @@ class TestValidation:
             with pytest.raises(ValueError, match="Missing required fields"):
                 inference.generate_metadata(text="text")
 
-    def test_abstract_no_paragraphs_raises(self, inference, bedrock_mock):
+    def test_abstract_single_paragraph_accepted(self, inference, bedrock_mock):
+        # CC3-1049: off-format abstract (1 paragraph) is accepted, not rejected —
+        # the reviewer can reshape it in AI Review.
         metadata = _valid_metadata()
         metadata["abstract"] = " ".join(["word"] * 80)  # single paragraph
         bedrock_mock.invoke_model.return_value = _bedrock_response(
             json.dumps(metadata)
         )
 
-        with pytest.raises(ValueError, match="two paragraphs"):
-            inference.generate_metadata(text="text")
+        result = inference.generate_metadata(text="text")
+        assert result["abstract"] == metadata["abstract"]
 
-    def test_abstract_paragraph_too_short_raises(self, inference, bedrock_mock):
+    def test_abstract_off_length_paragraphs_accepted(self, inference, bedrock_mock):
+        # CC3-1049: paragraphs outside the 50–150-word target are accepted.
         metadata = _valid_metadata()
-        metadata["abstract"] = "Short.\n\n" + " ".join(["word"] * 80)
+        metadata["abstract"] = "Short.\n\n" + " ".join(["word"] * 160)
         bedrock_mock.invoke_model.return_value = _bedrock_response(
             json.dumps(metadata)
         )
 
-        with pytest.raises(ValueError, match="words"):
-            inference.generate_metadata(text="text")
+        result = inference.generate_metadata(text="text")
+        assert result["abstract"] == metadata["abstract"]
 
-    def test_abstract_paragraph_too_long_raises(self, inference, bedrock_mock):
+    def test_abstract_empty_raises(self, inference, bedrock_mock):
+        # The one remaining hard requirement: a non-empty string.
         metadata = _valid_metadata()
-        metadata["abstract"] = " ".join(["word"] * 160) + "\n\n" + " ".join(["word"] * 80)
+        metadata["abstract"] = "   "
         bedrock_mock.invoke_model.return_value = _bedrock_response(
             json.dumps(metadata)
         )
 
-        with pytest.raises(ValueError, match="words"):
+        with pytest.raises(ValueError, match="non-empty"):
             inference.generate_metadata(text="text")
 
-    def test_keywords_too_few_raises(self, inference, bedrock_mock):
+    def test_keywords_few_accepted(self, inference, bedrock_mock):
+        # CC3-1049: a low keyword count is non-fatal — accept what the model
+        # returned rather than 422-ing the whole item (which stranded loads).
         metadata = _valid_metadata()
         metadata["keywords"] = ["a", "b", "c"]
         bedrock_mock.invoke_model.return_value = _bedrock_response(
             json.dumps(metadata)
         )
 
-        with pytest.raises(ValueError, match="8–12"):
-            inference.generate_metadata(text="text")
+        result = inference.generate_metadata(text="text")
+        assert result["keywords"] == ["a", "b", "c"]
 
-    def test_keywords_too_many_raises(self, inference, bedrock_mock):
+    def test_keywords_too_many_clamped(self, inference, bedrock_mock):
+        # CC3-1049: an over-eager model is clamped to MAX_KEYWORDS, not rejected.
         metadata = _valid_metadata()
         metadata["keywords"] = [f"kw{i}" for i in range(15)]
         bedrock_mock.invoke_model.return_value = _bedrock_response(
             json.dumps(metadata)
         )
 
-        with pytest.raises(ValueError, match="8–12"):
+        result = inference.generate_metadata(text="text")
+        assert result["keywords"] == [f"kw{i}" for i in range(12)]
+
+    def test_keywords_empty_raises(self, inference, bedrock_mock):
+        # The one remaining hard failure: zero usable keywords. With L1 in place
+        # this now surfaces to Drupal as a failure webhook rather than a stall.
+        metadata = _valid_metadata()
+        metadata["keywords"] = []
+        bedrock_mock.invoke_model.return_value = _bedrock_response(
+            json.dumps(metadata)
+        )
+
+        with pytest.raises(ValueError, match="at least one"):
             inference.generate_metadata(text="text")
 
     def test_invalid_learning_level_raises(self, inference, bedrock_mock):
@@ -411,9 +445,9 @@ class TestValidation:
 
 
 class TestCloudWatchMetrics:
-    def test_publishes_token_metrics(self, bedrock_mock):
+    def test_publishes_token_metrics(self, bedrock_mock, empty_thesaurus):
         cw_mock = MagicMock()
-        inference = BedrockInference(bedrock_client=bedrock_mock, cloudwatch_client=cw_mock)
+        inference = BedrockInference(bedrock_client=bedrock_mock, cloudwatch_client=cw_mock, thesaurus=empty_thesaurus)
         metadata = _valid_metadata()
         bedrock_mock.invoke_model.return_value = _bedrock_response(
             json.dumps(metadata), input_tokens=500, output_tokens=200
@@ -431,9 +465,9 @@ class TestCloudWatchMetrics:
         assert names["bedrock-output-tokens"]["Value"] == 200
         assert names["bedrock-output-tokens"]["Unit"] == "Count"
 
-    def test_accumulates_tokens_on_json_retry(self, bedrock_mock):
+    def test_accumulates_tokens_on_json_retry(self, bedrock_mock, empty_thesaurus):
         cw_mock = MagicMock()
-        inference = BedrockInference(bedrock_client=bedrock_mock, cloudwatch_client=cw_mock)
+        inference = BedrockInference(bedrock_client=bedrock_mock, cloudwatch_client=cw_mock, thesaurus=empty_thesaurus)
         metadata = _valid_metadata()
         bedrock_mock.invoke_model.side_effect = [
             _bedrock_response("not json", input_tokens=100, output_tokens=50),
@@ -455,3 +489,220 @@ class TestCloudWatchMetrics:
 
         assert result["input_tokens"] == 100
         assert result["output_tokens"] == 50
+
+
+# ---------------------------------------------------------------------------
+# Helpers: tool-use responses
+# ---------------------------------------------------------------------------
+
+
+def _tool_use_response(
+    tool_calls: list[dict],
+    text: str = "",
+    input_tokens: int = 100,
+    output_tokens: int = 50,
+) -> dict:
+    """Create a mock Bedrock response that requests tool use."""
+    content = []
+    if text:
+        content.append({"type": "text", "text": text})
+    for tc in tool_calls:
+        content.append({
+            "type": "tool_use",
+            "id": tc.get("id", "call_001"),
+            "name": tc.get("name", "search_ieee_thesaurus"),
+            "input": tc.get("input", {"query": "test"}),
+        })
+    body_bytes = json.dumps({
+        "content": content,
+        "stop_reason": "tool_use",
+        "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
+    }).encode()
+    return {"body": BytesIO(body_bytes)}
+
+
+def _final_response(content: str, input_tokens: int = 100, output_tokens: int = 50) -> dict:
+    """Create a mock Bedrock final response (end_turn)."""
+    return _bedrock_response(content, input_tokens, output_tokens)
+
+
+# ---------------------------------------------------------------------------
+# Tests: tool use with thesaurus
+# ---------------------------------------------------------------------------
+
+
+class TestToolUse:
+    @pytest.fixture
+    def sample_thesaurus(self, tmp_path):
+        data = {
+            "terms": [
+                {
+                    "preferred_term": "Machine learning",
+                    "scope_note": "A branch of AI",
+                    "use_for": ["ML"],
+                    "broader_terms": ["Artificial intelligence"],
+                    "narrower_terms": [],
+                    "related_terms": [],
+                },
+                {
+                    "preferred_term": "Neural networks",
+                    "scope_note": "",
+                    "use_for": ["ANN"],
+                    "broader_terms": [],
+                    "narrower_terms": [],
+                    "related_terms": [],
+                },
+                {
+                    "preferred_term": "Economics",
+                    "scope_note": "",
+                    "use_for": [],
+                    "broader_terms": [],
+                    "narrower_terms": ["Macroeconomics"],
+                    "related_terms": [],
+                },
+                {
+                    "preferred_term": "Macroeconomics",
+                    "scope_note": "",
+                    "use_for": [],
+                    "broader_terms": ["Economics"],
+                    "narrower_terms": [],
+                    "related_terms": [],
+                },
+            ],
+        }
+        path = tmp_path / "thesaurus.json"
+        path.write_text(json.dumps(data))
+        return ThesaurusSearch(data_path=str(path))
+
+    @pytest.fixture
+    def tool_inference(self, bedrock_mock, sample_thesaurus):
+        return BedrockInference(bedrock_client=bedrock_mock, thesaurus=sample_thesaurus)
+
+    def test_includes_tools_in_request(self, tool_inference, bedrock_mock):
+        """When thesaurus is loaded, request should include tools."""
+        metadata = _valid_metadata()
+        # LLM responds directly without using tools
+        bedrock_mock.invoke_model.return_value = _final_response(
+            json.dumps(metadata)
+        )
+
+        tool_inference.generate_metadata(text="Some ML text")
+
+        body = json.loads(bedrock_mock.invoke_model.call_args[1]["body"])
+        assert "tools" in body
+        assert body["tools"][0]["name"] == "search_ieee_thesaurus"
+
+    def test_tool_use_loop(self, tool_inference, bedrock_mock):
+        """LLM calls thesaurus tool, gets results, then produces final output."""
+        metadata = _valid_metadata()
+
+        bedrock_mock.invoke_model.side_effect = [
+            # First call: LLM requests tool use
+            _tool_use_response([{
+                "id": "call_001",
+                "name": "search_ieee_thesaurus",
+                "input": {"query": "machine learning neural networks"},
+            }]),
+            # Second call: LLM produces final JSON
+            _final_response(json.dumps(metadata)),
+        ]
+
+        result = tool_inference.generate_metadata(text="ML paper text")
+
+        assert result["learning_level"] == "Professional"
+        assert bedrock_mock.invoke_model.call_count == 2
+
+        # Verify second call includes tool results in messages
+        second_body = json.loads(bedrock_mock.invoke_model.call_args_list[1][1]["body"])
+        messages = second_body["messages"]
+        # Should have: user text, assistant tool_use, user tool_result
+        assert len(messages) == 3
+        assert messages[0]["role"] == "user"
+        assert messages[1]["role"] == "assistant"
+        assert messages[2]["role"] == "user"
+        # Tool result should contain thesaurus search results
+        tool_result_content = messages[2]["content"][0]["content"]
+        assert "Machine learning" in tool_result_content
+
+    def test_multiple_tool_calls(self, tool_inference, bedrock_mock):
+        """LLM can make multiple tool calls in sequence."""
+        metadata = _valid_metadata()
+
+        bedrock_mock.invoke_model.side_effect = [
+            # First iteration: two tool calls
+            _tool_use_response([
+                {"id": "call_001", "input": {"query": "machine learning"}},
+                {"id": "call_002", "input": {"query": "economics"}},
+            ]),
+            # Second iteration: final response
+            _final_response(json.dumps(metadata)),
+        ]
+
+        result = tool_inference.generate_metadata(text="ML economics text")
+        assert result["learning_level"] == "Professional"
+        assert bedrock_mock.invoke_model.call_count == 2
+
+    def test_skips_tool_use_with_explicit_thesaurus_terms(
+        self, tool_inference, bedrock_mock
+    ):
+        """When thesaurus_terms are passed explicitly, use legacy prompt path."""
+        metadata = _valid_metadata()
+        bedrock_mock.invoke_model.return_value = _final_response(
+            json.dumps(metadata)
+        )
+
+        tool_inference.generate_metadata(
+            text="text", thesaurus_terms=["smart grid", "power systems"]
+        )
+
+        body = json.loads(bedrock_mock.invoke_model.call_args[1]["body"])
+        assert "tools" not in body
+        assert "IEEE Thesaurus subset" in body["system"]
+
+    def test_thesaurus_coverage_in_result(self, tool_inference, bedrock_mock):
+        """Result should include thesaurus coverage count."""
+        metadata = _valid_metadata()
+        # Set some keywords that match our sample thesaurus
+        metadata["keywords"] = [
+            "Machine learning", "Neural networks", "Economics",
+            "Monetary Policy", "Federal Funds Rate", "Inflation",
+            "Deep learning", "Power grid", "Smart grid", "Energy storage",
+        ]
+        bedrock_mock.invoke_model.return_value = _final_response(
+            json.dumps(metadata)
+        )
+
+        result = tool_inference.generate_metadata(text="text")
+
+        # Machine learning, Neural networks, Economics match the sample thesaurus
+        assert result["thesaurus_coverage"] == 3
+
+    def test_zero_coverage_without_thesaurus(self, inference, bedrock_mock):
+        """Without thesaurus loaded, coverage should be 0."""
+        metadata = _valid_metadata()
+        bedrock_mock.invoke_model.return_value = _final_response(
+            json.dumps(metadata)
+        )
+
+        result = inference.generate_metadata(text="text")
+        assert result["thesaurus_coverage"] == 0
+
+    def test_max_iterations_safety(self, tool_inference, bedrock_mock):
+        """Should stop after MAX_TOOL_ITERATIONS even if LLM keeps calling tools."""
+        metadata = _valid_metadata()
+
+        # All responses request tool use, except we need to handle the final one
+        tool_responses = [
+            _tool_use_response([{
+                "id": f"call_{i:03d}",
+                "input": {"query": f"search {i}"},
+            }])
+            for i in range(MAX_TOOL_ITERATIONS + 1)
+        ]
+
+        bedrock_mock.invoke_model.side_effect = tool_responses
+
+        # Should not raise — extracts empty text, then JSON retry kicks in
+        # which will also fail, raising ValueError
+        with pytest.raises(ValueError, match="invalid JSON"):
+            tool_inference.generate_metadata(text="text")
