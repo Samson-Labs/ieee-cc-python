@@ -1145,12 +1145,29 @@ class TestCC858Validation:
         with pytest.raises(ValueError, match="requested_fields"):
             orch.process("bucket", "PES/pending/ITEM-100.pdf")
 
-    def test_empty_requested_fields_raises(self, orchestrator):
+    @patch("src.orchestrator.ai_orchestrator.WebhookSender.send", return_value=True)
+    def test_empty_requested_fields_accepted(self, mock_send, orchestrator):
+        """Empty requested_fields means 'no subset' and falls back to
+        ALL_FIELDS (line 382) — it must not raise (CC3-1085). Drupal stamps []
+        whenever no fields are named."""
         orch, s3, lam = orchestrator
         meta = _make_text_meta(requested_fields=[])
         s3.get_object.return_value = _s3_get_object_response(meta)
+        lam.invoke.return_value = _lambda_invoke_response(200, {"abstract": "a", "keywords": []})
 
-        with pytest.raises(ValueError, match="non-empty"):
+        result = orch.process("bucket", "PES/pending/ITEM-100.pdf")
+
+        assert result["action"] == "enriched"
+        # Empty subset -> Bedrock is asked for all fields (no narrowing sent).
+        bedrock_payload = json.loads(lam.invoke.call_args[1]["Payload"])
+        assert "requested_fields" not in bedrock_payload
+
+    def test_non_list_requested_fields_raises(self, orchestrator):
+        orch, s3, lam = orchestrator
+        meta = _make_text_meta(requested_fields="keywords")
+        s3.get_object.return_value = _s3_get_object_response(meta)
+
+        with pytest.raises(ValueError, match="must be an array"):
             orch.process("bucket", "PES/pending/ITEM-100.pdf")
 
 

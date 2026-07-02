@@ -217,8 +217,10 @@ def _validate_direct_meta(meta: dict) -> None:
 
     requested_fields = meta.get("requested_fields")
     if requested_fields is not None:
-        if not isinstance(requested_fields, list) or not requested_fields:
-            raise ValueError("requested_fields must be a non-empty array")
+        if not isinstance(requested_fields, list):
+            raise ValueError("requested_fields must be an array")
+        # An empty array means "no subset requested" and falls back to
+        # ALL_FIELDS downstream — accept it rather than reject (CC3-1085).
         if any(not isinstance(field, str) for field in requested_fields):
             raise ValueError("requested_fields must contain only strings")
         invalid = set(requested_fields) - ALL_FIELDS

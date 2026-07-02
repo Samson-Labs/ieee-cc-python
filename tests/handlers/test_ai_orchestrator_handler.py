@@ -319,6 +319,26 @@ class TestDirectMetaInvocation:
         assert "content" in result["body"]["error"]
         mock_orchestrator.process.assert_not_called()
 
+    def test_empty_requested_fields_returns_200(self, mock_orchestrator):
+        """Empty requested_fields (Drupal's default when no fields are named)
+        must pass direct-meta validation and fall back to all fields — not be
+        rejected (CC3-1085)."""
+        event = _make_direct_meta_event()
+        event["meta"]["requested_fields"] = []
+        result = handler(event, None)
+
+        assert result["statusCode"] == 200
+        mock_orchestrator.process.assert_called_once()
+
+    def test_non_list_requested_fields_returns_400(self, mock_orchestrator):
+        event = _make_direct_meta_event()
+        event["meta"]["requested_fields"] = "keywords"
+        result = handler(event, None)
+
+        assert result["statusCode"] == 400
+        assert "requested_fields" in result["body"]["error"]
+        mock_orchestrator.process.assert_not_called()
+
     def test_s3_event_still_routes_correctly(self, mock_orchestrator):
         """Backward compat: S3 events bypass the meta branch."""
         event = {
