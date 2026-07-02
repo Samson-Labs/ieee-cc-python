@@ -214,10 +214,17 @@ class BulkProcessor:
 
             requested_fields = item.get("requested_fields")
             if requested_fields is not None:
-                if not isinstance(requested_fields, list) or not requested_fields:
+                if not isinstance(requested_fields, list):
                     raise ValidationError(
-                        f"Item {i} 'requested_fields' must be a non-empty array"
+                        f"Item {i} 'requested_fields' must be an array"
                     )
+                # An empty array means "no subset requested" — the bulk worker
+                # drops the (falsy) key and the orchestrator falls back to
+                # ALL_FIELDS (ai_orchestrator.py: `requested_fields_raw or None`
+                # -> ALL_FIELDS). Drupal stamps [] whenever --requested-fields
+                # is omitted (BulkCommands.php parseRequestedFields), so the
+                # default backfill batch must validate rather than be rejected
+                # (CC3-1001 Blocker 1). Only the element shape is enforced.
                 if any(
                     not isinstance(field, str) or not field.strip()
                     for field in requested_fields

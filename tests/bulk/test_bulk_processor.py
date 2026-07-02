@@ -182,13 +182,39 @@ class TestBackfillValidation:
         with pytest.raises(ValidationError, match="input_text_mode"):
             proc.process_manifest("bucket", "test")
 
-    def test_empty_requested_fields_rejected(self, processor):
-        proc, s3_mock, _, _ = processor
+    def test_empty_requested_fields_accepted(self, processor):
+        """Drupal stamps requested_fields=[] whenever --requested-fields is
+        omitted (CC3-1001 Blocker 1). An empty array means 'no subset' — the
+        worker drops the falsy key and the orchestrator falls back to
+        ALL_FIELDS — so the default backfill batch must validate, not be
+        rejected."""
+        proc, s3_mock, sqs_mock, _ = processor
         manifest = _text_only_manifest()
         manifest["items"][0]["requested_fields"] = []
         s3_mock.get_object.return_value = _s3_manifest_response(manifest)
+        s3_mock.exceptions.NoSuchKey = type("NoSuchKey", (Exception,), {})
 
-        with pytest.raises(ValidationError, match="non-empty"):
+        with patch.dict("os.environ", {"BULK_QUEUE_URL": "https://sqs/q"}):
+            result = proc.process_manifest("bucket", "backfill-001")
+
+        assert result["published_count"] == 1
+
+    def test_non_list_requested_fields_rejected(self, processor):
+        proc, s3_mock, _, _ = processor
+        manifest = _text_only_manifest()
+        manifest["items"][0]["requested_fields"] = "keywords"
+        s3_mock.get_object.return_value = _s3_manifest_response(manifest)
+
+        with pytest.raises(ValidationError, match="must be an array"):
+            proc.process_manifest("bucket", "test")
+
+    def test_blank_requested_field_element_rejected(self, processor):
+        proc, s3_mock, _, _ = processor
+        manifest = _text_only_manifest()
+        manifest["items"][0]["requested_fields"] = ["keywords", "  "]
+        s3_mock.get_object.return_value = _s3_manifest_response(manifest)
+
+        with pytest.raises(ValidationError, match="non-empty strings"):
             proc.process_manifest("bucket", "test")
 
     def test_backward_compat_existing_manifest(self, processor):
